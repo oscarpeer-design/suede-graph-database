@@ -1,0 +1,754 @@
+// Query.cpp
+//
+// Implementation of the lightweight SQL-like query parser/executor.
+// This file contains detailed, line-by-line comments explaining what each
+// statement does to make the control flow and data transformations easy to
+// understand.
+
+#include "Query.h"
+#include "BFS_Searcher.h"                      // Include BFS traversal helper used by MATCH queries
+
+#include <algorithm>                            // std::transform, std::find
+#include <cctype>                               // std::toupper, std::isspace, std::isdigit
+#include <cstdlib>                              // std::strtoull
+#include <unordered_map>                        // used for mapping field names to values
+
+namespace {                                    // anonymous namespace for internal helpers
+
+// Return true if the character is considered part of a comparison operator.
+bool isOperatorChar(char c) {
+    return c == '=' || c == '!' || c == '<' || c == '>'; // operator chars: =, !, <, >
+}
+
+} // anonymous namespace
+
+// Constructor that stores the raw query string; the string is moved in to avoid copy.
+Query::Query(std::string rawQuery) : raw_(std::move(rawQuery)) {}
+
+// --------------------------- small helpers ------------------------------------
+
+// Convert string `s` to uppercase and return it.
+std::string Query::toUpper(const std::string& s) const {
+    std::string out = s;                         // make a mutable copy of the input
+    std::transform(out.begin(), out.end(), out.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::toupper(c)); }); // uppercase each char
+    return out;                                  // return the transformed string
+}
+
+// Remove matching single or double quotes from start and end of `s`, if present.
+std::string Query::stripQuotes(const std::string& s) const {
+    if (s.size() >= 2) {                         // only possible to have quotes if length >= 2
+        char first = s.front();                  // first character
+        char last = s.back();                    // last character
+        if ((first == '\'' && last == '\'') || (first == '"' && last == '"')) {
+            return s.substr(1, s.size() - 2);    // return the substring without the outer quotes
+        }
+    }
+    return s;                                    // return original if no matching quotes found
+}
+
+// Parse an unsigned integer from the token; reject empty or non-digit tokens.
+bool Query::parseUInt(const std::string& token, uint64_t& out) const {
+    if (token.empty()) return false;             // reject empty token immediately
+    for (char c : token) {                       // validate every character is a digit
+        if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+    }
+    out = std::strtoull(token.c_str(), nullptr, 10); // convert decimal string to uint64_t
+    return true;                                 // success
+}
+
+// Record an error message and mark the parse as failed.
+void Query::setError(const std::string& msg) {
+    errorMessage_ = msg;                         // store human-readable message
+    parsed_ = false;                             // mark parse state as failed
+}
+
+// --------------------------- tokenizer ---------------------------------------
+
+// Tokenize `text` into identifiers, operators, quoted strings, parentheses, and commas.
+std::vector<std::string> Query::tokenize(const std::string& text) const {
+    std::vector<std::string> tokens;             // output token list
+    size_t i = 0;                                // current index into the input
+    const size_t n = text.size();                // store input length for loop bounds
+
+    while (i < n) {                              // loop until we consume entire string
+        char c = text[i];                        // current character
+
+        if (std::isspace(static_cast<unsigned char>(c))) { ++i; continue; } // skip whitespace
+
+        // Handle quoted string tokens ('...' or "...")
+        if (c == '\'' || c == '"') {
+            char quote = c;                      // remember which quote char we saw
+            size_t start = i;                    // token start index includes the opening quote
+            ++i;                                 // advance past opening quote
+            while (i < n && text[i] != quote) ++i; // find matching closing quote (no escape handling)
+            if (i < n) ++i;                      // include closing quote if it exists
+            tokens.push_back(text.substr(start, i - start)); // push the entire quoted token
+            continue;                            // continue scanning after the quoted token
+        }
+
+        // Parentheses and commas are single-character tokens
+        if (c == '(' || c == ')' || c == ',') {
+            tokens.push_back(std::string(1, c)); // push the punctuation as a token
+            ++i;                                 // advance past the punctuation
+            continue;
+        }
+
+        // Operators: =, !=, <=, >=, <, >
+        if (isOperatorChar(c)) {
+            size_t start = i;                    // operator token start
+            ++i;                                 // consume the first operator char
+            if (i < n && text[i] == '=') ++i;   // allow two-character ops like <=, >=, !=
+            tokens.push_back(text.substr(start, i - start)); // push operator token
+            continue;
+        }
+
+        // Identifiers, keywords, and numbers: read maximal run of non-special chars
+        size_t start = i;                        // token start
+        while (i < n) {
+            char cc = text[i];                   // peek next char
+            if (std::isspace(static_cast<unsigned char>(cc)) || cc == '(' || cc == ')' ||
+                cc == ',' || cc == '\'' || cc == '"' || isOperatorChar(cc)) {
+                break;                          // stop when encountering delimiter
+            }
+            ++i;                                 // otherwise include char in current token
+        }
+        tokens.push_back(text.substr(start, i - start)); // push identifier/number token
+    }
+
+    return tokens;                               // return accumulated tokens
+}
+
+// --------------------------- parse orchestration ------------------------------
+
+// Overload that sets raw_ and invokes the parameterless parse().
+bool Query::parse(const std::string& rawQuery) {
+    raw_ = rawQuery;                             // replace stored raw input
+    return parse();                              // call the main parse implementation
+}
+
+// Main parse function: reset state, tokenize, dispatch to clause-specific parser.
+bool Query::parse() {
+    parsed_ = false;                             // clear parse success flag
+    errorMessage_.clear();                       // clear any existing error text
+    conditions_.clear();                         // clear parsed WHERE conditions
+    values_.clear();                             // clear parsed INSERT values
+    operation_ = QueryOperation::Unknown;        // reset operation type
+    target_ = QueryTarget::Unknown;              // reset target type
+
+    std::vector<std::string> tokens = tokenize(raw_); // produce tokens from the raw input
+    if (tokens.empty()) {                        // handle empty input case
+        setError("Empty query.");                // set error and mark parse failure
+        return false;
+    }
+
+    std::string keyword = toUpper(tokens[0]);    // read the first token as a case-insensitive keyword
+    bool ok = false;                             // will hold result of clause-specific parsing
+
+    if (keyword == "SELECT") {                   // SELECT statement dispatch
+        operation_ = QueryOperation::Select;     // set operation type
+        ok = parseSelect(tokens, 1);             // parse the remainder starting at token index 1
+    } else if (keyword == "INSERT") {            // INSERT statement dispatch
+        operation_ = QueryOperation::Insert;
+        ok = parseInsert(tokens, 1);
+    } else if (keyword == "DELETE") {            // DELETE statement dispatch
+        operation_ = QueryOperation::Delete;
+        ok = parseDelete(tokens, 1);
+    } else if (keyword == "MATCH") {             // MATCH traversal dispatch
+        operation_ = QueryOperation::Match;
+        ok = parseMatch(tokens, 1);
+    } else {                                     // unknown top-level keyword
+        setError("Unrecognized query keyword: " + tokens[0]); // error out with original token shown
+        return false;
+    }
+
+    parsed_ = ok;                                // record parse success/failure
+    return ok;                                   // return result to caller
+}
+
+// Map textual token to QueryTarget enum for "NODES" / "EDGES".
+bool Query::parseTarget(const std::string& token, QueryTarget& outTarget) const {
+    std::string t = toUpper(token);              // compare case-insensitively
+    if (t == "NODES") { outTarget = QueryTarget::Nodes; return true; } // match nodes
+    if (t == "EDGES") { outTarget = QueryTarget::Edges; return true; } // match edges
+    return false;                                // unknown target
+}
+
+// --------------------------- clause parsers ----------------------------------
+
+// parse SELECT * FROM <NODES|EDGES> [WHERE ...]
+// This function enforces that only '*' projection is supported and that a
+// WHERE clause is present and valid.
+bool Query::parseSelect(const std::vector<std::string>& tokens, size_t pos) {
+    if (pos >= tokens.size()) { setError("SELECT: expected '*'."); return false; } // need a projection token
+    if (tokens[pos] != "*") { setError("SELECT: only '*' projections are supported."); return false; } // reject other forms
+    ++pos;                                        // advance past the '*'
+
+    if (pos >= tokens.size() || toUpper(tokens[pos]) != "FROM") { setError("SELECT: expected FROM."); return false; } // require FROM
+    ++pos;                                        // advance past 'FROM'
+
+    if (pos >= tokens.size() || !parseTarget(tokens[pos], target_)) { // read target token and set target_
+        setError("SELECT: expected NODES or EDGES after FROM.");
+        return false;
+    }
+    ++pos;                                        // advance past target token
+
+    if (pos < tokens.size()) {                    // if there are more tokens, expect a WHERE clause
+        if (toUpper(tokens[pos]) != "WHERE") { setError("SELECT: unexpected token '" + tokens[pos] + "'."); return false; } // unexpected token
+        return parseWhereClause(tokens, pos + 1); // delegate WHERE parsing starting after 'WHERE'
+    }
+
+    setError("SELECT: a WHERE clause is required (WHERE ID = ... or WHERE LABEL = ...)."); // require explicit WHERE
+    return false;
+}
+
+// parse INSERT INTO <NODES|EDGES> (col1, col2, ...) VALUES (val1, val2, ...)
+// Columns and values are matched by position and stored into values_ map.
+bool Query::parseInsert(const std::vector<std::string>& tokens, size_t pos) {
+    if (pos >= tokens.size() || toUpper(tokens[pos]) != "INTO") { setError("INSERT: expected INTO."); return false; } // require INTO
+    ++pos;                                        // advance past INTO
+
+    if (pos >= tokens.size() || !parseTarget(tokens[pos], target_)) { // parse target after INTO
+        setError("INSERT: expected NODES or EDGES after INTO.");
+        return false;
+    }
+    ++pos;                                        // advance past target
+
+    if (pos >= tokens.size() || tokens[pos] != "(") { setError("INSERT: expected '(' to begin column list."); return false; } // column list start
+    ++pos;                                        // advance into column list
+
+    std::vector<std::string> columns;             // temporary storage for parsed column names
+    while (pos < tokens.size() && tokens[pos] != ")") { // collect tokens until ')' encountered
+        if (tokens[pos] != ",") columns.push_back(tokens[pos]); // ignore commas, add names
+        ++pos;                                    // advance to next token
+    }
+    if (pos >= tokens.size()) { setError("INSERT: unterminated column list."); return false; } // unmatched '('
+    ++pos;                                        // skip the closing ')'
+
+    if (pos >= tokens.size() || toUpper(tokens[pos]) != "VALUES") { setError("INSERT: expected VALUES."); return false; } // expect VALUES
+    ++pos;                                        // advance past VALUES
+
+    if (pos >= tokens.size() || tokens[pos] != "(") { setError("INSERT: expected '(' to begin value list."); return false; } // value list start
+    ++pos;                                        // advance into values
+
+    std::vector<std::string> vals;                // store parsed values as strings
+    while (pos < tokens.size() && tokens[pos] != ")") { // collect until ')'
+        if (tokens[pos] != ",") vals.push_back(stripQuotes(tokens[pos])); // strip quotes from string literals
+        ++pos;                                    // advance token pointer
+    }
+    if (pos >= tokens.size()) { setError("INSERT: unterminated value list."); return false; } // unmatched '(' in values
+    ++pos;                                        // skip ')'
+
+    if (columns.size() != vals.size()) { setError("INSERT: column count does not match value count."); return false; } // mismatch check
+
+    for (size_t i = 0; i < columns.size(); ++i) values_[columns[i]] = vals[i]; // populate values_ map by column name
+
+    if (pos != tokens.size()) { setError("INSERT: unexpected trailing tokens."); return false; } // no trailing tokens allowed
+
+    if (target_ == QueryTarget::Nodes) {         // additional validation for node inserts
+        if (values_.find("label") == values_.end()) {
+            setError("INSERT INTO NODES requires a 'label' column.");
+            return false;
+        }
+    } else {                                      // validation for edge inserts
+        // Edges must have exactly from, to, label and no other columns.
+        if (values_.find("from") == values_.end() || values_.find("to") == values_.end() ||
+            values_.find("label") == values_.end()) {
+            setError("INSERT INTO EDGES requires 'from', 'to', and 'label' columns.");
+            return false;
+        }
+        if (values_.size() != 3) {
+            setError("INSERT INTO EDGES only supports 'from', 'to', and 'label' columns (edges have no properties).");
+            return false;
+        }
+    }
+
+    return true;                                  // insert parse succeeded
+}
+
+// parse DELETE FROM <NODES|EDGES> WHERE ID = <id>
+// Only single-ID deletes are supported; the WHERE clause must be a single ID equality.
+bool Query::parseDelete(const std::vector<std::string>& tokens, size_t pos) {
+    if (pos >= tokens.size() || toUpper(tokens[pos]) != "FROM") { setError("DELETE: expected FROM."); return false; } // require FROM
+    ++pos;                                        // advance past FROM
+
+    if (pos >= tokens.size() || !parseTarget(tokens[pos], target_)) { // read target token (NODES/EDGES)
+        setError("DELETE: expected NODES or EDGES after FROM.");
+        return false;
+    }
+    ++pos;                                        // advance past target
+
+    if (pos >= tokens.size() || toUpper(tokens[pos]) != "WHERE") {
+        setError("DELETE: a WHERE ID = <id> clause is required."); // require WHERE clause for deletes
+        return false;
+    }
+    if (!parseWhereClause(tokens, pos + 1)) return false; // parse WHERE starting after 'WHERE'
+
+    // Only single equality on ID is allowed for DELETE
+    if (conditions_.size() != 1 || toUpper(conditions_[0].property) != "ID" || conditions_[0].op != "=") {
+        setError("DELETE: only WHERE ID = <id> is supported.");
+        return false;
+    }
+
+    return true;                                  // delete parse validated
+}
+
+// parse MATCH queries: SHORTEST_PATH, REACHABLE, KHOP variants
+bool Query::parseMatch(const std::vector<std::string>& tokens, size_t pos) {
+    if (pos >= tokens.size()) { setError("MATCH: expected SHORTEST_PATH, REACHABLE, or KHOP."); return false; } // require mode token
+    std::string mode = toUpper(tokens[pos]);       // read mode in uppercase
+    if (mode == "SHORTEST_PATH") matchMode_ = CSR_Mode::SHORTEST_PATH; // set match mode
+    else if (mode == "REACHABLE") matchMode_ = CSR_Mode::REACHABLE;
+    else if (mode == "KHOP") matchMode_ = CSR_Mode::KHOP;
+    else { setError("MATCH: unknown mode '" + tokens[pos] + "'."); return false; } // unknown mode
+    ++pos;                                        // advance past mode token
+
+    if (pos >= tokens.size() || toUpper(tokens[pos]) != "FROM") { setError("MATCH: expected FROM."); return false; } // expect FROM
+    ++pos;                                        // advance past FROM
+
+    if (pos >= tokens.size() || !parseUInt(tokens[pos], matchFromRaw_)) { // parse source id
+        setError("MATCH: expected a numeric node id after FROM.");
+        return false;
+    }
+    ++pos;                                        // advance after source id
+
+    if (matchMode_ == CSR_Mode::SHORTEST_PATH) {   // SHORTEST_PATH requires a TO <id>
+        if (pos >= tokens.size() || toUpper(tokens[pos]) != "TO") { setError("MATCH SHORTEST_PATH: expected TO."); return false; }
+        ++pos;                                    // skip 'TO'
+        if (pos >= tokens.size() || !parseUInt(tokens[pos], matchToRaw_)) { // parse target id
+            setError("MATCH SHORTEST_PATH: expected a numeric node id after TO.");
+            return false;
+        }
+        ++pos;                                    // advance after target id
+    } else if (matchMode_ == CSR_Mode::KHOP) {     // KHOP expects STEPS <k>
+        if (pos >= tokens.size() || toUpper(tokens[pos]) != "STEPS") { setError("MATCH KHOP: expected STEPS."); return false; }
+        ++pos;                                    // skip 'STEPS'
+        uint64_t k = 0;                           // temporary numeric storage
+        if (pos >= tokens.size() || !parseUInt(tokens[pos], k)) { // parse k
+            setError("MATCH KHOP: expected a numeric step count after STEPS.");
+            return false;
+        }
+        matchK_ = static_cast<size_t>(k);         // store step count into matchK_
+        ++pos;                                    // advance past steps value
+    }
+
+    if (pos != tokens.size()) { setError("MATCH: unexpected trailing tokens."); return false; } // no trailing tokens allowed
+
+    return true;                                  // match parse succeeded
+}
+
+// parse a WHERE clause of the shape: property op value [AND property op value ...]
+// Supports only the operators explicitly in validOps and only AND logic.
+bool Query::parseWhereClause(const std::vector<std::string>& tokens, size_t pos) {
+    conditions_.clear();                          // clear any pre-existing conditions
+
+    while (pos < tokens.size()) {                 // keep parsing condition groups until end or error
+        Condition cond;                           // reusable condition struct to populate
+        cond.property = tokens[pos];              // read property name token
+        ++pos;                                    // advance after property
+
+        if (pos >= tokens.size()) { setError("WHERE: expected operator."); return false; } // require operator token
+        cond.op = tokens[pos];                    // read operator token
+        static const std::vector<std::string> validOps = {"=", "!=", "<", ">", "<=", ">="}; // allowed ops
+        if (std::find(validOps.begin(), validOps.end(), cond.op) == validOps.end()) { // validate op
+            setError("WHERE: invalid operator '" + cond.op + "'.");
+            return false;
+        }
+        ++pos;                                    // advance past operator
+
+        if (pos >= tokens.size()) { setError("WHERE: expected value."); return false; } // require RHS value
+        cond.value = stripQuotes(tokens[pos]);    // store RHS, stripping surrounding quotes
+        ++pos;                                    // advance past value
+
+        if (pos < tokens.size()) {                 // check for optional logic connector
+            std::string next = toUpper(tokens[pos]); // read connector
+            if (next == "AND") { cond.logicOp = next; ++pos; } // accept only AND
+            else { setError("WHERE: unexpected token '" + tokens[pos] + "' (only AND is supported)."); return false; } // unexpected token
+        }
+
+        conditions_.push_back(cond);              // append parsed condition to conditions_ vector
+        if (cond.logicOp.empty()) break;          // if no AND followed, break out of loop; otherwise continue to next condition
+    }
+
+    if (conditions_.empty()) { setError("WHERE: no conditions found."); return false; } // ensure at least one condition parsed
+    return true;                                  // WHERE clause parsed successfully
+}
+
+// --------------------------- execute() --------------------------------------
+
+// Execute previously parsed statement against `graph`. Dispatch based on operation_.
+QueryResult Query::execute(Graph& graph) const {
+    QueryResult result;                           // accumulator for execution result
+
+    if (!parsed_) {                               // guard: cannot execute if not parsed successfully
+        result.success = false;                   // indicate failure
+        result.message = errorMessage_.empty() ? "Query has not been successfully parsed." : errorMessage_; // choose message
+        return result;                            // return immediately on error
+    }
+
+    switch (operation_) {                         // dispatch by operation type
+        case QueryOperation::Select:
+            return (target_ == QueryTarget::Nodes) ? executeSelectNodes(graph) : executeSelectEdges(graph);
+        case QueryOperation::Insert:
+            return (target_ == QueryTarget::Nodes) ? executeInsertNodes(graph) : executeInsertEdges(graph);
+        case QueryOperation::Delete:
+            return (target_ == QueryTarget::Nodes) ? executeDeleteNodes(graph) : executeDeleteEdges(graph);
+        case QueryOperation::Match:
+            return executeMatch(graph);
+        case QueryOperation::Unknown:
+        default:
+            result.success = false;               // unknown operation is an execution error
+            result.message = "Cannot execute a query with an unknown operation.";
+            return result;
+    }
+}
+
+// Convenience method: parse the provided rawQuery then execute it.
+QueryResult Query::run(const std::string& rawQuery, Graph& graph) {
+    if (!parse(rawQuery)) {                       // attempt to parse; on failure return the parse error
+        QueryResult result;
+        result.success = false;
+        result.message = errorMessage_;
+        return result;
+    }
+    return execute(graph);                        // on success execute the parsed query
+}
+
+// --------------------------- SELECT execution --------------------------------
+static bool executeCondition(const Condition& e, const std::string& actual, bool& matches) {
+    bool condResult;
+    if (e.op == "=") // equality
+        condResult = (actual == e.value);    
+    else if (e.op == "!=") // inequality
+        condResult = (actual != e.value); // inequality
+    else if (e.op == "<") // lexicographic comparison
+        condResult = (actual < e.value);  
+    else if (e.op == ">") // greater than lexicographic comparison
+        condResult = (actual > e.value);
+    else if (e.op == "<=") // less than or equal to
+        condResult = (actual <= e.value); 
+    else if (e.op == ">=") // greater than or equal to
+        condResult = (actual >= e.value);
+    else 
+        condResult = false;        // unknown operator (should not happen due to parse validation)
+    // set match and return result of execution
+    matches = condResult;
+    return condResult;
+}
+
+
+
+// Execute a SELECT query targeting nodes.
+QueryResult Query::executeSelectNodes(Graph& graph) const {
+    QueryResult result;                           // prepare result container
+
+    // Fast-path: WHERE ID = <id>
+    for (const Condition& c : conditions_) {      // iterate conditions to find ID equality
+        if (toUpper(c.property) == "ID" && c.op == "=") {
+            uint64_t idVal;                       // numeric id storage
+            if (!parseUInt(c.value, idVal)) { result.success = false; result.message = "Invalid node id."; return result; } // validate id
+            Node node;                            // temporary Node container
+            if (graph.GetNode(NodeId(idVal), node)) { // attempt to fetch node by id
+                result.nodes.push_back(node);    // add found node to result set
+                result.success = true;
+                result.message = "Found 1 row.";
+            } else {
+                result.success = true;           // query succeeded but returned no rows
+                result.message = "Found 0 row(s).";
+            }
+            return result;                       // return early after ID lookup
+        }
+    }
+
+    // Label-based selection: WHERE LABEL = '...' [AND property filters ...]
+    for (const Condition& c : conditions_) {      // search for a LABEL condition
+        if (toUpper(c.property) == "LABEL" && c.op == "=") {
+            int warning = operationSuccessful;    // Graph API uses an integer warning code pattern
+            std::vector<Node> found;              // temporary container for nodes returned by graph
+            graph.FindNodes(found, c.value, warning); // ask Graph for nodes matching label
+            if (warning != operationSuccessful) { // treat graph warning as query-level failure
+                result.success = false;
+                result.message = "No nodes found with that label.";
+                return result;
+            }
+
+            // Build a list of extra property filters (exclude the LABEL condition itself)
+            std::vector<Condition> extra;
+            for (const Condition& other : conditions_) {
+                std::string p = toUpper(other.property);
+                if (p != "LABEL") extra.push_back(other); // keep other conditions for client-side filtering
+            }
+
+            // Apply client-side property filters to each node returned by Graph::FindNodes
+            for (const Node& node : found) {
+                bool matches = true;                // optimistic match flag
+                for (const Condition& e : extra) {
+                    auto it = node.properties.find(e.property); // find property in node's property map
+                    std::string actual = (it != node.properties.end()) ? it->second : ""; // default empty if absent
+                    bool condResult = executeCondition(e, actual, matches); // execute the condition
+                    // break early if any filter fails
+                    if (!condResult) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches) result.nodes.push_back(node); // keep nodes that match all extra filters
+            }
+
+            result.success = true;
+            result.message = "Found " + std::to_string(result.nodes.size()) + " row(s).";
+            return result;                           // done processing LABEL-based SELECT
+        }
+    }
+
+    // If neither ID nor LABEL were provided, return an informative error.
+    result.success = false;
+    result.message = "SELECT FROM NODES requires WHERE ID = ... or WHERE LABEL = ....";
+    return result;
+}
+
+// Execute a SELECT query targeting edges.
+QueryResult Query::executeSelectEdges(Graph& graph) const {
+    QueryResult result;                           // prepare result container
+
+    std::unordered_map<std::string, std::string> field; // map stringified field names to values
+    for (const Condition& c : conditions_) {      // collect only equality conditions into the map
+        if (c.op == "=") field[toUpper(c.property)] = c.value;
+    }
+
+    int warning = operationSuccessful;            // warning code used by Graph APIs
+    std::vector<Edge> found;                      // temporary storage for edges returned by Graph
+
+    // ID lookup fast-path: WHERE ID = <id>
+    if (field.count("ID")) {
+        uint64_t idVal;                           // parsed edge id storage
+        if (!parseUInt(field["ID"], idVal)) { result.success = false; result.message = "Invalid edge id."; return result; } // validate ID
+        Edge edge;                                // temporary Edge holder
+        if (graph.GetEdge(EdgeId(idVal), edge)) { // fetch edge by id
+            result.edges.push_back(edge);        // add to result if found
+            result.success = true;
+            result.message = "Found 1 row.";
+        } else {
+            result.success = true;               // found 0 rows but operation is successful
+            result.message = "Found 0 row(s).";
+        }
+        return result;                           // return after ID lookup
+    }
+
+    // Determine direction for FROM-based queries (default to OUTGOING)
+    EdgeDirection dir = OUTGOING;                 // default behavior matches "edges FROM x"
+    if (field.count("DIRECTION")) {               // if DIRECTION was provided parse it
+        std::string d = toUpper(field["DIRECTION"]);
+        if (d == "OUTGOING") dir = OUTGOING;
+        else if (d == "INCOMING") dir = INCOMING;
+        else if (d == "BOTH") dir = BOTH;
+        else { result.success = false; result.message = "Invalid DIRECTION (expected OUTGOING, INCOMING, or BOTH)."; return result; } // invalid direction
+    }
+
+    // FROM-based query: WHERE FROM = <nodeId> [AND LABEL = '...' ] [AND TO = <id>]
+    if (field.count("FROM")) {
+        uint64_t fromVal;
+        if (!parseUInt(field["FROM"], fromVal)) { result.success = false; result.message = "Invalid FROM node id."; return result; } // validate FROM
+        NodeId from(fromVal);                     // wrap raw id into NodeId
+
+        if (field.count("LABEL")) {               // if LABEL provided, use label-aware fetch
+            graph.FindEdgesByNodeAndLabel(from, field["LABEL"], found, dir, warning);
+        } else {                                  // otherwise request all edges for the node in the requested direction
+            graph.FindEdgesByNodeId(from, found, dir, warning);
+        }
+
+        if (warning != operationSuccessful) {      // Graph reported an error/failure
+            result.success = false;
+            result.message = "No edges found for that node.";
+            return result;
+        }
+
+        // Optional post-filter on TO: if present keep only edges with matching endpoint
+        if (field.count("TO")) {
+            uint64_t toVal;
+            if (!parseUInt(field["TO"], toVal)) { result.success = false; result.message = "Invalid TO node id."; return result; } // validate TO
+            NodeId to(toVal);                     // wrap raw id into NodeId
+            std::vector<Edge> filtered;           // temporary container for filtered edges
+            for (const Edge& e : found) {         // iterate edges returned by Graph
+                if (e.to == to || e.from == to) filtered.push_back(e); // keep edges that have the target endpoint
+            }
+            found = filtered;                     // replace found with filtered list
+        }
+
+        result.edges = found;                     // set result edges
+        result.success = true;
+        result.message = "Found " + std::to_string(result.edges.size()) + " row(s).";
+        return result;                            // done with FROM-based SELECT
+    }
+
+    // LABEL-only query: WHERE LABEL = '...'
+    if (field.count("LABEL")) {
+        graph.FindEdgesByLabel(found, field["LABEL"], warning); // fetch edges by label
+        if (warning != operationSuccessful) {      // handle graph error
+            result.success = false;
+            result.message = "No edges found with that label.";
+            return result;
+        }
+        result.edges = found;                     // set result edges
+        result.success = true;
+        result.message = "Found " + std::to_string(result.edges.size()) + " row(s).";
+        return result;
+    }
+
+    // If none of the supported WHERE forms were present return an error message.
+    result.success = false;
+    result.message = "SELECT FROM EDGES requires WHERE ID = ..., WHERE LABEL = ..., or WHERE FROM = ....";
+    return result;
+}
+
+// --------------------------- INSERT / DELETE ---------------------------------
+
+// Execute INSERT INTO NODES: uses values_ to create a Node via Graph::CreateNode.
+QueryResult Query::executeInsertNodes(Graph& graph) const {
+    QueryResult result;                           // result container
+
+    propertiesMap properties = values_;           // copy parsed values
+    std::string label = properties.at("label");   // extract 'label' column (throws if missing)
+    properties.erase("label");                    // remove label from properties map
+
+    NodeId id = graph.CreateNode(label, properties); // create node and obtain NodeId
+
+    Node node;                                    // temporary to re-read inserted node
+    if (graph.GetNode(id, node)) {                // read back created node to include in result
+        result.nodes.push_back(node);
+        result.success = true;
+        result.message = "Inserted node.";
+    } else {
+        result.success = false;
+        result.message = "Node insert reported success but could not be re-read.";
+    }
+    return result;                                // return insert result
+}
+
+// Execute INSERT INTO EDGES: parse numeric from/to and call Graph::CreateEdge.
+QueryResult Query::executeInsertEdges(Graph& graph) const {
+    QueryResult result;                           // result container
+
+    uint64_t fromVal, toVal;                      // raw numeric endpoints
+    if (!parseUInt(values_.at("from"), fromVal) || !parseUInt(values_.at("to"), toVal)) { // validate both
+        result.success = false;
+        result.message = "INSERT INTO EDGES: 'from' and 'to' must be numeric node ids.";
+        return result;
+    }
+
+    int warning = operationSuccessful;            // Graph returns a warning code
+    EdgeId id = graph.CreateEdge(NodeId(fromVal), NodeId(toVal), values_.at("label"), warning); // create edge
+
+    if (warning != operationSuccessful) {         // if creation failed because endpoints missing
+        result.success = false;
+        result.message = "INSERT INTO EDGES failed: one or both endpoint nodes do not exist.";
+        return result;
+    }
+
+    Edge edge;                                    // read back created edge for result payload
+    if (graph.GetEdge(id, edge)) {
+        result.edges.push_back(edge);
+        result.success = true;
+        result.message = "Inserted edge.";
+    } else {
+        result.success = false;
+        result.message = "Edge insert reported success but could not be re-read.";
+    }
+    return result;                                // return insertion result
+}
+
+// Execute DELETE FROM NODES WHERE ID = <id>
+QueryResult Query::executeDeleteNodes(Graph& graph) const {
+    QueryResult result;                           // result container
+    uint64_t idVal;                               // raw id storage
+    if (!parseUInt(conditions_[0].value, idVal)) { result.success = false; result.message = "Invalid node id."; return result; } // validate id
+
+    int warning = operationSuccessful;            // Graph uses warning codes
+    graph.DeleteNode(NodeId(idVal), warning);     // attempt delete
+
+    result.success = (warning == operationSuccessful); // success if graph reported operationSuccessful
+    result.message = result.success ? "Deleted node." : "DELETE failed: node does not exist.";
+    return result;                                // return deletion result
+}
+
+// Execute DELETE FROM EDGES WHERE ID = <id>
+QueryResult Query::executeDeleteEdges(Graph& graph) const {
+    QueryResult result;                           // result container
+    uint64_t idVal;                               // raw id storage
+    if (!parseUInt(conditions_[0].value, idVal)) { result.success = false; result.message = "Invalid edge id."; return result; } // validate id
+
+    int warning = operationSuccessful;            // Graph APIs use warning codes
+    graph.DeleteEdge(EdgeId(idVal), warning);     // attempt delete
+
+    result.success = (warning == operationSuccessful); // success if graph reported operationSuccessful
+    result.message = result.success ? "Deleted edge." : "DELETE failed: edge does not exist.";
+    return result;                                // return deletion result
+}
+
+// --------------------------- MATCH (traversals) -------------------------------
+
+// Execute MATCH queries (REACHABLE, SHORTEST_PATH, KHOP) by invoking BFS_Searcher.
+QueryResult Query::executeMatch(Graph& graph) const {
+    QueryResult result;                           // result container
+
+    NodeId source(matchFromRaw_);                 // wrap raw numeric source into NodeId
+
+    Node sourceNode;                              // storage for verifying source exists
+    if (!graph.GetNode(source, sourceNode)) {     // verify source node exists
+        result.success = false;
+        result.message = "MATCH: source node does not exist.";
+        return result;
+    }
+
+    BFS_Searcher searcher(graph, source);         // construct BFS searcher with graph and source
+    searcher.Run_BFS(BOTH);                       // execute BFS across both directions by default
+
+    if (matchMode_ == CSR_Mode::REACHABLE) {      // REACHABLE: return visited node order
+        std::vector<NodeId> visitOrder;           // container for visit order
+        searcher.GetVisitedNodeIdOrder(visitOrder); // obtain visit order from searcher
+        result.traversalResult = visitOrder;      // populate result
+        result.success = true;
+        result.message = "Found " + std::to_string(result.traversalResult.size()) + " reachable node(s).";
+        return result;
+    }
+
+    if (matchMode_ == CSR_Mode::SHORTEST_PATH) {  // SHORTEST_PATH: return node path to target
+        NodeId target(matchToRaw_);               // wrap target id
+        if (!searcher.HasVisited(target)) {       // if target not visited there is no path
+            result.success = true;
+            result.traversalResult.clear();
+            result.message = "No path found between the given nodes.";
+            return result;
+        }
+        std::vector<NodeId> path;                 // container for path
+        searcher.GetShortestPath(target, path);   // ask searcher for shortest path back to source
+        result.traversalResult = path;            // set result path
+        result.success = true;
+        result.message = "Path found with " + std::to_string(path.size()) + " node(s).";
+        return result;
+    }
+
+    // KHOP: include nodes whose parent-chain distance to source is <= matchK_
+    std::vector<NodeId> visitOrder;              // get visit order for walking parents
+    searcher.GetVisitedNodeIdOrder(visitOrder);   // populate visitOrder
+
+    for (const NodeId& node : visitOrder) {      // iterate all nodes visited by BFS
+        size_t hops = 0;                         // count hops from node back to source
+        NodeId current = node;                   // current node in the parent chain
+        bool withinRange = false;                // whether node is within matchK_ hops
+        while (true) {                           // walk parent chain
+            if (current == source) { withinRange = (hops <= matchK_); break; } // reached source, check hop count
+            NodeId parent = searcher.GetParentOfVisited(current); // get parent from searcher
+            if (parent == NodeIdInvalid) break; // safety: parent invalid means no path (shouldn't happen)
+            current = parent;                    // step to parent
+            ++hops;                              // increment hop counter
+            if (hops > matchK_) break;           // early out if hops exceed matchK_
+        }
+        if (withinRange) result.traversalResult.push_back(node); // keep nodes within range
+    }
+
+    result.success = true;                        // match executed successfully
+    result.message = "Found " + std::to_string(result.traversalResult.size()) + " node(s) within " +
+                      std::to_string(matchK_) + " hop(s)."; // human-readable summary
+    return result;                                // return final result
+}

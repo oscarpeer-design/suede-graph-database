@@ -1,0 +1,1 @@
+This is a lightweight graph database system that operates with a mutable graph layer for writing, and a CSR representation for faster queries. It reads graphs from either a binary file or a CSV and can export a graph as CSVs.

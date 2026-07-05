@@ -75,12 +75,29 @@ depending on the statement — `nodes`, `edges`, or `traversalResult` (a list of
 > that references something structurally absent (an unknown label) is reported
 > as a **failure**. See the per-statement sections for exactly which is which.
 
-### 1.4 Traversals (BFS)
+### 1.4 Traversals (BFS live, CSR snapshot)
 
-`MATCH` queries are backed by a breadth-first search (`BFS_Searcher`). The search
-runs **undirected** (it follows edges in both directions) from a source node and
-records the visit order and a shortest-path tree. From that single traversal the
-executor derives reachable sets, shortest paths, and k-hop neighbourhoods.
+`MATCH` queries walk the graph, and there are **two interchangeable traversal
+engines** behind them:
+
+- **`BFS_Searcher` (LIVE)** — a breadth-first search over the live `Graph`. It
+  always reflects the current state of the graph, including every insert and
+  delete applied so far. This is the default.
+- **`CSR_Searcher` (SNAPSHOT)** — a breadth-first search over a
+  `CSR_Representation`: an immutable, point-in-time snapshot of the graph stored
+  as Compressed Sparse Row arrays for fast, cache-friendly traversal. A snapshot
+  is built once (via `Load_CSR()`) and thereafter observes the graph exactly as
+  it was at build time, regardless of later live mutations.
+
+Both engines run **undirected** (they follow edges in both directions) from a
+source node, and both return the same shape of result, so a query behaves
+identically whichever engine serves it — only *which point in time* it observes,
+and *how fast* it runs, differ. A query chooses its engine with the trailing
+`LIVE` / `SNAPSHOT` keyword (see §2.5).
+
+Because the CSR snapshot indexes only adjacency (not labels or properties), the
+snapshot engine serves `MATCH` traversals only. `SELECT`, `INSERT`, and `DELETE`
+always run against the live graph.
 
 ### 1.5 Persistence (`StorageEngine`)
 
@@ -111,6 +128,9 @@ General rules that apply everywhere:
 - **`WHERE` supports only `AND`** as a connective. `OR` is not supported.
 - Valid comparison operators are `=`, `!=`, `<`, `>`, `<=`, `>=`. Comparisons are
   **lexicographic** (string) comparisons, since all values are stored as strings.
+- A statement may end with an optional **execution-mode keyword**, `LIVE` (the
+  default) or `SNAPSHOT`. `LIVE` reads the current graph; `SNAPSHOT` reads a
+  frozen CSR snapshot and applies to `MATCH` only. See §2.5.
 
 The four statements are `SELECT`, `INSERT`, `DELETE`, and `MATCH`.
 
@@ -304,6 +324,72 @@ notes:
 
 ---
 
+### 2.5 LIVE / SNAPSHOT execution modes
+
+Any statement may end with an optional execution-mode keyword. It selects which
+view of the graph the query resolves against:
+
+```
+<statement> LIVE       -- (default) read the current, live graph
+<statement> SNAPSHOT   -- read a frozen, point-in-time CSR snapshot
+```
+
+`LIVE` is the default, so omitting the keyword is the same as writing `LIVE`.
+Writing it explicitly is a harmless no-op that documents intent.
+
+`SNAPSHOT` routes a `MATCH` traversal to the CSR snapshot engine
+(`CSR_Searcher` over a `CSR_Representation`) instead of the live `BFS_Searcher`.
+The snapshot is captured once and does not change afterwards, so a `SNAPSHOT`
+query keeps observing the graph as it was at capture time even as the live graph
+is mutated. This gives **point-in-time consistency** for read-heavy traversal
+workloads, and the CSR layout makes those traversals fast.
+
+```sql
+-- Live traversal (default): reflects every insert/delete so far
+MATCH REACHABLE FROM 1
+MATCH REACHABLE FROM 1 LIVE          -- identical, explicit
+
+-- Snapshot traversal: reads the frozen CSR snapshot
+MATCH SHORTEST_PATH FROM 1 TO 3 SNAPSHOT
+MATCH KHOP FROM 1 STEPS 2 SNAPSHOT
+```
+
+Rules and behaviour:
+
+- **`SNAPSHOT` applies to `MATCH` only.** Because the CSR snapshot indexes only
+  adjacency, `SELECT`, `INSERT`, and `DELETE` cannot be served from it and are
+  **rejected at parse time** when combined with `SNAPSHOT`
+  (`SNAPSHOT applies only to MATCH traversals; SELECT, INSERT, and DELETE always
+  run against the live graph.`).
+- **A snapshot must actually exist.** The snapshot is supplied by the caller
+  (`Query::execute(Graph& live, CSR_Representation& snapshot)`). If a `SNAPSHOT`
+  query is executed with no snapshot available (the single-argument
+  `Query::execute(Graph&)`), it **gracefully falls back** to a live BFS
+  traversal rather than failing.
+- **The keyword is a reserved trailing token.** Only a bare, final `LIVE` /
+  `SNAPSHOT` is treated as a mode keyword; a quoted value such as `'SNAPSHOT'`
+  keeps its quotes and is left untouched, so
+  `SELECT * FROM NODES WHERE LABEL = 'SNAPSHOT'` is an ordinary live query.
+- Results and messages are identical to the live equivalents — a `SNAPSHOT`
+  `REACHABLE` returns `Found <n> reachable node(s).`, and so on.
+
+From code, the two forms are:
+
+```cpp
+CSR_Representation snapshot(graph);
+snapshot.Load_CSR();                 // freeze the graph as it is now
+
+Query q;
+q.parse("MATCH REACHABLE FROM 1 SNAPSHOT");
+QueryResult live = q.execute(graph);            // no snapshot -> live BFS fallback
+QueryResult snap = q.execute(graph, snapshot);  // CSR snapshot traversal
+
+// Later mutations to `graph` are visible to LIVE queries but NOT to `snapshot`,
+// until a fresh CSR_Representation is built.
+```
+
+---
+
 ## 3. Error and status messages
 
 Two kinds of messages can come back: **parse errors** (the statement is
@@ -347,6 +433,7 @@ the executor reports the outcome). Below is the authoritative list.
 | `MATCH KHOP: expected STEPS.` | `KHOP` without `STEPS`. |
 | `MATCH KHOP: expected a numeric step count after STEPS.` | Non-numeric step count. |
 | `MATCH: unexpected trailing tokens.` | Extra tokens after a complete `MATCH`. |
+| `SNAPSHOT applies only to MATCH traversals; SELECT, INSERT, and DELETE always run against the live graph.` | `SNAPSHOT` keyword used on a `SELECT`, `INSERT`, or `DELETE`. |
 | `WHERE: expected operator.` | Property with no operator. |
 | `WHERE: invalid operator '<op>'.` | Operator not in the valid set. |
 | `WHERE: expected value.` | Operator with no right-hand value. |

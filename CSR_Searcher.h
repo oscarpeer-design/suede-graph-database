@@ -235,5 +235,9 @@ public:
     // - mode: traversal strategy
     void Run(NodeId target, CSR_Mode mode, size_t k);
 
-    // (Optional) Accessor to get last query results could be added here, e.g. GetResult()
+    // Accessor for the results of the most recent Run(). Returns the traversal
+    // output as Graph NodeIds: the reachable set (REACHABLE), the source->target
+    // node sequence (SHORTEST_PATH, empty when unreachable), or the within-k-hops
+    // set (KHOP). Valid until the next Run() call overwrites the buffer.
+    const std::vector<NodeId>& GetResult() const { return result_; }
 };

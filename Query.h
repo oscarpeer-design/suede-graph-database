@@ -9,6 +9,11 @@
 #include "Types.h"         // NodeId, EdgeId, EdgeDirection, CSR_Mode
 #include "ErrorCodes.h"    // operationSuccessful
 
+// Forward declaration: the CSR snapshot type used to back SNAPSHOT-mode MATCH
+// traversals. Only a reference/pointer is needed here, so the full definition
+// (CSR_Representation.h) is included in Query.cpp rather than in this header.
+class CSR_Representation;
+
 // Query operation and target types
 enum class QueryOperation {
     Unknown,
@@ -22,6 +27,30 @@ enum class QueryTarget {
     Unknown,
     Nodes,
     Edges
+};
+
+// Execution mode: which view of the graph a query resolves against.
+//
+//   Live     -- (default) the query sees the current, mutable graph. Reads
+//               reflect every insert/delete applied so far; INSERT and DELETE
+//               are permitted and modify this graph.
+//   Snapshot -- the query resolves against a frozen, point-in-time CSR snapshot
+//               of the graph (a CSR_Representation, see
+//               Query::execute(Graph&, CSR_Representation&)). The traversal
+//               runs on CSR_Searcher rather than the live BFS_Searcher, and
+//               observes the graph as it was when the snapshot was built,
+//               independent of later live mutations.
+//
+// Because the CSR snapshot only indexes adjacency (not labels or properties),
+// Snapshot mode is meaningful only for MATCH traversals. SELECT, INSERT, and
+// DELETE with SNAPSHOT are rejected during parsing.
+//
+// A statement selects Snapshot mode by ending with the reserved keyword
+// SNAPSHOT (LIVE is accepted as an explicit no-op for the default). See
+// QUERY_REFERENCE.md for the full semantics.
+enum class ExecutionMode {
+    Live,
+    Snapshot
 };
 
 // Simple Condition representation used by WHERE parsing
@@ -49,8 +78,24 @@ public:
     // high-level parse + execute
     bool parse(const std::string& rawQuery);
     bool parse();
+
+    // Execute against a single live graph, with no CSR snapshot available.
+    // LIVE queries read/mutate this graph via BFS_Searcher. A MATCH ... SNAPSHOT
+    // query has nothing frozen to read here, so it gracefully falls back to a
+    // live BFS traversal. Most callers use this form.
     QueryResult execute(Graph& graph) const;
+
+    // Execute with a CSR snapshot available. A MATCH ... SNAPSHOT traversal runs
+    // on CSR_Searcher over `snapshot` (built earlier from the graph), observing
+    // that point-in-time state while `live` keeps changing. LIVE reads and all
+    // mutations still target `live`.
+    QueryResult execute(Graph& live, CSR_Representation& snapshot) const;
+
     QueryResult run(const std::string& rawQuery, Graph& graph);
+
+    // Which view this parsed statement will resolve against (Live by default,
+    // Snapshot when the statement ended with the SNAPSHOT keyword).
+    ExecutionMode executionMode() const { return executionMode_; }
 
 private:
     // small helpers
@@ -79,6 +124,15 @@ private:
     QueryResult executeDeleteEdges(Graph& graph) const;
     QueryResult executeMatch(Graph& graph) const;
 
+    // CSR-backed MATCH execution: runs the traversal on CSR_Searcher over the
+    // supplied point-in-time snapshot.
+    QueryResult executeMatchCSR(CSR_Representation& snapshot) const;
+
+    // Shared execution core for both execute() overloads. `snapshot` is null
+    // when no CSR snapshot is available. MATCH reads route to the CSR snapshot
+    // in Snapshot mode (when one is supplied); everything else uses `live`.
+    QueryResult executeResolved(Graph& live, CSR_Representation* snapshot) const;
+
 private:
     // parse/execution state
     std::string raw_;                          // raw query text
@@ -90,6 +144,9 @@ private:
 
     QueryOperation operation_ = QueryOperation::Unknown;
     QueryTarget target_ = QueryTarget::Unknown;
+
+    // Execution mode selected by an optional trailing LIVE / SNAPSHOT keyword.
+    ExecutionMode executionMode_ = ExecutionMode::Live;
 
     // MATCH-specific
     CSR_Mode matchMode_ = CSR_Mode::REACHABLE;

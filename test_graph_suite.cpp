@@ -3,6 +3,7 @@
 #include "Graph.h"
 #include "Query.h"
 #include "StorageEngine.h"
+#include "CSR_Representation.h"
 #include <iostream>
 #include <cassert>
 #include <fstream>
@@ -157,12 +158,12 @@ int test_graph() {
 //   2: 2 --LIVES_IN--> 3
 static void buildQueryFixture(Graph& graph) {
     NodeId alice = graph.CreateNode("Person", { {"name", "Alice"}, {"age", "30"} });
-    NodeId bob   = graph.CreateNode("Person", { {"name", "Bob"},   {"age", "25"} });
-    NodeId city  = graph.CreateNode("City",   { {"name", "Sydney"} });
+    NodeId bob = graph.CreateNode("Person", { {"name", "Bob"},   {"age", "25"} });
+    NodeId city = graph.CreateNode("City", { {"name", "Sydney"} });
 
     int warning = operationSuccessful;
-    graph.CreateEdge(alice, bob,  "KNOWS",    warning);
-    graph.CreateEdge(bob,   city, "LIVES_IN", warning);
+    graph.CreateEdge(alice, bob, "KNOWS", warning);
+    graph.CreateEdge(bob, city, "LIVES_IN", warning);
 }
 
 int test_query_layer() {
@@ -174,17 +175,17 @@ int test_query_layer() {
     std::cout << "\n== Parsing: well-formed statements accepted ==\n";
     {
         Query q;
-        check("parse SELECT by id",        q.parse("SELECT * FROM NODES WHERE ID = 1"));
-        check("parse SELECT by label",     q.parse("SELECT * FROM NODES WHERE LABEL = 'Person'"));
-        check("parse SELECT with AND",     q.parse("SELECT * FROM NODES WHERE LABEL = 'Person' AND age > 20"));
-        check("parse SELECT edges by from",q.parse("SELECT * FROM EDGES WHERE FROM = 1"));
-        check("parse INSERT nodes",        q.parse("INSERT INTO NODES (label, name) VALUES ('Person', 'Zed')"));
-        check("parse INSERT edges",        q.parse("INSERT INTO EDGES (from, to, label) VALUES (1, 2, 'KNOWS')"));
-        check("parse DELETE nodes",        q.parse("DELETE FROM NODES WHERE ID = 1"));
-        check("parse DELETE edges",        q.parse("DELETE FROM EDGES WHERE ID = 1"));
-        check("parse MATCH reachable",     q.parse("MATCH REACHABLE FROM 1"));
+        check("parse SELECT by id", q.parse("SELECT * FROM NODES WHERE ID = 1"));
+        check("parse SELECT by label", q.parse("SELECT * FROM NODES WHERE LABEL = 'Person'"));
+        check("parse SELECT with AND", q.parse("SELECT * FROM NODES WHERE LABEL = 'Person' AND age > 20"));
+        check("parse SELECT edges by from", q.parse("SELECT * FROM EDGES WHERE FROM = 1"));
+        check("parse INSERT nodes", q.parse("INSERT INTO NODES (label, name) VALUES ('Person', 'Zed')"));
+        check("parse INSERT edges", q.parse("INSERT INTO EDGES (from, to, label) VALUES (1, 2, 'KNOWS')"));
+        check("parse DELETE nodes", q.parse("DELETE FROM NODES WHERE ID = 1"));
+        check("parse DELETE edges", q.parse("DELETE FROM EDGES WHERE ID = 1"));
+        check("parse MATCH reachable", q.parse("MATCH REACHABLE FROM 1"));
         check("parse MATCH shortest_path", q.parse("MATCH SHORTEST_PATH FROM 1 TO 3"));
-        check("parse MATCH khop",          q.parse("MATCH KHOP FROM 1 STEPS 2"));
+        check("parse MATCH khop", q.parse("MATCH KHOP FROM 1 STEPS 2"));
         // keywords are case-insensitive (toUpper on the first token / clauses)
         check("parse is case-insensitive", q.parse("select * from nodes where id = 1"));
     }
@@ -195,23 +196,23 @@ int test_query_layer() {
     std::cout << "\n== Parsing: malformed statements rejected ==\n";
     {
         Query q;
-        check("reject empty query",             !q.parse(""));
-        check("reject unknown keyword",         !q.parse("FROBNICATE NODES"));
-        check("reject SELECT without '*'",      !q.parse("SELECT name FROM NODES WHERE ID = 1"));
-        check("reject SELECT without WHERE",    !q.parse("SELECT * FROM NODES"));
-        check("reject SELECT bad target",       !q.parse("SELECT * FROM PLANETS WHERE ID = 1"));
-        check("reject INSERT NODES no label",   !q.parse("INSERT INTO NODES (name) VALUES ('Zed')"));
-        check("reject INSERT count mismatch",   !q.parse("INSERT INTO NODES (label, name) VALUES ('Person')"));
-        check("reject INSERT EDGES missing col",!q.parse("INSERT INTO EDGES (from, to) VALUES (1, 2)"));
-        check("reject INSERT EDGES extra col",  !q.parse("INSERT INTO EDGES (from, to, label, weight) VALUES (1, 2, 'K', 5)"));
-        check("reject DELETE non-id filter",    !q.parse("DELETE FROM NODES WHERE LABEL = 'Person'"));
-        check("reject DELETE without WHERE",    !q.parse("DELETE FROM NODES"));
-        check("reject MATCH unknown mode",      !q.parse("MATCH WARP FROM 1"));
-        check("reject MATCH KHOP without STEPS",!q.parse("MATCH KHOP FROM 1"));
-        check("reject MATCH non-numeric source",!q.parse("MATCH REACHABLE FROM abc"));
-        check("reject WHERE invalid operator",  !q.parse("SELECT * FROM NODES WHERE ID ~ 1"));
-        check("reject WHERE OR (only AND)",     !q.parse("SELECT * FROM NODES WHERE age > 20 OR age < 10"));
-        check("reject trailing tokens",         !q.parse("MATCH REACHABLE FROM 1 EXTRA"));
+        check("reject empty query", !q.parse(""));
+        check("reject unknown keyword", !q.parse("FROBNICATE NODES"));
+        check("reject SELECT without '*'", !q.parse("SELECT name FROM NODES WHERE ID = 1"));
+        check("reject SELECT without WHERE", !q.parse("SELECT * FROM NODES"));
+        check("reject SELECT bad target", !q.parse("SELECT * FROM PLANETS WHERE ID = 1"));
+        check("reject INSERT NODES no label", !q.parse("INSERT INTO NODES (name) VALUES ('Zed')"));
+        check("reject INSERT count mismatch", !q.parse("INSERT INTO NODES (label, name) VALUES ('Person')"));
+        check("reject INSERT EDGES missing col", !q.parse("INSERT INTO EDGES (from, to) VALUES (1, 2)"));
+        check("reject INSERT EDGES extra col", !q.parse("INSERT INTO EDGES (from, to, label, weight) VALUES (1, 2, 'K', 5)"));
+        check("reject DELETE non-id filter", !q.parse("DELETE FROM NODES WHERE LABEL = 'Person'"));
+        check("reject DELETE without WHERE", !q.parse("DELETE FROM NODES"));
+        check("reject MATCH unknown mode", !q.parse("MATCH WARP FROM 1"));
+        check("reject MATCH KHOP without STEPS", !q.parse("MATCH KHOP FROM 1"));
+        check("reject MATCH non-numeric source", !q.parse("MATCH REACHABLE FROM abc"));
+        check("reject WHERE invalid operator", !q.parse("SELECT * FROM NODES WHERE ID ~ 1"));
+        check("reject WHERE OR (only AND)", !q.parse("SELECT * FROM NODES WHERE age > 20 OR age < 10"));
+        check("reject trailing tokens", !q.parse("MATCH REACHABLE FROM 1 EXTRA"));
     }
 
     // -----------------------------------------------------------------
@@ -225,17 +226,17 @@ int test_query_layer() {
         QueryResult r;
 
         r = q.run("SELECT * FROM NODES WHERE ID = 1", graph);
-        check("select node by id: success",   r.success);
-        check("select node by id: 1 row",     r.nodes.size() == 1);
+        check("select node by id: success", r.success);
+        check("select node by id: 1 row", r.nodes.size() == 1);
         check("select node by id: correct id", r.nodes.size() == 1 && r.nodes[0].id == NodeId(1));
 
         r = q.run("SELECT * FROM NODES WHERE ID = 999", graph);
         check("select missing node id: success (no rows)", r.success);
-        check("select missing node id: 0 rows",            r.nodes.size() == 0);
+        check("select missing node id: 0 rows", r.nodes.size() == 0);
 
         r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person'", graph);
         check("select nodes by label: success", r.success);
-        check("select nodes by label: 2 rows",  r.nodes.size() == 2);
+        check("select nodes by label: 2 rows", r.nodes.size() == 2);
 
         r = q.run("SELECT * FROM NODES WHERE LABEL = 'Ghost'", graph);
         check("select unknown label: reports failure", !r.success);
@@ -258,17 +259,17 @@ int test_query_layer() {
         QueryResult r;
 
         r = q.run("SELECT * FROM EDGES WHERE ID = 1", graph);
-        check("select edge by id: success",   r.success);
-        check("select edge by id: 1 row",     r.edges.size() == 1);
+        check("select edge by id: success", r.success);
+        check("select edge by id: 1 row", r.edges.size() == 1);
         check("select edge by id: label KNOWS", r.edges.size() == 1 && r.edges[0].label == "KNOWS");
 
         r = q.run("SELECT * FROM EDGES WHERE ID = 999", graph);
         check("select missing edge id: success (no rows)", r.success);
-        check("select missing edge id: 0 rows",            r.edges.size() == 0);
+        check("select missing edge id: 0 rows", r.edges.size() == 0);
 
         r = q.run("SELECT * FROM EDGES WHERE LABEL = 'KNOWS'", graph);
         check("select edges by label: success", r.success);
-        check("select edges by label: 1 row",   r.edges.size() == 1);
+        check("select edges by label: 1 row", r.edges.size() == 1);
 
         r = q.run("SELECT * FROM EDGES WHERE LABEL = 'NOPE'", graph);
         check("select unknown edge label: reports failure", !r.success);
@@ -276,17 +277,17 @@ int test_query_layer() {
         // FROM defaults to OUTGOING: node 1 has a single outgoing edge (KNOWS).
         r = q.run("SELECT * FROM EDGES WHERE FROM = 1", graph);
         check("select edges from node (outgoing default): success", r.success);
-        check("select edges from node (outgoing default): 1 row",   r.edges.size() == 1);
+        check("select edges from node (outgoing default): 1 row", r.edges.size() == 1);
 
         // Node 2 has one incoming (KNOWS) and one outgoing (LIVES_IN): BOTH => 2.
         r = q.run("SELECT * FROM EDGES WHERE FROM = 2 AND DIRECTION = 'BOTH'", graph);
         check("select edges direction=BOTH: success", r.success);
-        check("select edges direction=BOTH: 2 rows",  r.edges.size() == 2);
+        check("select edges direction=BOTH: 2 rows", r.edges.size() == 2);
 
         // FROM + LABEL narrows to the labelled outgoing edge.
         r = q.run("SELECT * FROM EDGES WHERE FROM = 1 AND LABEL = 'KNOWS'", graph);
         check("select edges from + label: success", r.success);
-        check("select edges from + label: 1 row",   r.edges.size() == 1);
+        check("select edges from + label: 1 row", r.edges.size() == 1);
 
         // FROM + TO keeps only edges touching the TO endpoint.
         r = q.run("SELECT * FROM EDGES WHERE FROM = 1 AND TO = 2", graph);
@@ -294,7 +295,7 @@ int test_query_layer() {
 
         r = q.run("SELECT * FROM EDGES WHERE FROM = 1 AND TO = 3", graph);
         check("select edges from + non-matching to: success", r.success);
-        check("select edges from + non-matching to: 0 rows",  r.edges.size() == 0);
+        check("select edges from + non-matching to: 0 rows", r.edges.size() == 0);
     }
 
     // -----------------------------------------------------------------
@@ -309,22 +310,22 @@ int test_query_layer() {
 
         // BFS runs undirected (BOTH), so all three nodes are reachable from 1.
         r = q.run("MATCH REACHABLE FROM 1", graph);
-        check("match reachable: success",       r.success);
-        check("match reachable: 3 nodes",       r.traversalResult.size() == 3);
+        check("match reachable: success", r.success);
+        check("match reachable: 3 nodes", r.traversalResult.size() == 3);
 
         // Shortest path 1 -> 2 -> 3 spans three nodes.
         r = q.run("MATCH SHORTEST_PATH FROM 1 TO 3", graph);
-        check("match shortest_path: success",   r.success);
-        check("match shortest_path: 3 nodes",   r.traversalResult.size() == 3);
+        check("match shortest_path: success", r.success);
+        check("match shortest_path: 3 nodes", r.traversalResult.size() == 3);
         check("match shortest_path: starts at source",
-              r.traversalResult.size() == 3 && r.traversalResult.front() == NodeId(1));
+            r.traversalResult.size() == 3 && r.traversalResult.front() == NodeId(1));
         check("match shortest_path: ends at target",
-              r.traversalResult.size() == 3 && r.traversalResult.back() == NodeId(3));
+            r.traversalResult.size() == 3 && r.traversalResult.back() == NodeId(3));
 
         // No path to an unreachable / nonexistent target: success, empty result.
         r = q.run("MATCH SHORTEST_PATH FROM 1 TO 999", graph);
         check("match shortest_path no path: success", r.success);
-        check("match shortest_path no path: empty",   r.traversalResult.empty());
+        check("match shortest_path no path: empty", r.traversalResult.empty());
 
         // KHOP with 1 step reaches node 1 (0 hops) and node 2 (1 hop) only.
         r = q.run("MATCH KHOP FROM 1 STEPS 1", graph);
@@ -341,6 +342,128 @@ int test_query_layer() {
     }
 
     // -----------------------------------------------------------------
+    // 2d. LIVE / SNAPSHOT execution-mode toggling
+    // -----------------------------------------------------------------
+    //
+    // A statement may end with the reserved keyword LIVE (the default) or
+    // SNAPSHOT. LIVE MATCH traversals run on the live graph via BFS_Searcher;
+    // SNAPSHOT MATCH traversals run on a frozen CSR_Representation via
+    // CSR_Searcher. Because the CSR snapshot only indexes adjacency, SNAPSHOT is
+    // rejected on SELECT / INSERT / DELETE at parse time.
+    std::cout << "\n== Parsing: LIVE / SNAPSHOT keyword ==\n";
+    {
+        Query q;
+
+        // The trailing keyword is accepted and recorded on the parsed query.
+        check("parse MATCH ... SNAPSHOT accepted",
+            q.parse("MATCH REACHABLE FROM 1 SNAPSHOT") &&
+            q.executionMode() == ExecutionMode::Snapshot);
+        check("parse MATCH ... LIVE accepted",
+            q.parse("MATCH REACHABLE FROM 1 LIVE") &&
+            q.executionMode() == ExecutionMode::Live);
+        // No trailing keyword defaults to LIVE.
+        check("parse MATCH (no keyword) defaults to LIVE",
+            q.parse("MATCH REACHABLE FROM 1") &&
+            q.executionMode() == ExecutionMode::Live);
+        // The keyword is case-insensitive, like every other keyword.
+        check("parse SNAPSHOT is case-insensitive",
+            q.parse("MATCH KHOP FROM 1 STEPS 2 snapshot") &&
+            q.executionMode() == ExecutionMode::Snapshot);
+        // A quoted value that happens to spell SNAPSHOT is NOT a mode keyword.
+        check("quoted 'SNAPSHOT' value is not a mode keyword",
+            q.parse("SELECT * FROM NODES WHERE LABEL = 'SNAPSHOT'") &&
+            q.executionMode() == ExecutionMode::Live);
+
+        // SNAPSHOT is only valid on MATCH; the other statements reject it.
+        check("reject SELECT ... SNAPSHOT", !q.parse("SELECT * FROM NODES WHERE ID = 1 SNAPSHOT"));
+        check("reject INSERT ... SNAPSHOT", !q.parse("INSERT INTO NODES (label) VALUES ('X') SNAPSHOT"));
+        check("reject DELETE ... SNAPSHOT", !q.parse("DELETE FROM NODES WHERE ID = 1 SNAPSHOT"));
+    }
+
+    std::cout << "\n== Execute: MATCH over a CSR SNAPSHOT ==\n";
+    {
+        Graph graph;
+        buildQueryFixture(graph);
+
+        // Freeze a point-in-time CSR snapshot of the graph.
+        CSR_Representation snapshot(graph);
+        snapshot.Load_CSR();
+
+        Query q;
+        QueryResult r;
+
+        // REACHABLE over the snapshot: undirected BFS reaches all three nodes.
+        q.parse("MATCH REACHABLE FROM 1 SNAPSHOT");
+        r = q.execute(graph, snapshot);
+        check("snapshot reachable: success", r.success);
+        check("snapshot reachable: 3 nodes", r.traversalResult.size() == 3);
+
+        // SHORTEST_PATH over the snapshot: 1 -> 2 -> 3.
+        q.parse("MATCH SHORTEST_PATH FROM 1 TO 3 SNAPSHOT");
+        r = q.execute(graph, snapshot);
+        check("snapshot shortest_path: success", r.success);
+        check("snapshot shortest_path: 3 nodes", r.traversalResult.size() == 3);
+        check("snapshot shortest_path: starts at source",
+            r.traversalResult.size() == 3 && r.traversalResult.front() == NodeId(1));
+        check("snapshot shortest_path: ends at target",
+            r.traversalResult.size() == 3 && r.traversalResult.back() == NodeId(3));
+
+        // SHORTEST_PATH to a node absent from the snapshot: success, empty path.
+        q.parse("MATCH SHORTEST_PATH FROM 1 TO 999 SNAPSHOT");
+        r = q.execute(graph, snapshot);
+        check("snapshot shortest_path no path: success", r.success);
+        check("snapshot shortest_path no path: empty", r.traversalResult.empty());
+
+        // KHOP over the snapshot: 1 step reaches node 1 (0 hops) and node 2.
+        q.parse("MATCH KHOP FROM 1 STEPS 1 SNAPSHOT");
+        r = q.execute(graph, snapshot);
+        check("snapshot khop steps=1: success", r.success);
+        check("snapshot khop steps=1: 2 nodes", r.traversalResult.size() == 2);
+
+        // A source node absent from the snapshot is an execution failure.
+        q.parse("MATCH REACHABLE FROM 999 SNAPSHOT");
+        r = q.execute(graph, snapshot);
+        check("snapshot missing source: reports failure", !r.success);
+    }
+
+    std::cout << "\n== Execute: point-in-time divergence (LIVE vs SNAPSHOT) ==\n";
+    {
+        Graph graph;
+        buildQueryFixture(graph);           // nodes 1,2,3 ; edges 1->2, 2->3
+
+        // Freeze the snapshot while the graph has exactly three nodes.
+        CSR_Representation snapshot(graph);
+        snapshot.Load_CSR();
+
+        // Now mutate the LIVE graph: add node 4 and connect it to node 3.
+        int warning = operationSuccessful;
+        graph.CreateNode("Robot", { {"name", "R2"} });      // id 4
+        graph.CreateEdge(NodeId(3), NodeId(4), "BUILT", warning);
+
+        Query q;
+        QueryResult r;
+
+        // LIVE reflects the mutation: node 4 is now reachable -> 4 nodes.
+        q.parse("MATCH REACHABLE FROM 1 LIVE");
+        r = q.execute(graph, snapshot);
+        check("live reachable sees new node: 4 nodes",
+            r.success && r.traversalResult.size() == 4);
+
+        // SNAPSHOT is frozen at 3 nodes: it does not see the later mutation.
+        q.parse("MATCH REACHABLE FROM 1 SNAPSHOT");
+        r = q.execute(graph, snapshot);
+        check("snapshot reachable ignores new node: 3 nodes",
+            r.success && r.traversalResult.size() == 3);
+
+        // With no snapshot supplied, a SNAPSHOT query gracefully falls back to
+        // the live BFS traversal (single-argument execute) -> sees 4 nodes.
+        q.parse("MATCH REACHABLE FROM 1 SNAPSHOT");
+        r = q.execute(graph);
+        check("snapshot query, no snapshot supplied: falls back to live (4 nodes)",
+            r.success && r.traversalResult.size() == 4);
+    }
+
+    // -----------------------------------------------------------------
     // 3. EXECUTION -- INSERT (mutating)
     // -----------------------------------------------------------------
     std::cout << "\n== Execute: INSERT ==\n";
@@ -352,17 +475,17 @@ int test_query_layer() {
 
         // Insert a node, then read it back through the query layer (new id = 4).
         r = q.run("INSERT INTO NODES (label, name) VALUES ('Robot', 'R2')", graph);
-        check("insert node: success",        r.success);
+        check("insert node: success", r.success);
         check("insert node: 1 row returned", r.nodes.size() == 1);
         check("insert node: label preserved",
-              r.nodes.size() == 1 && r.nodes[0].label == "Robot");
+            r.nodes.size() == 1 && r.nodes[0].label == "Robot");
 
         r = q.run("SELECT * FROM NODES WHERE ID = 4", graph);
         check("inserted node is retrievable", r.success && r.nodes.size() == 1);
 
         // Insert a valid edge between existing nodes.
         r = q.run("INSERT INTO EDGES (from, to, label) VALUES (1, 3, 'VISITS')", graph);
-        check("insert edge: success",        r.success);
+        check("insert edge: success", r.success);
         check("insert edge: 1 row returned", r.edges.size() == 1);
 
         // Insert an edge with a nonexistent endpoint -> execution failure.
@@ -428,19 +551,19 @@ int test_query_layer() {
 // 0-based insertion index, which is what the index comments above refer to.)
 static void buildStorageFixture(Graph& graph) {
     NodeId alice = graph.CreateNode("Person", { {"name", "Alice"}, {"age", "30"} });
-    NodeId bob   = graph.CreateNode("Person", { {"name", "Bob"},   {"age", "25"} });
-    NodeId city  = graph.CreateNode("City",   { {"name", "Sydney"} });
+    NodeId bob = graph.CreateNode("Person", { {"name", "Bob"},   {"age", "25"} });
+    NodeId city = graph.CreateNode("City", { {"name", "Sydney"} });
 
     int warning = operationSuccessful;
-    graph.CreateEdge(alice, bob,  "KNOWS",    warning);
-    graph.CreateEdge(bob,   city, "LIVES_IN", warning);
+    graph.CreateEdge(alice, bob, "KNOWS", warning);
+    graph.CreateEdge(bob, city, "LIVES_IN", warning);
 }
 
 int test_storage_engine() {
     std::cout << "\n=================== STORAGE ENGINE ===================\n";
 
-    const std::string binPath    = "se_test_graph.bin";
-    const std::string csvInPath  = "se_test_import.csv";
+    const std::string binPath = "se_test_graph.bin";
+    const std::string csvInPath = "se_test_import.csv";
     const std::string csvOutPath = "se_test_export.csv";
 
     // -----------------------------------------------------------------
@@ -470,21 +593,21 @@ int test_storage_engine() {
         Node n0, n2;
         bool got0 = nodeIds.size() == 3 && loaded.GetNode(nodeIds[0], n0);
         bool got2 = nodeIds.size() == 3 && loaded.GetNode(nodeIds[2], n2);
-        check("Load: node 0 label preserved",   got0 && n0.label == "Person");
-        check("Load: node 0 name preserved",     got0 && n0.properties.at("name") == "Alice");
-        check("Load: node 0 age preserved",      got0 && n0.properties.at("age")  == "30");
-        check("Load: node 2 label preserved",     got2 && n2.label == "City");
-        check("Load: node 2 name preserved",      got2 && n2.properties.at("name") == "Sydney");
+        check("Load: node 0 label preserved", got0 && n0.label == "Person");
+        check("Load: node 0 name preserved", got0 && n0.properties.at("name") == "Alice");
+        check("Load: node 0 age preserved", got0 && n0.properties.at("age") == "30");
+        check("Load: node 2 label preserved", got2 && n2.label == "City");
+        check("Load: node 2 name preserved", got2 && n2.properties.at("name") == "Sydney");
 
         // Edge content is preserved, including endpoints (by relative position).
         int warning = operationSuccessful;
         std::vector<Edge> knows;
         loaded.FindEdgesByLabel(knows, "KNOWS", warning);
         check("Load: KNOWS edge restored",
-              warning == operationSuccessful && knows.size() == 1);
+            warning == operationSuccessful && knows.size() == 1);
         check("Load: KNOWS endpoints preserved",
-              knows.size() == 1 && nodeIds.size() == 3 &&
-              knows[0].from == nodeIds[0] && knows[0].to == nodeIds[1]);
+            knows.size() == 1 && nodeIds.size() == 3 &&
+            knows[0].from == nodeIds[0] && knows[0].to == nodeIds[1]);
 
         // -------------------------------------------------------------
         // 2. ValidateGraph (uses the counts captured during Load)
@@ -538,17 +661,17 @@ int test_storage_engine() {
 
         Node n0;
         bool got0 = nodeIds.size() == 3 && imported.GetNode(nodeIds[0], n0);
-        check("ImportCSV: node label parsed",    got0 && n0.label == "Person");
+        check("ImportCSV: node label parsed", got0 && n0.label == "Person");
         check("ImportCSV: node property parsed", got0 && n0.properties.at("name") == "Alice");
 
         int warning = operationSuccessful;
         std::vector<Edge> lives;
         imported.FindEdgesByLabel(lives, "LIVES_IN", warning);
         check("ImportCSV: edge label parsed",
-              warning == operationSuccessful && lives.size() == 1);
+            warning == operationSuccessful && lives.size() == 1);
         check("ImportCSV: edge endpoints parsed",
-              lives.size() == 1 && nodeIds.size() == 3 &&
-              lives[0].from == nodeIds[1] && lives[0].to == nodeIds[2]);
+            lives.size() == 1 && nodeIds.size() == 3 &&
+            lives[0].from == nodeIds[1] && lives[0].to == nodeIds[2]);
     }
 
     // -----------------------------------------------------------------
@@ -567,10 +690,10 @@ int test_storage_engine() {
         buffer << in.rdbuf();
         const std::string content = buffer.str();
 
-        check("ExportCSV: node label written",    content.find("Person") != std::string::npos);
-        check("ExportCSV: node property written",  content.find("name=Alice") != std::string::npos);
-        check("ExportCSV: KNOWS edge written",     content.find("0,1,KNOWS") != std::string::npos);
-        check("ExportCSV: LIVES_IN edge written",  content.find("1,2,LIVES_IN") != std::string::npos);
+        check("ExportCSV: node label written", content.find("Person") != std::string::npos);
+        check("ExportCSV: node property written", content.find("name=Alice") != std::string::npos);
+        check("ExportCSV: KNOWS edge written", content.find("0,1,KNOWS") != std::string::npos);
+        check("ExportCSV: LIVES_IN edge written", content.find("1,2,LIVES_IN") != std::string::npos);
     }
 
     // -----------------------------------------------------------------

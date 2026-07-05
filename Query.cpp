@@ -6,7 +6,9 @@
 // understand.
 
 #include "Query.h"
-#include "BFS_Searcher.h"                      // Include BFS traversal helper used by MATCH queries
+#include "BFS_Searcher.h"                      // Live MATCH traversals (LIVE mode)
+#include "CSR_Representation.h"                 // Point-in-time CSR snapshot type
+#include "CSR_Searcher.h"                       // Snapshot MATCH traversals (SNAPSHOT mode)
 
 #include <algorithm>                            // std::transform, std::find
 #include <cctype>                               // std::toupper, std::isspace, std::isdigit
@@ -15,10 +17,10 @@
 
 namespace {                                    // anonymous namespace for internal helpers
 
-// Return true if the character is considered part of a comparison operator.
-bool isOperatorChar(char c) {
-    return c == '=' || c == '!' || c == '<' || c == '>'; // operator chars: =, !, <, >
-}
+    // Return true if the character is considered part of a comparison operator.
+    bool isOperatorChar(char c) {
+        return c == '=' || c == '!' || c == '<' || c == '>'; // operator chars: =, !, <, >
+    }
 
 } // anonymous namespace
 
@@ -31,7 +33,7 @@ Query::Query(std::string rawQuery) : raw_(std::move(rawQuery)) {}
 std::string Query::toUpper(const std::string& s) const {
     std::string out = s;                         // make a mutable copy of the input
     std::transform(out.begin(), out.end(), out.begin(),
-                    [](unsigned char c) { return static_cast<char>(std::toupper(c)); }); // uppercase each char
+        [](unsigned char c) { return static_cast<char>(std::toupper(c)); }); // uppercase each char
     return out;                                  // return the transformed string
 }
 
@@ -135,6 +137,7 @@ bool Query::parse() {
     values_.clear();                             // clear parsed INSERT values
     operation_ = QueryOperation::Unknown;        // reset operation type
     target_ = QueryTarget::Unknown;              // reset target type
+    executionMode_ = ExecutionMode::Live;        // reset to the default (live) view
 
     std::vector<std::string> tokens = tokenize(raw_); // produce tokens from the raw input
     if (tokens.empty()) {                        // handle empty input case
@@ -142,22 +145,54 @@ bool Query::parse() {
         return false;
     }
 
+    // Optional trailing execution-mode keyword. A statement may end with the
+    // reserved word LIVE (the default) or SNAPSHOT (read against a frozen,
+    // point-in-time copy). We consume it here, before dispatch, so the
+    // individual clause parsers never see it and their "unexpected trailing
+    // tokens" checks keep working unchanged. Only a bare, final LIVE/SNAPSHOT
+    // token is treated as a mode keyword -- a quoted value such as 'SNAPSHOT'
+    // tokenizes with its quotes and is left untouched.
+    if (tokens.size() >= 2) {
+        std::string lastUpper = toUpper(tokens.back());
+        if (lastUpper == "SNAPSHOT") {
+            executionMode_ = ExecutionMode::Snapshot;
+            tokens.pop_back();
+        }
+        else if (lastUpper == "LIVE") {
+            executionMode_ = ExecutionMode::Live;
+            tokens.pop_back();
+        }
+    }
+
     std::string keyword = toUpper(tokens[0]);    // read the first token as a case-insensitive keyword
+
+    // The CSR snapshot only indexes adjacency, so SNAPSHOT mode can serve only
+    // MATCH traversals. Reject SNAPSHOT on SELECT/INSERT/DELETE up front so the
+    // caller gets a clear parse-time error rather than a confusing one later.
+    if (executionMode_ == ExecutionMode::Snapshot && keyword != "MATCH") {
+        setError("SNAPSHOT applies only to MATCH traversals; SELECT, INSERT, and DELETE always run against the live graph.");
+        return false;
+    }
+
     bool ok = false;                             // will hold result of clause-specific parsing
 
     if (keyword == "SELECT") {                   // SELECT statement dispatch
         operation_ = QueryOperation::Select;     // set operation type
         ok = parseSelect(tokens, 1);             // parse the remainder starting at token index 1
-    } else if (keyword == "INSERT") {            // INSERT statement dispatch
+    }
+    else if (keyword == "INSERT") {            // INSERT statement dispatch
         operation_ = QueryOperation::Insert;
         ok = parseInsert(tokens, 1);
-    } else if (keyword == "DELETE") {            // DELETE statement dispatch
+    }
+    else if (keyword == "DELETE") {            // DELETE statement dispatch
         operation_ = QueryOperation::Delete;
         ok = parseDelete(tokens, 1);
-    } else if (keyword == "MATCH") {             // MATCH traversal dispatch
+    }
+    else if (keyword == "MATCH") {             // MATCH traversal dispatch
         operation_ = QueryOperation::Match;
         ok = parseMatch(tokens, 1);
-    } else {                                     // unknown top-level keyword
+    }
+    else {                                     // unknown top-level keyword
         setError("Unrecognized query keyword: " + tokens[0]); // error out with original token shown
         return false;
     }
@@ -250,7 +285,8 @@ bool Query::parseInsert(const std::vector<std::string>& tokens, size_t pos) {
             setError("INSERT INTO NODES requires a 'label' column.");
             return false;
         }
-    } else {                                      // validation for edge inserts
+    }
+    else {                                      // validation for edge inserts
         // Edges must have exactly from, to, label and no other columns.
         if (values_.find("from") == values_.end() || values_.find("to") == values_.end() ||
             values_.find("label") == values_.end()) {
@@ -320,7 +356,8 @@ bool Query::parseMatch(const std::vector<std::string>& tokens, size_t pos) {
             return false;
         }
         ++pos;                                    // advance after target id
-    } else if (matchMode_ == CSR_Mode::KHOP) {     // KHOP expects STEPS <k>
+    }
+    else if (matchMode_ == CSR_Mode::KHOP) {     // KHOP expects STEPS <k>
         if (pos >= tokens.size() || toUpper(tokens[pos]) != "STEPS") { setError("MATCH KHOP: expected STEPS."); return false; }
         ++pos;                                    // skip 'STEPS'
         uint64_t k = 0;                           // temporary numeric storage
@@ -349,7 +386,7 @@ bool Query::parseWhereClause(const std::vector<std::string>& tokens, size_t pos)
 
         if (pos >= tokens.size()) { setError("WHERE: expected operator."); return false; } // require operator token
         cond.op = tokens[pos];                    // read operator token
-        static const std::vector<std::string> validOps = {"=", "!=", "<", ">", "<=", ">="}; // allowed ops
+        static const std::vector<std::string> validOps = { "=", "!=", "<", ">", "<=", ">=" }; // allowed ops
         if (std::find(validOps.begin(), validOps.end(), cond.op) == validOps.end()) { // validate op
             setError("WHERE: invalid operator '" + cond.op + "'.");
             return false;
@@ -376,8 +413,23 @@ bool Query::parseWhereClause(const std::vector<std::string>& tokens, size_t pos)
 
 // --------------------------- execute() --------------------------------------
 
-// Execute previously parsed statement against `graph`. Dispatch based on operation_.
+// Single-graph execute: no CSR snapshot available. A MATCH ... SNAPSHOT query
+// has nothing frozen to read, so it falls back to a live BFS traversal.
 QueryResult Query::execute(Graph& graph) const {
+    return executeResolved(graph, nullptr);
+}
+
+// CSR-snapshot execute: a MATCH ... SNAPSHOT traversal runs on CSR_Searcher over
+// `snapshot`; LIVE reads and all mutations target `live`.
+QueryResult Query::execute(Graph& live, CSR_Representation& snapshot) const {
+    return executeResolved(live, &snapshot);
+}
+
+// Execute previously parsed statement. Dispatch based on operation_. SELECT,
+// INSERT and DELETE always run against the live graph (SNAPSHOT on these is
+// rejected during parsing). A MATCH traversal runs on the CSR snapshot when
+// Snapshot mode is requested and a snapshot is supplied; otherwise on live BFS.
+QueryResult Query::executeResolved(Graph& live, CSR_Representation* snapshot) const {
     QueryResult result;                           // accumulator for execution result
 
     if (!parsed_) {                               // guard: cannot execute if not parsed successfully
@@ -387,19 +439,23 @@ QueryResult Query::execute(Graph& graph) const {
     }
 
     switch (operation_) {                         // dispatch by operation type
-        case QueryOperation::Select:
-            return (target_ == QueryTarget::Nodes) ? executeSelectNodes(graph) : executeSelectEdges(graph);
-        case QueryOperation::Insert:
-            return (target_ == QueryTarget::Nodes) ? executeInsertNodes(graph) : executeInsertEdges(graph);
-        case QueryOperation::Delete:
-            return (target_ == QueryTarget::Nodes) ? executeDeleteNodes(graph) : executeDeleteEdges(graph);
-        case QueryOperation::Match:
-            return executeMatch(graph);
-        case QueryOperation::Unknown:
-        default:
-            result.success = false;               // unknown operation is an execution error
-            result.message = "Cannot execute a query with an unknown operation.";
-            return result;
+    case QueryOperation::Select:
+        return (target_ == QueryTarget::Nodes) ? executeSelectNodes(live) : executeSelectEdges(live);
+    case QueryOperation::Insert:
+        return (target_ == QueryTarget::Nodes) ? executeInsertNodes(live) : executeInsertEdges(live);
+    case QueryOperation::Delete:
+        return (target_ == QueryTarget::Nodes) ? executeDeleteNodes(live) : executeDeleteEdges(live);
+    case QueryOperation::Match:
+        // Route to the CSR snapshot when SNAPSHOT was requested and one is
+        // actually available; otherwise fall back to the live BFS traversal.
+        if (executionMode_ == ExecutionMode::Snapshot && snapshot != nullptr)
+            return executeMatchCSR(*snapshot);
+        return executeMatch(live);
+    case QueryOperation::Unknown:
+    default:
+        result.success = false;               // unknown operation is an execution error
+        result.message = "Cannot execute a query with an unknown operation.";
+        return result;
     }
 }
 
@@ -418,22 +474,22 @@ QueryResult Query::run(const std::string& rawQuery, Graph& graph) {
 static bool executeCondition(const Condition& e, const std::string& actual, bool& matches) {
     bool condResult;
     if (e.op == "=") // equality
-        condResult = (actual == e.value);    
+        condResult = (actual == e.value);
     else if (e.op == "!=") // inequality
         condResult = (actual != e.value); // inequality
     else if (e.op == "<") // lexicographic comparison
-        condResult = (actual < e.value);  
+        condResult = (actual < e.value);
     else if (e.op == ">") // greater than lexicographic comparison
         condResult = (actual > e.value);
     else if (e.op == "<=") // less than or equal to
-        condResult = (actual <= e.value); 
+        condResult = (actual <= e.value);
     else if (e.op == ">=") // greater than or equal to
         condResult = (actual >= e.value);
-    else 
+    else
         condResult = false;        // unknown operator (should not happen due to parse validation)
-    // set match and return result of execution
-    matches = condResult;
-    return condResult;
+
+    matches = condResult;          // report the result through the out-parameter
+    return condResult;             // and as the return value used by the caller
 }
 
 
@@ -452,7 +508,8 @@ QueryResult Query::executeSelectNodes(Graph& graph) const {
                 result.nodes.push_back(node);    // add found node to result set
                 result.success = true;
                 result.message = "Found 1 row.";
-            } else {
+            }
+            else {
                 result.success = true;           // query succeeded but returned no rows
                 result.message = "Found 0 row(s).";
             }
@@ -528,7 +585,8 @@ QueryResult Query::executeSelectEdges(Graph& graph) const {
             result.edges.push_back(edge);        // add to result if found
             result.success = true;
             result.message = "Found 1 row.";
-        } else {
+        }
+        else {
             result.success = true;               // found 0 rows but operation is successful
             result.message = "Found 0 row(s).";
         }
@@ -553,7 +611,8 @@ QueryResult Query::executeSelectEdges(Graph& graph) const {
 
         if (field.count("LABEL")) {               // if LABEL provided, use label-aware fetch
             graph.FindEdgesByNodeAndLabel(from, field["LABEL"], found, dir, warning);
-        } else {                                  // otherwise request all edges for the node in the requested direction
+        }
+        else {                                  // otherwise request all edges for the node in the requested direction
             graph.FindEdgesByNodeId(from, found, dir, warning);
         }
 
@@ -618,7 +677,8 @@ QueryResult Query::executeInsertNodes(Graph& graph) const {
         result.nodes.push_back(node);
         result.success = true;
         result.message = "Inserted node.";
-    } else {
+    }
+    else {
         result.success = false;
         result.message = "Node insert reported success but could not be re-read.";
     }
@@ -650,7 +710,8 @@ QueryResult Query::executeInsertEdges(Graph& graph) const {
         result.edges.push_back(edge);
         result.success = true;
         result.message = "Inserted edge.";
-    } else {
+    }
+    else {
         result.success = false;
         result.message = "Edge insert reported success but could not be re-read.";
     }
@@ -749,6 +810,69 @@ QueryResult Query::executeMatch(Graph& graph) const {
 
     result.success = true;                        // match executed successfully
     result.message = "Found " + std::to_string(result.traversalResult.size()) + " node(s) within " +
-                      std::to_string(matchK_) + " hop(s)."; // human-readable summary
+        std::to_string(matchK_) + " hop(s)."; // human-readable summary
     return result;                                // return final result
+}
+
+// --------------------------- MATCH over a CSR snapshot ------------------------
+
+// Execute MATCH queries against a frozen CSR snapshot using CSR_Searcher. This
+// mirrors executeMatch()'s result shape and messages exactly, so a query
+// returns the same kind of QueryResult whether it ran LIVE (BFS) or SNAPSHOT
+// (CSR) -- only the engine and the point-in-time it observes differ.
+QueryResult Query::executeMatchCSR(CSR_Representation& snapshot) const {
+    QueryResult result;                           // result container
+
+    NodeId source(matchFromRaw_);                 // wrap raw numeric source into NodeId
+
+    // Verify the source exists in the snapshot's CSR index space. A node that
+    // was created after the snapshot was built simply isn't mapped.
+    int mapWarning = operationSuccessful;
+    snapshot.MapGraphNodeToCSR(source, mapWarning);
+    if (mapWarning != operationSuccessful) {
+        result.success = false;
+        result.message = "MATCH: source node does not exist.";
+        return result;
+    }
+
+    // For SHORTEST_PATH, guard the target too. CSR_Searcher maps a missing
+    // target to CSR index 0, which would otherwise be misread as "found"; we
+    // treat an unmapped target as simply unreachable, matching the BFS path.
+    if (matchMode_ == CSR_Mode::SHORTEST_PATH) {
+        int targetWarning = operationSuccessful;
+        snapshot.MapGraphNodeToCSR(NodeId(matchToRaw_), targetWarning);
+        if (targetWarning != operationSuccessful) {
+            result.success = true;
+            result.traversalResult.clear();
+            result.message = "No path found between the given nodes.";
+            return result;
+        }
+    }
+
+    // Run the CSR traversal. target is used for SHORTEST_PATH; matchK_ for KHOP.
+    CSR_Searcher searcher(source, snapshot);
+    searcher.Run(NodeId(matchToRaw_), matchMode_, matchK_);
+    result.traversalResult = searcher.GetResult();
+
+    // Compose the mode-specific success message, identical to the BFS variant.
+    if (matchMode_ == CSR_Mode::REACHABLE) {
+        result.success = true;
+        result.message = "Found " + std::to_string(result.traversalResult.size()) + " reachable node(s).";
+        return result;
+    }
+
+    if (matchMode_ == CSR_Mode::SHORTEST_PATH) {
+        result.success = true;
+        if (result.traversalResult.empty())
+            result.message = "No path found between the given nodes.";
+        else
+            result.message = "Path found with " + std::to_string(result.traversalResult.size()) + " node(s).";
+        return result;
+    }
+
+    // KHOP
+    result.success = true;
+    result.message = "Found " + std::to_string(result.traversalResult.size()) + " node(s) within " +
+        std::to_string(matchK_) + " hop(s).";
+    return result;
 }

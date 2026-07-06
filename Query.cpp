@@ -138,6 +138,9 @@ bool Query::parse() {
     operation_ = QueryOperation::Unknown;        // reset operation type
     target_ = QueryTarget::Unknown;              // reset target type
     executionMode_ = ExecutionMode::Live;        // reset to the default (live) view
+    projection_.clear();                         // reset projection (empty == "*")
+    hasLimit_ = false;                           // reset row limit
+    limit_ = 0;
 
     std::vector<std::string> tokens = tokenize(raw_); // produce tokens from the raw input
     if (tokens.empty()) {                        // handle empty input case
@@ -211,13 +214,52 @@ bool Query::parseTarget(const std::string& token, QueryTarget& outTarget) const 
 
 // --------------------------- clause parsers ----------------------------------
 
-// parse SELECT * FROM <NODES|EDGES> [WHERE ...]
-// This function enforces that only '*' projection is supported and that a
-// WHERE clause is present and valid.
+// parse SELECT [TOP <n>] <* | col1, col2, ...> FROM <NODES|EDGES> [WHERE ...]
+//
+// Projection: '*' selects all columns (the default); a comma-separated list of
+// column names selects only those. Column names are node property keys plus the
+// reserved names "id" and "label". Projection is NODES-only -- an explicit
+// column list against EDGES is rejected (edges have no property map to trim).
+//
+// TOP <n>: an optional leading row limit (T-SQL style), applied to the result.
 bool Query::parseSelect(const std::vector<std::string>& tokens, size_t pos) {
-    if (pos >= tokens.size()) { setError("SELECT: expected '*'."); return false; } // need a projection token
-    if (tokens[pos] != "*") { setError("SELECT: only '*' projections are supported."); return false; } // reject other forms
-    ++pos;                                        // advance past the '*'
+    // Optional leading TOP <n>.
+    if (pos < tokens.size() && toUpper(tokens[pos]) == "TOP") {
+        ++pos;                                    // consume TOP
+        uint64_t n = 0;
+        if (pos >= tokens.size() || !parseUInt(tokens[pos], n)) {
+            setError("SELECT TOP: expected a non-negative integer row count after TOP.");
+            return false;
+        }
+        hasLimit_ = true;
+        limit_ = static_cast<size_t>(n);
+        ++pos;                                    // consume the count
+    }
+
+    // Projection: '*' or a comma-separated column list.
+    if (pos >= tokens.size()) { setError("SELECT: expected '*' or a column list."); return false; }
+    if (tokens[pos] == "*") {
+        ++pos;                                    // '*' -> projection_ stays empty (all columns)
+    }
+    else {
+        // Read identifiers separated by commas until FROM.
+        bool expectColumn = true;                 // grammar: col (, col)*
+        while (pos < tokens.size() && toUpper(tokens[pos]) != "FROM") {
+            if (tokens[pos] == ",") {
+                if (expectColumn) { setError("SELECT: unexpected ',' in column list."); return false; }
+                expectColumn = true;
+                ++pos;
+                continue;
+            }
+            if (!expectColumn) { setError("SELECT: expected ',' between columns."); return false; }
+            // A bare '*' mixed into a list is not allowed.
+            if (tokens[pos] == "*") { setError("SELECT: cannot mix '*' with named columns."); return false; }
+            projection_.push_back(tokens[pos]);   // column name, case-preserved
+            expectColumn = false;
+            ++pos;
+        }
+        if (projection_.empty() || expectColumn) { setError("SELECT: expected a column name."); return false; }
+    }
 
     if (pos >= tokens.size() || toUpper(tokens[pos]) != "FROM") { setError("SELECT: expected FROM."); return false; } // require FROM
     ++pos;                                        // advance past 'FROM'
@@ -227,6 +269,13 @@ bool Query::parseSelect(const std::vector<std::string>& tokens, size_t pos) {
         return false;
     }
     ++pos;                                        // advance past target token
+
+    // Selective projection is only supported for NODES (edges have no property
+    // map). EDGES must use '*'.
+    if (target_ == QueryTarget::Edges && !projection_.empty()) {
+        setError("SELECT: selective columns are only supported for NODES; use '*' for EDGES.");
+        return false;
+    }
 
     if (pos < tokens.size()) {                    // if there are more tokens, expect a WHERE clause
         if (toUpper(tokens[pos]) != "WHERE") { setError("SELECT: unexpected token '" + tokens[pos] + "'."); return false; } // unexpected token
@@ -329,8 +378,21 @@ bool Query::parseDelete(const std::vector<std::string>& tokens, size_t pos) {
     return true;                                  // delete parse validated
 }
 
-// parse MATCH queries: SHORTEST_PATH, REACHABLE, KHOP variants
+// parse MATCH [TOP <n>] <mode> FROM <src> ...  (SHORTEST_PATH, REACHABLE, KHOP)
 bool Query::parseMatch(const std::vector<std::string>& tokens, size_t pos) {
+    // Optional leading TOP <n> caps the number of nodes returned.
+    if (pos < tokens.size() && toUpper(tokens[pos]) == "TOP") {
+        ++pos;                                    // consume TOP
+        uint64_t n = 0;
+        if (pos >= tokens.size() || !parseUInt(tokens[pos], n)) {
+            setError("MATCH TOP: expected a non-negative integer row count after TOP.");
+            return false;
+        }
+        hasLimit_ = true;
+        limit_ = static_cast<size_t>(n);
+        ++pos;                                    // consume the count
+    }
+
     if (pos >= tokens.size()) { setError("MATCH: expected SHORTEST_PATH, REACHABLE, or KHOP."); return false; } // require mode token
     std::string mode = toUpper(tokens[pos]);       // read mode in uppercase
     if (mode == "SHORTEST_PATH") matchMode_ = CSR_Mode::SHORTEST_PATH; // set match mode
@@ -492,6 +554,27 @@ static bool executeCondition(const Condition& e, const std::string& actual, bool
     return condResult;             // and as the return value used by the caller
 }
 
+// Trim each node's property map to the projected columns. A "*" projection
+// (projection_ empty) is a no-op. The reserved columns "id" and "label" are
+// structural fields on the Node (not entries in the property map), so they are
+// always available and are simply skipped here; every other projected column is
+// looked up as a property key and kept when present.
+void Query::projectNodes(std::vector<Node>& nodes) const {
+    if (projection_.empty()) return;              // '*' -> keep all columns
+
+    for (Node& node : nodes) {
+        propertiesMap trimmed;
+        for (const std::string& col : projection_) {
+            std::string upper = toUpper(col);
+            if (upper == "ID" || upper == "LABEL") continue; // structural, always kept
+            auto it = node.properties.find(col);  // property keys are case-sensitive
+            if (it != node.properties.end())
+                trimmed.emplace(col, it->second);
+        }
+        node.properties = std::move(trimmed);
+    }
+}
+
 
 
 // Execute a SELECT query targeting nodes.
@@ -506,13 +589,13 @@ QueryResult Query::executeSelectNodes(Graph& graph) const {
             Node node;                            // temporary Node container
             if (graph.GetNode(NodeId(idVal), node)) { // attempt to fetch node by id
                 result.nodes.push_back(node);    // add found node to result set
-                result.success = true;
-                result.message = "Found 1 row.";
             }
-            else {
-                result.success = true;           // query succeeded but returned no rows
-                result.message = "Found 0 row(s).";
-            }
+            result.success = true;               // an id lookup always succeeds (0 or 1 rows)
+            projectNodes(result.nodes);          // trim to selected columns (no-op for '*')
+            applyLimit(result.nodes);            // apply TOP <n> (only matters for TOP 0 here)
+            result.message = (result.nodes.size() == 1)
+                ? "Found 1 row."
+                : "Found " + std::to_string(result.nodes.size()) + " row(s).";
             return result;                       // return early after ID lookup
         }
     }
@@ -553,7 +636,11 @@ QueryResult Query::executeSelectNodes(Graph& graph) const {
             }
 
             result.success = true;
-            result.message = "Found " + std::to_string(result.nodes.size()) + " row(s).";
+            projectNodes(result.nodes);              // trim to selected columns (no-op for '*')
+            applyLimit(result.nodes);                // apply TOP <n> row cap
+            result.message = (result.nodes.size() == 1)
+                ? "Found 1 row."
+                : "Found " + std::to_string(result.nodes.size()) + " row(s).";
             return result;                           // done processing LABEL-based SELECT
         }
     }
@@ -583,13 +670,12 @@ QueryResult Query::executeSelectEdges(Graph& graph) const {
         Edge edge;                                // temporary Edge holder
         if (graph.GetEdge(EdgeId(idVal), edge)) { // fetch edge by id
             result.edges.push_back(edge);        // add to result if found
-            result.success = true;
-            result.message = "Found 1 row.";
         }
-        else {
-            result.success = true;               // found 0 rows but operation is successful
-            result.message = "Found 0 row(s).";
-        }
+        result.success = true;                   // an id lookup always succeeds (0 or 1 rows)
+        applyLimit(result.edges);                // apply TOP <n> (only matters for TOP 0 here)
+        result.message = (result.edges.size() == 1)
+            ? "Found 1 row."
+            : "Found " + std::to_string(result.edges.size()) + " row(s).";
         return result;                           // return after ID lookup
     }
 
@@ -636,6 +722,7 @@ QueryResult Query::executeSelectEdges(Graph& graph) const {
 
         result.edges = found;                     // set result edges
         result.success = true;
+        applyLimit(result.edges);                 // apply TOP <n> row cap
         result.message = "Found " + std::to_string(result.edges.size()) + " row(s).";
         return result;                            // done with FROM-based SELECT
     }
@@ -650,6 +737,7 @@ QueryResult Query::executeSelectEdges(Graph& graph) const {
         }
         result.edges = found;                     // set result edges
         result.success = true;
+        applyLimit(result.edges);                 // apply TOP <n> row cap
         result.message = "Found " + std::to_string(result.edges.size()) + " row(s).";
         return result;
     }
@@ -769,6 +857,7 @@ QueryResult Query::executeMatch(Graph& graph) const {
         searcher.GetVisitedNodeIdOrder(visitOrder); // obtain visit order from searcher
         result.traversalResult = visitOrder;      // populate result
         result.success = true;
+        applyLimit(result.traversalResult);       // apply TOP <n> row cap
         result.message = "Found " + std::to_string(result.traversalResult.size()) + " reachable node(s).";
         return result;
     }
@@ -785,7 +874,8 @@ QueryResult Query::executeMatch(Graph& graph) const {
         searcher.GetShortestPath(target, path);   // ask searcher for shortest path back to source
         result.traversalResult = path;            // set result path
         result.success = true;
-        result.message = "Path found with " + std::to_string(path.size()) + " node(s).";
+        applyLimit(result.traversalResult);       // apply TOP <n> (caps returned path length)
+        result.message = "Path found with " + std::to_string(result.traversalResult.size()) + " node(s).";
         return result;
     }
 
@@ -809,6 +899,7 @@ QueryResult Query::executeMatch(Graph& graph) const {
     }
 
     result.success = true;                        // match executed successfully
+    applyLimit(result.traversalResult);           // apply TOP <n> row cap
     result.message = "Found " + std::to_string(result.traversalResult.size()) + " node(s) within " +
         std::to_string(matchK_) + " hop(s)."; // human-readable summary
     return result;                                // return final result
@@ -853,6 +944,7 @@ QueryResult Query::executeMatchCSR(CSR_Representation& snapshot) const {
     CSR_Searcher searcher(source, snapshot);
     searcher.Run(NodeId(matchToRaw_), matchMode_, matchK_);
     result.traversalResult = searcher.GetResult();
+    applyLimit(result.traversalResult);           // apply TOP <n> row cap (uniform with BFS)
 
     // Compose the mode-specific success message, identical to the BFS variant.
     if (matchMode_ == CSR_Mode::REACHABLE) {

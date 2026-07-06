@@ -131,6 +131,9 @@ General rules that apply everywhere:
 - A statement may end with an optional **execution-mode keyword**, `LIVE` (the
   default) or `SNAPSHOT`. `LIVE` reads the current graph; `SNAPSHOT` reads a
   frozen CSR snapshot and applies to `MATCH` only. See §2.5.
+- `SELECT` and `MATCH` accept an optional leading **`TOP <n>`** that caps the
+  number of rows returned. `SELECT` also accepts a **column projection** in place
+  of `*`. See §2.1 and §2.4.
 
 The four statements are `SELECT`, `INSERT`, `DELETE`, and `MATCH`.
 
@@ -138,12 +141,49 @@ The four statements are `SELECT`, `INSERT`, `DELETE`, and `MATCH`.
 
 ### 2.1 SELECT
 
-Retrieve nodes or edges. Only the `*` projection is supported (you always get
-whole rows), and a `WHERE` clause is **required**.
+Retrieve nodes or edges. A `WHERE` clause is **required**. The projection may be
+`*` (whole rows) or a comma-separated list of columns, and an optional leading
+`TOP <n>` caps the number of rows returned.
 
 ```
-SELECT * FROM NODES WHERE <conditions>
-SELECT * FROM EDGES WHERE <conditions>
+SELECT [TOP <n>] <* | col1, col2, ...> FROM NODES WHERE <conditions>
+SELECT [TOP <n>] *                     FROM EDGES WHERE <conditions>
+```
+
+#### Projection (selective columns)
+
+`SELECT *` returns every column. A column list instead returns only the named
+columns:
+
+```sql
+SELECT name, age FROM NODES WHERE LABEL = 'Person'
+```
+
+Column names are node **property keys** plus the two reserved names `id` and
+`label`. Projection trims each returned node's **property map** to the selected
+property keys — so after `SELECT name FROM NODES ...`, each result node's
+`properties` map contains only `name`. The `id` and `label` are structural
+fields on the node (not entries in the property map): they are always present on
+the returned row, and naming them as columns is allowed but does not add
+anything to the property map (`SELECT label FROM NODES ...` yields rows with an
+empty property map and the label still set).
+
+Projecting a key that a particular node does not have simply leaves that key
+absent from that node's (already trimmed) map — it is not an error.
+
+**Projection is NODES-only.** Edges have no property map to trim, so an explicit
+column list against `EDGES` is rejected; use `*` for edges.
+
+#### TOP (row limit)
+
+`TOP <n>` (T-SQL style, placed right after `SELECT`) returns **at most** `n`
+rows. `n` is a non-negative integer; `TOP 0` returns zero rows (a success), and
+a `TOP` larger than the number of matches simply returns them all. It applies
+after filtering and projection, to both `NODES` and `EDGES`.
+
+```sql
+SELECT TOP 100 * FROM NODES WHERE LABEL = 'Person'
+SELECT TOP 10 name, age FROM NODES WHERE LABEL = 'Person'
 ```
 
 #### SELECT FROM NODES
@@ -289,10 +329,15 @@ Walk the graph from a source node. All traversals are undirected (edges are
 followed both ways).
 
 ```
-MATCH REACHABLE FROM <src>
-MATCH SHORTEST_PATH FROM <src> TO <dst>
-MATCH KHOP FROM <src> STEPS <k>
+MATCH [TOP <n>] REACHABLE FROM <src>
+MATCH [TOP <n>] SHORTEST_PATH FROM <src> TO <dst>
+MATCH [TOP <n>] KHOP FROM <src> STEPS <k>
 ```
+
+An optional leading `TOP <n>` caps the number of nodes returned in
+`traversalResult`. For `REACHABLE` and `KHOP` it keeps the first `n` of the
+result set; for `SHORTEST_PATH` it caps the returned path to its first `n` nodes
+(from the source).
 
 | Mode | Returns |
 |------|---------|
@@ -403,7 +448,14 @@ the executor reports the outcome). Below is the authoritative list.
 | `Empty query.` | Empty or whitespace-only input. |
 | `Unrecognized query keyword: <tok>` | First word isn't SELECT/INSERT/DELETE/MATCH. |
 | `SELECT: expected '*'.` | Missing projection after `SELECT`. |
-| `SELECT: only '*' projections are supported.` | A projection other than `*` (e.g. `SELECT name ...`). |
+| `SELECT: expected '*' or a column list.` | No projection after `SELECT` (or after `TOP <n>`). |
+| `SELECT: expected a column name.` | Column list is empty or ends without a name. |
+| `SELECT: unexpected ',' in column list.` | A leading or doubled comma in the column list. |
+| `SELECT: expected ',' between columns.` | Two column names with no comma between them. |
+| `SELECT: cannot mix '*' with named columns.` | `*` used alongside named columns. |
+| `SELECT: selective columns are only supported for NODES; use '*' for EDGES.` | A column list against `EDGES`. |
+| `SELECT TOP: expected a non-negative integer row count after TOP.` | `TOP` without a valid count. |
+| `MATCH TOP: expected a non-negative integer row count after TOP.` | `MATCH TOP` without a valid count. |
 | `SELECT: expected FROM.` | Missing `FROM`. |
 | `SELECT: expected NODES or EDGES after FROM.` | Bad or missing target. |
 | `SELECT: unexpected token '<tok>'.` | Extra token where `WHERE` was expected. |
@@ -526,8 +578,14 @@ INSERT INTO EDGES (from, to, label) VALUES (2, 3, 'LIVES_IN')           -- edge 
 -- Who does Bob know or live with? (both directions)
 SELECT * FROM EDGES WHERE FROM = 2 AND DIRECTION = 'BOTH'               -- Found 2 row(s).
 
+-- Just the names of the people, at most 10 of them
+SELECT TOP 10 name FROM NODES WHERE LABEL = 'Person'                   -- rows carry only `name`
+
 -- Everyone/everything reachable from Alice
 MATCH REACHABLE FROM 1                                                  -- Found 3 reachable node(s).
+
+-- The two closest reachable nodes only
+MATCH TOP 2 REACHABLE FROM 1                                            -- Found 2 reachable node(s).
 
 -- Shortest hop-path from Alice to Sydney
 MATCH SHORTEST_PATH FROM 1 TO 3                                         -- Path found with 3 node(s).

@@ -97,6 +97,16 @@ public:
     // Snapshot when the statement ended with the SNAPSHOT keyword).
     ExecutionMode executionMode() const { return executionMode_; }
 
+    // The projected columns for a SELECT (empty means "*" -- all columns). Only
+    // meaningful for SELECT FROM NODES; property keys plus the reserved names
+    // "id" and "label" are valid columns. Exposed for testing.
+    const std::vector<std::string>& projection() const { return projection_; }
+
+    // Row limit set by a leading TOP <n> (SELECT) / MATCH TOP <n>. hasLimit() is
+    // false when no TOP was given; limit() is the cap when it is. Exposed for testing.
+    bool hasLimit() const { return hasLimit_; }
+    size_t limit() const { return limit_; }
+
 private:
     // small helpers
     std::string toUpper(const std::string& s) const;
@@ -128,6 +138,16 @@ private:
     // supplied point-in-time snapshot.
     QueryResult executeMatchCSR(CSR_Representation& snapshot) const;
 
+    // Trim each node's property map to the projected columns (no-op for "*").
+    // The reserved columns "id"/"label" are structural and always retained.
+    void projectNodes(std::vector<Node>& nodes) const;
+
+    // Truncate a result vector to the TOP <n> limit, if one was given.
+    template <typename T>
+    void applyLimit(std::vector<T>& rows) const {
+        if (hasLimit_ && rows.size() > limit_) rows.resize(limit_);
+    }
+
     // Shared execution core for both execute() overloads. `snapshot` is null
     // when no CSR snapshot is available. MATCH reads route to the CSR snapshot
     // in Snapshot mode (when one is supplied); everything else uses `live`.
@@ -144,6 +164,15 @@ private:
 
     QueryOperation operation_ = QueryOperation::Unknown;
     QueryTarget target_ = QueryTarget::Unknown;
+
+    // SELECT projection: the requested columns. Empty means "*" (all columns).
+    // For NODES these are property keys and/or the reserved names "id"/"label".
+    std::vector<std::string> projection_;
+
+    // Row limit from a leading TOP <n>. When hasLimit_ is true, at most limit_
+    // rows are returned by SELECT / MATCH.
+    bool hasLimit_ = false;
+    size_t limit_ = 0;
 
     // Execution mode selected by an optional trailing LIVE / SNAPSHOT keyword.
     ExecutionMode executionMode_ = ExecutionMode::Live;

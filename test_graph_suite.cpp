@@ -166,8 +166,12 @@ static void buildQueryFixture(Graph& graph) {
     graph.CreateEdge(bob, city, "LIVES_IN", warning);
 }
 
-int test_query_layer() {
-    std::cout << "\n==================== QUERY LAYER ====================\n";
+// The query-layer suite is split into two helpers (part1 / part2) so that no
+// single function accumulates a huge stack frame from all the per-block Graph /
+// CSR_Representation locals -- that summed frame tripped a compiler stack-size
+// warning. The pass/fail counters are file-static, so the split is transparent;
+// test_query_layer() below simply runs both halves.
+static int test_query_layer_part1() {
 
     // -----------------------------------------------------------------
     // 1. PARSING -- statements that must parse successfully
@@ -198,7 +202,7 @@ int test_query_layer() {
         Query q;
         check("reject empty query", !q.parse(""));
         check("reject unknown keyword", !q.parse("FROBNICATE NODES"));
-        check("reject SELECT without '*'", !q.parse("SELECT name FROM NODES WHERE ID = 1"));
+        check("reject SELECT with empty projection", !q.parse("SELECT FROM NODES WHERE ID = 1"));
         check("reject SELECT without WHERE", !q.parse("SELECT * FROM NODES"));
         check("reject SELECT bad target", !q.parse("SELECT * FROM PLANETS WHERE ID = 1"));
         check("reject INSERT NODES no label", !q.parse("INSERT INTO NODES (name) VALUES ('Zed')"));
@@ -494,6 +498,157 @@ int test_query_layer() {
     }
 
     // -----------------------------------------------------------------
+    // 2b-iii. PROJECTION (selective columns) + TOP (row limit)
+    // -----------------------------------------------------------------
+    //
+    // Projection: `SELECT col1, col2 FROM NODES` returns Node rows whose property
+    // map is trimmed to the named columns; `SELECT *` keeps everything. The
+    // reserved columns `id` and `label` are structural and always present, so
+    // they never appear in (or are removed from) the property map. Projection is
+    // NODES-only. TOP <n> caps the number of returned rows for SELECT and MATCH.
+    std::cout << "\n== Parsing: projection + TOP grammar ==\n";
+    {
+        Query q;
+        // Accepted forms.
+        check("parse SELECT single column", q.parse("SELECT name FROM NODES WHERE LABEL = 'Person'"));
+        check("parse SELECT column list", q.parse("SELECT name, age FROM NODES WHERE LABEL = 'Person'"));
+        check("parse SELECT id/label columns", q.parse("SELECT id, label FROM NODES WHERE ID = 1"));
+        check("parse SELECT TOP n + '*'", q.parse("SELECT TOP 10 * FROM NODES WHERE LABEL = 'Person'"));
+        check("parse SELECT TOP n + columns", q.parse("SELECT TOP 5 name, age FROM NODES WHERE LABEL = 'Person'"));
+        check("parse SELECT TOP on EDGES", q.parse("SELECT TOP 3 * FROM EDGES WHERE LABEL = 'KNOWS'"));
+        check("parse MATCH TOP n", q.parse("MATCH TOP 2 REACHABLE FROM 1"));
+        check("parse MATCH TOP n + SNAPSHOT", q.parse("MATCH TOP 2 REACHABLE FROM 1 SNAPSHOT"));
+
+        // The parsed limit is exposed for inspection.
+        check("parse records the TOP limit",
+            q.parse("SELECT TOP 7 * FROM NODES WHERE LABEL = 'Person'") &&
+            q.hasLimit() && q.limit() == 7);
+        check("no TOP means no limit",
+            q.parse("SELECT * FROM NODES WHERE LABEL = 'Person'") && !q.hasLimit());
+
+        // Rejected forms.
+        check("reject SELECT TOP without a count", !q.parse("SELECT TOP * FROM NODES WHERE ID = 1"));
+        check("reject SELECT TOP negative count", !q.parse("SELECT TOP -1 * FROM NODES WHERE ID = 1"));
+        check("reject trailing comma in column list", !q.parse("SELECT name, FROM NODES WHERE ID = 1"));
+        check("reject missing comma in column list", !q.parse("SELECT name age FROM NODES WHERE ID = 1"));
+        check("reject '*' mixed with columns", !q.parse("SELECT name, * FROM NODES WHERE ID = 1"));
+        check("reject projection on EDGES", !q.parse("SELECT name FROM EDGES WHERE ID = 1"));
+        check("reject MATCH TOP without a count", !q.parse("MATCH TOP REACHABLE FROM 1"));
+    }
+
+    std::cout << "\n== Execute: projection trims the property map ==\n";
+    {
+        // Alice/Bob carry name, age, city; Carol has no city (tests absent keys).
+        Graph graph;
+        graph.CreateNode("Person", { {"name","Alice"}, {"age","30"}, {"city","Sydney"} });
+        graph.CreateNode("Person", { {"name","Bob"},   {"age","25"}, {"city","Sydney"} });
+        graph.CreateNode("Person", { {"name","Carol"}, {"age","40"} });
+
+        Query q; QueryResult r;
+
+        // Single column -> each row's property map holds only that key.
+        r = q.run("SELECT name FROM NODES WHERE LABEL = 'Person'", graph);
+        bool onlyName = r.success && r.nodes.size() == 3;
+        for (const Node& n : r.nodes)
+            onlyName = onlyName && n.properties.size() == 1 && n.properties.count("name") == 1;
+        check("project name: 3 rows, each property map == {name}", onlyName);
+
+        // Column list -> exactly those keys, others dropped.
+        r = q.run("SELECT name, age FROM NODES WHERE LABEL = 'Person'", graph);
+        bool nameAge = r.success && r.nodes.size() == 3;
+        for (const Node& n : r.nodes)
+            nameAge = nameAge && n.properties.size() == 2 &&
+            n.properties.count("name") && n.properties.count("age") && !n.properties.count("city");
+        check("project name,age: property map == {name,age}, city dropped", nameAge);
+
+        // id/label are structural: selecting them keeps the node's id and label
+        // while leaving the property map trimmed to the *property* columns only.
+        r = q.run("SELECT id, name FROM NODES WHERE LABEL = 'Person'", graph);
+        check("project id,name: id+label still populated, props == {name}",
+            r.success && r.nodes.size() == 3 &&
+            r.nodes[0].id != NodeIdInvalid && r.nodes[0].label == "Person" &&
+            r.nodes[0].properties.size() == 1 && r.nodes[0].properties.count("name"));
+
+        // Selecting only label yields an empty property map (label lives on the
+        // Node struct, not in properties).
+        r = q.run("SELECT label FROM NODES WHERE LABEL = 'Person'", graph);
+        check("project label: empty property map, label present",
+            r.success && r.nodes[0].properties.empty() && r.nodes[0].label == "Person");
+
+        // '*' keeps everything (Carol keeps her two properties, no city).
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person'", graph);
+        bool starOk = r.success && r.nodes.size() == 3;
+        int haveCity = 0;
+        for (const Node& n : r.nodes) if (n.properties.count("city")) ++haveCity;
+        check("project *: full property maps retained (2 of 3 have city)",
+            starOk && haveCity == 2);
+
+        // Projecting a key that some rows lack: those rows get an empty map for
+        // it; the query still succeeds and returns every label-matched row.
+        r = q.run("SELECT city FROM NODES WHERE LABEL = 'Person'", graph);
+        int withCity = 0, withoutCity = 0;
+        for (const Node& n : r.nodes) { if (n.properties.count("city")) ++withCity; else ++withoutCity; }
+        check("project city: 2 rows carry city, 1 (Carol) has empty map",
+            r.success && r.nodes.size() == 3 && withCity == 2 && withoutCity == 1);
+    }
+
+    std::cout << "\n== Execute: TOP <n> row limit (SELECT + MATCH) ==\n";
+    {
+        // Chain of five Person nodes so limits below/at/above the count are clear.
+        Graph graph;
+        NodeId n1 = graph.CreateNode("Person", { {"name","N1"} });
+        NodeId n2 = graph.CreateNode("Person", { {"name","N2"} });
+        NodeId n3 = graph.CreateNode("Person", { {"name","N3"} });
+        NodeId n4 = graph.CreateNode("Person", { {"name","N4"} });
+        NodeId n5 = graph.CreateNode("Person", { {"name","N5"} });
+        int w = operationSuccessful;
+        graph.CreateEdge(n1, n2, "KNOWS", w);
+        graph.CreateEdge(n2, n3, "KNOWS", w);
+        graph.CreateEdge(n3, n4, "KNOWS", w);
+        graph.CreateEdge(n4, n5, "KNOWS", w);
+
+        CSR_Representation snapshot(graph);
+        snapshot.Load_CSR();
+
+        Query q; QueryResult r;
+        const std::string src = std::to_string(n1.value());
+
+        // SELECT limits.
+        r = q.run("SELECT TOP 3 * FROM NODES WHERE LABEL = 'Person'", graph);
+        check("SELECT TOP 3 of 5: 3 rows", r.success && r.nodes.size() == 3);
+
+        r = q.run("SELECT TOP 100 * FROM NODES WHERE LABEL = 'Person'", graph);
+        check("SELECT TOP 100 (> available): all 5 rows", r.success && r.nodes.size() == 5);
+
+        r = q.run("SELECT TOP 0 * FROM NODES WHERE LABEL = 'Person'", graph);
+        check("SELECT TOP 0: 0 rows, success, 'Found 0 row(s).'",
+            r.success && r.nodes.size() == 0 && r.message == "Found 0 row(s).");
+
+        // TOP composes with projection.
+        r = q.run("SELECT TOP 2 name FROM NODES WHERE LABEL = 'Person'", graph);
+        bool ok = r.success && r.nodes.size() == 2;
+        for (const Node& n : r.nodes) ok = ok && n.properties.size() == 1 && n.properties.count("name");
+        check("SELECT TOP 2 + projection: 2 trimmed rows", ok);
+
+        // TOP on an edge SELECT.
+        r = q.run("SELECT TOP 2 * FROM EDGES WHERE LABEL = 'KNOWS'", graph);
+        check("SELECT TOP 2 edges of 4 KNOWS: 2 rows", r.success && r.edges.size() == 2);
+
+        // TOP caps a MATCH result (live BFS): 5 reachable, capped to 2.
+        r = q.run("MATCH TOP 2 REACHABLE FROM " + src, graph);
+        check("MATCH TOP 2 REACHABLE (live): 2 nodes", r.success && r.traversalResult.size() == 2);
+
+        // TOP caps a MATCH result over the CSR snapshot too.
+        q.parse("MATCH TOP 2 REACHABLE FROM " + src + " SNAPSHOT");
+        r = q.execute(graph, snapshot);
+        check("MATCH TOP 2 REACHABLE (snapshot): 2 nodes", r.success && r.traversalResult.size() == 2);
+
+        // TOP caps KHOP as well.
+        r = q.run("MATCH TOP 1 KHOP FROM " + src + " STEPS 4", graph);
+        check("MATCH TOP 1 KHOP: 1 node", r.success && r.traversalResult.size() == 1);
+    }
+
+    // -----------------------------------------------------------------
     // 2c-ii. ID-INDEPENDENT robustness: DELETE, SHORTEST_PATH, KHOP
     // -----------------------------------------------------------------
     //
@@ -572,6 +727,11 @@ int test_query_layer() {
         check("delete edge already removed by cascade: reports failure", !r.success);
     }
 
+    return fail == 0 ? 0 : 1;
+}
+
+// Second half of the query-layer suite (see the note on test_query_layer_part1).
+static int test_query_layer_part2() {
     std::cout << "\n== Execute: id-independent SHORTEST_PATH (live + snapshot) ==\n";
     {
         // Directed chain A -> B -> C -> D (traversal is undirected).
@@ -592,7 +752,8 @@ int test_query_layer() {
         auto nameOf = [&](NodeId id) { Node n; if (!graph.GetNode(id, n)) return std::string("");
         auto it = n.properties.find("name"); return it != n.properties.end() ? it->second : std::string(""); };
         auto pathHas = [&](const std::vector<NodeId>& v, const std::string& t) {
-            for (NodeId id : v) if (nameOf(id) == t) return true; return false; };
+            for (NodeId id : v) if (nameOf(id) == t) return true;
+            return false; };
         const std::string src = std::to_string(a.value());
         const std::string dst = std::to_string(d.value());
 
@@ -661,7 +822,8 @@ int test_query_layer() {
         auto nameOf = [&](NodeId id) { Node n; if (!graph.GetNode(id, n)) return std::string("");
         auto it = n.properties.find("name"); return it != n.properties.end() ? it->second : std::string(""); };
         auto has = [&](const std::vector<NodeId>& v, const std::string& t) {
-            for (NodeId id : v) if (nameOf(id) == t) return true; return false; };
+            for (NodeId id : v) if (nameOf(id) == t) return true;
+            return false; };
         const std::string hubId = std::to_string(hub.value());
         const std::string leafId = std::to_string(l1.value());
 
@@ -878,6 +1040,15 @@ int test_query_layer() {
 
     std::cout << "\n" << pass << " passed, " << fail << " failed (cumulative).\n";
     return fail == 0 ? 0 : 1;
+}
+
+// Public entry point: prints the banner and runs both halves of the suite.
+// Returns non-zero if either half recorded a failure.
+int test_query_layer() {
+    std::cout << "\n==================== QUERY LAYER ====================\n";
+    int rc1 = test_query_layer_part1();
+    int rc2 = test_query_layer_part2();
+    return (rc1 == 0 && rc2 == 0) ? 0 : 1;
 }
 
 // =====================================================================

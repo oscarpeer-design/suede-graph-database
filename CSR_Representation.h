@@ -1,5 +1,5 @@
 #pragma once
-#include "graph.h"
+#include "Graph.h"
 #include "Types.h"
 
 // This is a immutable representation of a Graph database using Compressed Sparse Rows

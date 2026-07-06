@@ -299,6 +299,158 @@ int test_query_layer() {
     }
 
     // -----------------------------------------------------------------
+    // 2b-ii. EXECUTION -- SELECT matching on LABELS and PROPERTIES
+    // -----------------------------------------------------------------
+    //
+    // The fixtures above lean on ID lookups. These cases exercise the query
+    // paths users actually reach for: matching NODES by label and by property
+    // comparisons, and matching EDGES by label. A richer fixture is used so the
+    // counts are meaningful (several nodes per label, several edges per label,
+    // a node deliberately missing a property, mixed ages for comparisons).
+    //
+    // Fixture (ids are sequential from 1):
+    //   1 Person { name=Alice, age=30, city=Sydney }
+    //   2 Person { name=Bob,   age=25, city=Sydney }
+    //   3 Person { name=Carol, age=40 }            <- no `city` property
+    //   4 City   { name=Sydney,    population=5000000 }
+    //   5 City   { name=Melbourne, population=5000000 }
+    //   6 Robot  { name=R2 }                        <- unique, single-member label
+    // Edges:
+    //   1: 1 -KNOWS->    2      4: 2 -LIVES_IN-> 4
+    //   2: 2 -KNOWS->    3      5: 3 -LIVES_IN-> 5
+    //   3: 1 -LIVES_IN-> 4      6: 1 -OWNS->     6
+    std::cout << "\n== Execute: SELECT NODES by label / property ==\n";
+    {
+        Graph graph;
+        NodeId alice = graph.CreateNode("Person", { {"name","Alice"}, {"age","30"}, {"city","Sydney"} });
+        NodeId bob = graph.CreateNode("Person", { {"name","Bob"},   {"age","25"}, {"city","Sydney"} });
+        NodeId carol = graph.CreateNode("Person", { {"name","Carol"}, {"age","40"} });
+        NodeId syd = graph.CreateNode("City", { {"name","Sydney"},    {"population","5000000"} });
+        NodeId melb = graph.CreateNode("City", { {"name","Melbourne"}, {"population","5000000"} });
+        NodeId r2 = graph.CreateNode("Robot", { {"name","R2"} });
+
+        int w = operationSuccessful;
+        graph.CreateEdge(alice, bob, "KNOWS", w);
+        graph.CreateEdge(bob, carol, "KNOWS", w);
+        graph.CreateEdge(alice, syd, "LIVES_IN", w);
+        graph.CreateEdge(bob, syd, "LIVES_IN", w);
+        graph.CreateEdge(carol, melb, "LIVES_IN", w);
+        graph.CreateEdge(alice, r2, "OWNS", w);
+
+        Query q;
+        QueryResult r;
+
+        // --- Node label matching (multiplicity) ---
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person'", graph);
+        check("nodes label Person: success", r.success);
+        check("nodes label Person: 3 rows", r.nodes.size() == 3);
+
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'City'", graph);
+        check("nodes label City: 2 rows", r.success && r.nodes.size() == 2);
+
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Robot'", graph);
+        check("nodes label Robot (single-member): 1 row", r.success && r.nodes.size() == 1);
+
+        // A label present on a node returns whole rows with properties intact.
+        check("nodes label Robot: row carries its property",
+            r.nodes.size() == 1 && r.nodes[0].label == "Robot" &&
+            r.nodes[0].properties.at("name") == "R2");
+
+        // Unknown label -> reported as a failure (not an empty success).
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Ghost'", graph);
+        check("nodes unknown label: reports failure", !r.success);
+
+        // Labels are case-sensitive: 'person' is not 'Person'.
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'person'", graph);
+        check("nodes label is case-sensitive: 'person' fails", !r.success);
+
+        // --- Property filtering on top of a label ---
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND name = 'Alice'", graph);
+        check("nodes label + name=Alice: 1 row",
+            r.success && r.nodes.size() == 1 && r.nodes[0].properties.at("name") == "Alice");
+
+        // A property shared by several nodes narrows the label set.
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND city = 'Sydney'", graph);
+        check("nodes label + city=Sydney: 2 rows (Carol has no city)",
+            r.success && r.nodes.size() == 2);
+
+        // A node missing the property is treated as having the empty string,
+        // so `city = ''` matches exactly the node without a city (Carol).
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND city = ''", graph);
+        check("nodes label + city='' matches the property-less node: 1 row",
+            r.success && r.nodes.size() == 1 && r.nodes[0].properties.at("name") == "Carol");
+
+        // Property NAMES are case-sensitive: 'AGE' is not the stored key 'age',
+        // so it reads as empty and matches nothing (but still succeeds).
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND AGE = '30'", graph);
+        check("nodes property name is case-sensitive: 'AGE' matches 0 rows",
+            r.success && r.nodes.size() == 0);
+
+        // A property value that no node has -> success, zero rows.
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND age = '99'", graph);
+        check("nodes label + non-matching property: 0 rows (success)",
+            r.success && r.nodes.size() == 0);
+
+        // --- Comparison operators (values compare lexicographically) ---
+        // ages: Alice 30, Bob 25, Carol 40
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND age > '30'", graph);
+        check("nodes age > '30': 1 row (Carol)", r.success && r.nodes.size() == 1);
+
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND age >= '30'", graph);
+        check("nodes age >= '30': 2 rows (Alice, Carol)", r.success && r.nodes.size() == 2);
+
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND age < '30'", graph);
+        check("nodes age < '30': 1 row (Bob)", r.success && r.nodes.size() == 1);
+
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND age != '30'", graph);
+        check("nodes age != '30': 2 rows (Bob, Carol)", r.success && r.nodes.size() == 2);
+
+        // --- Multiple ANDed property filters ---
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND age = '25' AND name = 'Bob'", graph);
+        check("nodes label + two matching filters: 1 row (Bob)",
+            r.success && r.nodes.size() == 1);
+
+        // Second filter fails -> zero rows. This is also a regression guard for
+        // the executeCondition AND-semantics (a wrong condition must exclude).
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND age = '25' AND name = 'Alice'", graph);
+        check("nodes label + conflicting filters: 0 rows (AND excludes)",
+            r.success && r.nodes.size() == 0);
+
+        std::cout << "\n== Execute: SELECT EDGES by label ==\n";
+
+        // --- Edge label matching (multiplicity) ---
+        r = q.run("SELECT * FROM EDGES WHERE LABEL = 'KNOWS'", graph);
+        check("edges label KNOWS: 2 rows", r.success && r.edges.size() == 2);
+
+        r = q.run("SELECT * FROM EDGES WHERE LABEL = 'LIVES_IN'", graph);
+        check("edges label LIVES_IN: 3 rows", r.success && r.edges.size() == 3);
+
+        r = q.run("SELECT * FROM EDGES WHERE LABEL = 'OWNS'", graph);
+        check("edges label OWNS (single): 1 row",
+            r.success && r.edges.size() == 1 && r.edges[0].label == "OWNS");
+
+        // Unknown edge label -> failure.
+        r = q.run("SELECT * FROM EDGES WHERE LABEL = 'NOPE'", graph);
+        check("edges unknown label: reports failure", !r.success);
+
+        // Edge labels are case-sensitive too.
+        r = q.run("SELECT * FROM EDGES WHERE LABEL = 'knows'", graph);
+        check("edges label is case-sensitive: 'knows' fails", !r.success);
+
+        // --- Edge label combined with a node endpoint ---
+        r = q.run("SELECT * FROM EDGES WHERE FROM = 1 AND LABEL = 'LIVES_IN'", graph);
+        check("edges from node 1 + label LIVES_IN: 1 row", r.success && r.edges.size() == 1);
+
+        r = q.run("SELECT * FROM EDGES WHERE FROM = 1 AND LABEL = 'KNOWS'", graph);
+        check("edges from node 1 + label KNOWS: 1 row", r.success && r.edges.size() == 1);
+
+        // Node 2 sits on two KNOWS edges (incoming from 1, outgoing to 3);
+        // BOTH direction with the label returns both.
+        r = q.run("SELECT * FROM EDGES WHERE FROM = 2 AND LABEL = 'KNOWS' AND DIRECTION = 'BOTH'", graph);
+        check("edges from node 2 + label KNOWS + BOTH: 2 rows", r.success && r.edges.size() == 2);
+    }
+
+    // -----------------------------------------------------------------
     // 2c. EXECUTION -- MATCH (BFS-backed traversals)
     // -----------------------------------------------------------------
     std::cout << "\n== Execute: MATCH traversals ==\n";
@@ -339,6 +491,207 @@ int test_query_layer() {
         // Missing source node is an execution error.
         r = q.run("MATCH REACHABLE FROM 999", graph);
         check("match missing source: reports failure", !r.success);
+    }
+
+    // -----------------------------------------------------------------
+    // 2c-ii. ID-INDEPENDENT robustness: DELETE, SHORTEST_PATH, KHOP
+    // -----------------------------------------------------------------
+    //
+    // Invariant under test: any statement that CAN be issued with a node or
+    // edge id must also be issuable WITHOUT hard-coding one. These cases never
+    // write a literal id into a query or an assertion. Instead the id is taken
+    // from the value the graph assigned at creation time (NodeId::value() /
+    // EdgeId::value()) and spliced into the SQL-like text, and every result is
+    // checked by its CONTENT (labels / name properties resolved back through the
+    // graph) rather than by comparing against a specific id.
+    std::cout << "\n== Execute: id-independent DELETE (node, edge, cascade) ==\n";
+    {
+        // Fixture: Alice -KNOWS-> Bob, Bob -LIVES_IN-> Sydney, Alice -KNOWS-> Carol
+        Graph graph;
+        NodeId alice = graph.CreateNode("Person", { {"name","Alice"} });
+        NodeId bob = graph.CreateNode("Person", { {"name","Bob"} });
+        NodeId carol = graph.CreateNode("Person", { {"name","Carol"} });
+        NodeId syd = graph.CreateNode("City", { {"name","Sydney"} });
+        int w = operationSuccessful;
+        graph.CreateEdge(alice, bob, "KNOWS", w);
+        graph.CreateEdge(bob, syd, "LIVES_IN", w);
+        graph.CreateEdge(alice, carol, "KNOWS", w);
+
+        Query q; QueryResult r;
+        // true if any returned node carries name == target
+        auto nodesHaveName = [&](const std::vector<Node>& ns, const std::string& t) {
+            for (const Node& n : ns) {
+                auto it = n.properties.find("name");
+                if (it != n.properties.end() && it->second == t) return true;
+            }
+            return false; };
+
+        // DELETE a node addressed by its runtime-assigned id, verified by content.
+        r = q.run("DELETE FROM NODES WHERE ID = " + std::to_string(bob.value()), graph);
+        check("delete node by derived id: success", r.success);
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person'", graph);
+        check("after delete: 2 Person rows and Bob is gone",
+            r.success && r.nodes.size() == 2 && !nodesHaveName(r.nodes, "Bob"));
+
+        // Deleting the node cascaded to its incident edges.
+        r = q.run("SELECT * FROM EDGES WHERE LABEL = 'LIVES_IN'", graph);
+        check("cascade: Bob's only LIVES_IN edge is gone (0 rows)",
+            r.success && r.edges.size() == 0);
+        r = q.run("SELECT * FROM EDGES WHERE LABEL = 'KNOWS'", graph);
+        check("cascade: Alice-Bob KNOWS gone, Alice-Carol KNOWS remains (1 row)",
+            r.success && r.edges.size() == 1);
+    }
+    {
+        // DELETE an edge addressed by its runtime-assigned EdgeId.
+        Graph graph;
+        NodeId a = graph.CreateNode("Person", { {"name","Alice"} });
+        NodeId b = graph.CreateNode("Person", { {"name","Bob"} });
+        int w = operationSuccessful;
+        EdgeId e = graph.CreateEdge(a, b, "KNOWS", w);
+
+        Query q; QueryResult r;
+        r = q.run("DELETE FROM EDGES WHERE ID = " + std::to_string(e.value()), graph);
+        check("delete edge by derived edge id: success", r.success);
+        r = q.run("SELECT * FROM EDGES WHERE LABEL = 'KNOWS'", graph);
+        check("after edge delete: 0 KNOWS edges remain", r.success && r.edges.size() == 0);
+    }
+    {
+        // Deleting a missing target is a failure -- shown without fabricating an
+        // id: delete once (succeeds), then delete the same target again.
+        Graph graph;
+        NodeId a = graph.CreateNode("Person", { {"name","Alice"} });
+        NodeId b = graph.CreateNode("Person", { {"name","Bob"} });
+        int w = operationSuccessful;
+        EdgeId e = graph.CreateEdge(a, b, "KNOWS", w);   // cascades when 'a' is deleted
+
+        Query q; QueryResult r;
+        q.run("DELETE FROM NODES WHERE ID = " + std::to_string(a.value()), graph);
+        r = q.run("DELETE FROM NODES WHERE ID = " + std::to_string(a.value()), graph);
+        check("double-delete node: second attempt reports failure", !r.success);
+        r = q.run("DELETE FROM EDGES WHERE ID = " + std::to_string(e.value()), graph);
+        check("delete edge already removed by cascade: reports failure", !r.success);
+    }
+
+    std::cout << "\n== Execute: id-independent SHORTEST_PATH (live + snapshot) ==\n";
+    {
+        // Directed chain A -> B -> C -> D (traversal is undirected).
+        Graph graph;
+        NodeId a = graph.CreateNode("Stop", { {"name","A"} });
+        NodeId b = graph.CreateNode("Stop", { {"name","B"} });
+        NodeId c = graph.CreateNode("Stop", { {"name","C"} });
+        NodeId d = graph.CreateNode("Stop", { {"name","D"} });
+        int w = operationSuccessful;
+        graph.CreateEdge(a, b, "NEXT", w);
+        graph.CreateEdge(b, c, "NEXT", w);
+        graph.CreateEdge(c, d, "NEXT", w);
+
+        CSR_Representation snapshot(graph);
+        snapshot.Load_CSR();
+
+        Query q; QueryResult r;
+        auto nameOf = [&](NodeId id) { Node n; if (!graph.GetNode(id, n)) return std::string("");
+        auto it = n.properties.find("name"); return it != n.properties.end() ? it->second : std::string(""); };
+        auto pathHas = [&](const std::vector<NodeId>& v, const std::string& t) {
+            for (NodeId id : v) if (nameOf(id) == t) return true; return false; };
+        const std::string src = std::to_string(a.value());
+        const std::string dst = std::to_string(d.value());
+
+        // Live (default) shortest path, asserted entirely by name.
+        r = q.run("MATCH SHORTEST_PATH FROM " + src + " TO " + dst, graph);
+        check("live shortest_path A..D: 4 nodes, A->D endpoints, contains B and C",
+            r.success && r.traversalResult.size() == 4 &&
+            nameOf(r.traversalResult.front()) == "A" &&
+            nameOf(r.traversalResult.back()) == "D" &&
+            pathHas(r.traversalResult, "B") && pathHas(r.traversalResult, "C"));
+
+        // Snapshot shortest path over the frozen CSR, same content.
+        q.parse("MATCH SHORTEST_PATH FROM " + src + " TO " + dst + " SNAPSHOT");
+        r = q.execute(graph, snapshot);
+        check("snapshot shortest_path A..D: 4 nodes, A->D endpoints by name",
+            r.success && r.traversalResult.size() == 4 &&
+            nameOf(r.traversalResult.front()) == "A" &&
+            nameOf(r.traversalResult.back()) == "D");
+    }
+    {
+        // Two disconnected components: no path exists (success, empty) for both
+        // engines. Ids are derived; assertions are on emptiness, not ids.
+        Graph graph;
+        NodeId p = graph.CreateNode("Stop", { {"name","P"} });
+        NodeId qn = graph.CreateNode("Stop", { {"name","Q"} });
+        NodeId x = graph.CreateNode("Stop", { {"name","X"} });
+        NodeId y = graph.CreateNode("Stop", { {"name","Y"} });
+        int w = operationSuccessful;
+        graph.CreateEdge(p, qn, "NEXT", w);   // component 1
+        graph.CreateEdge(x, y, "NEXT", w);   // component 2
+
+        CSR_Representation snapshot(graph);
+        snapshot.Load_CSR();
+
+        Query q; QueryResult r;
+        const std::string src = std::to_string(p.value());
+        const std::string dst = std::to_string(x.value());
+
+        r = q.run("MATCH SHORTEST_PATH FROM " + src + " TO " + dst, graph);
+        check("live shortest_path across components: success, empty path",
+            r.success && r.traversalResult.empty());
+
+        q.parse("MATCH SHORTEST_PATH FROM " + src + " TO " + dst + " SNAPSHOT");
+        r = q.execute(graph, snapshot);
+        check("snapshot shortest_path across components: success, empty path",
+            r.success && r.traversalResult.empty());
+    }
+
+    std::cout << "\n== Execute: id-independent KHOP (star graph, steps 0/1) ==\n";
+    {
+        // Star: Hub linked to L1, L2, L3.
+        Graph graph;
+        NodeId hub = graph.CreateNode("Hub", { {"name","Hub"} });
+        NodeId l1 = graph.CreateNode("Leaf", { {"name","L1"} });
+        NodeId l2 = graph.CreateNode("Leaf", { {"name","L2"} });
+        NodeId l3 = graph.CreateNode("Leaf", { {"name","L3"} });
+        int w = operationSuccessful;
+        graph.CreateEdge(hub, l1, "LINK", w);
+        graph.CreateEdge(hub, l2, "LINK", w);
+        graph.CreateEdge(hub, l3, "LINK", w);
+
+        CSR_Representation snapshot(graph);
+        snapshot.Load_CSR();
+
+        Query q; QueryResult r;
+        auto nameOf = [&](NodeId id) { Node n; if (!graph.GetNode(id, n)) return std::string("");
+        auto it = n.properties.find("name"); return it != n.properties.end() ? it->second : std::string(""); };
+        auto has = [&](const std::vector<NodeId>& v, const std::string& t) {
+            for (NodeId id : v) if (nameOf(id) == t) return true; return false; };
+        const std::string hubId = std::to_string(hub.value());
+        const std::string leafId = std::to_string(l1.value());
+
+        // 1 hop from the hub reaches the hub itself plus every leaf.
+        r = q.run("MATCH KHOP FROM " + hubId + " STEPS 1", graph);
+        check("live khop hub steps=1: hub + 3 leaves (4), all leaves present",
+            r.success && r.traversalResult.size() == 4 &&
+            has(r.traversalResult, "L1") && has(r.traversalResult, "L2") && has(r.traversalResult, "L3"));
+
+        // 1 hop from a leaf reaches only that leaf and the hub, no sibling leaf.
+        r = q.run("MATCH KHOP FROM " + leafId + " STEPS 1", graph);
+        check("live khop leaf steps=1: leaf + hub (2), no sibling leaf",
+            r.success && r.traversalResult.size() == 2 &&
+            has(r.traversalResult, "Hub") && !has(r.traversalResult, "L2"));
+
+        // 0 hops is just the source node, whichever id it was assigned.
+        r = q.run("MATCH KHOP FROM " + hubId + " STEPS 0", graph);
+        check("live khop steps=0: source only (1), by name",
+            r.success && r.traversalResult.size() == 1 && nameOf(r.traversalResult.front()) == "Hub");
+
+        // Same two behaviours over the CSR snapshot.
+        q.parse("MATCH KHOP FROM " + hubId + " STEPS 1 SNAPSHOT");
+        r = q.execute(graph, snapshot);
+        check("snapshot khop hub steps=1: hub + 3 leaves (4)",
+            r.success && r.traversalResult.size() == 4 && has(r.traversalResult, "L3"));
+
+        q.parse("MATCH KHOP FROM " + hubId + " STEPS 0 SNAPSHOT");
+        r = q.execute(graph, snapshot);
+        check("snapshot khop steps=0: source only (1), by name",
+            r.success && r.traversalResult.size() == 1 && nameOf(r.traversalResult.front()) == "Hub");
     }
 
     // -----------------------------------------------------------------

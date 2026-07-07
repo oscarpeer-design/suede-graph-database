@@ -169,11 +169,14 @@ bool Query::parse() {
 
     std::string keyword = toUpper(tokens[0]);    // read the first token as a case-insensitive keyword
 
-    // The CSR snapshot only indexes adjacency, so SNAPSHOT mode can serve only
-    // MATCH traversals. Reject SNAPSHOT on SELECT/INSERT/DELETE up front so the
-    // caller gets a clear parse-time error rather than a confusing one later.
-    if (executionMode_ == ExecutionMode::Snapshot && keyword != "MATCH") {
-        setError("SNAPSHOT applies only to MATCH traversals; SELECT, INSERT, and DELETE always run against the live graph.");
+    // SNAPSHOT selects a point-in-time view. It is meaningful for reads (SELECT
+    // and MATCH) but not for mutations: INSERT and DELETE always apply to the
+    // live graph, so SNAPSHOT on them is rejected up front with a clear error.
+    // SELECT ... SNAPSHOT resolves against the MVCC history at the snapshot's
+    // version; MATCH ... SNAPSHOT traverses the frozen CSR snapshot.
+    if (executionMode_ == ExecutionMode::Snapshot &&
+        keyword != "MATCH" && keyword != "SELECT") {
+        setError("SNAPSHOT applies only to reads (SELECT, MATCH); INSERT and DELETE always run against the live graph.");
         return false;
     }
 
@@ -280,6 +283,14 @@ bool Query::parseSelect(const std::vector<std::string>& tokens, size_t pos) {
     if (pos < tokens.size()) {                    // if there are more tokens, expect a WHERE clause
         if (toUpper(tokens[pos]) != "WHERE") { setError("SELECT: unexpected token '" + tokens[pos] + "'."); return false; } // unexpected token
         return parseWhereClause(tokens, pos + 1); // delegate WHERE parsing starting after 'WHERE'
+    }
+
+    // A WHERE-less SELECT is a full scan. Against the live graph this is rejected
+    // (the live path is index-driven and needs an ID/LABEL predicate), but a
+    // SELECT ... SNAPSHOT materializes the whole point-in-time set, so an
+    // unfiltered snapshot scan is well-defined and permitted.
+    if (executionMode_ == ExecutionMode::Snapshot) {
+        return true;                              // no conditions: full snapshot scan
     }
 
     setError("SELECT: a WHERE clause is required (WHERE ID = ... or WHERE LABEL = ...)."); // require explicit WHERE
@@ -502,6 +513,16 @@ QueryResult Query::executeResolved(Graph& live, CSR_Representation* snapshot) co
 
     switch (operation_) {                         // dispatch by operation type
     case QueryOperation::Select:
+        // SELECT ... SNAPSHOT resolves against MVCC history at the snapshot's
+        // captured version, when a CSR snapshot is available to supply it.
+        // Without a snapshot there is no captured version, so we fall back to
+        // the live graph (documented behaviour, mirroring MATCH ... SNAPSHOT).
+        if (executionMode_ == ExecutionMode::Snapshot && snapshot != nullptr) {
+            const uint64_t ver = snapshot->GetSnapshotVersion();
+            return (target_ == QueryTarget::Nodes)
+                ? executeSelectNodesSnapshot(live, ver)
+                : executeSelectEdgesSnapshot(live, ver);
+        }
         return (target_ == QueryTarget::Nodes) ? executeSelectNodes(live) : executeSelectEdges(live);
     case QueryOperation::Insert:
         return (target_ == QueryTarget::Nodes) ? executeInsertNodes(live) : executeInsertEdges(live);
@@ -745,6 +766,143 @@ QueryResult Query::executeSelectEdges(Graph& graph) const {
     // If none of the supported WHERE forms were present return an error message.
     result.success = false;
     result.message = "SELECT FROM EDGES requires WHERE ID = ..., WHERE LABEL = ..., or WHERE FROM = ....";
+    return result;
+}
+
+// ----------------------- SELECT ... SNAPSHOT execution -----------------------
+//
+// These resolve the query against the graph's MVCC history at a fixed
+// point-in-time version, so the result is unaffected by inserts or deletes
+// applied after the snapshot was captured. The visible set is materialized once
+// via Graph::GetNodesAtVersion / GetEdgesAtVersion, then filtered in-process by
+// the parsed WHERE conditions. Because the set is already in hand, a SELECT with
+// no WHERE is permitted here (a full point-in-time scan) -- unlike the live
+// path, which requires an ID or LABEL predicate.
+
+// Execute SELECT ... SNAPSHOT targeting nodes.
+QueryResult Query::executeSelectNodesSnapshot(Graph& graph, uint64_t snapshotVersion) const {
+    QueryResult result;
+
+    // Materialize the nodes visible at the snapshot version (insertion order).
+    std::vector<Node> visible;
+    graph.GetNodesAtVersion(visible, snapshotVersion);
+
+    // Partition conditions: an optional ID equality, an optional LABEL equality,
+    // and any remaining property filters. All are applied against the frozen set.
+    bool haveIdFilter = false;
+    uint64_t idFilter = 0;
+    bool haveLabelFilter = false;
+    std::string labelFilter;
+    std::vector<Condition> propFilters;
+
+    for (const Condition& c : conditions_) {
+        const std::string p = toUpper(c.property);
+        if (p == "ID" && c.op == "=") {
+            uint64_t idVal;
+            if (!parseUInt(c.value, idVal)) {
+                result.success = false; result.message = "Invalid node id."; return result;
+            }
+            haveIdFilter = true; idFilter = idVal;
+        }
+        else if (p == "LABEL" && c.op == "=") {
+            haveLabelFilter = true; labelFilter = c.value;
+        }
+        else {
+            propFilters.push_back(c);   // property predicate, applied client-side
+        }
+    }
+
+    // Apply the filters to each visible node.
+    for (const Node& node : visible) {
+        if (haveIdFilter && node.id.value() != idFilter) continue;
+        if (haveLabelFilter && node.label != labelFilter) continue;
+
+        bool matches = true;
+        for (const Condition& e : propFilters) {
+            auto it = node.properties.find(e.property);
+            std::string actual = (it != node.properties.end()) ? it->second : "";
+            bool condResult = executeCondition(e, actual, matches);
+            if (!condResult) { matches = false; break; }
+        }
+        if (matches) result.nodes.push_back(node);
+    }
+
+    result.success = true;
+    projectNodes(result.nodes);              // trim to selected columns (no-op for '*')
+    applyLimit(result.nodes);                // apply TOP <n> row cap
+    result.message = (result.nodes.size() == 1)
+        ? "Found 1 row."
+        : "Found " + std::to_string(result.nodes.size()) + " row(s).";
+    return result;
+}
+
+// Execute SELECT ... SNAPSHOT targeting edges.
+QueryResult Query::executeSelectEdgesSnapshot(Graph& graph, uint64_t snapshotVersion) const {
+    QueryResult result;
+
+    // Materialize edges visible at the snapshot version.
+    std::vector<Edge> visible;
+    graph.GetEdgesAtVersion(visible, snapshotVersion);
+
+    // Collect equality predicates into a field map (same shape as the live path).
+    std::unordered_map<std::string, std::string> field;
+    for (const Condition& c : conditions_) {
+        if (c.op == "=") field[toUpper(c.property)] = c.value;
+    }
+
+    // Optional endpoint / direction filters.
+    bool haveId = field.count("ID") != 0;
+    uint64_t idVal = 0;
+    if (haveId && !parseUInt(field["ID"], idVal)) {
+        result.success = false; result.message = "Invalid edge id."; return result;
+    }
+
+    bool haveFrom = field.count("FROM") != 0;
+    uint64_t fromVal = 0;
+    if (haveFrom && !parseUInt(field["FROM"], fromVal)) {
+        result.success = false; result.message = "Invalid FROM node id."; return result;
+    }
+
+    bool haveTo = field.count("TO") != 0;
+    uint64_t toVal = 0;
+    if (haveTo && !parseUInt(field["TO"], toVal)) {
+        result.success = false; result.message = "Invalid TO node id."; return result;
+    }
+
+    bool haveLabel = field.count("LABEL") != 0;
+    std::string labelVal = haveLabel ? field["LABEL"] : "";
+
+    EdgeDirection dir = OUTGOING;
+    if (field.count("DIRECTION")) {
+        std::string d = toUpper(field["DIRECTION"]);
+        if (d == "OUTGOING") dir = OUTGOING;
+        else if (d == "INCOMING") dir = INCOMING;
+        else if (d == "BOTH") dir = BOTH;
+        else { result.success = false; result.message = "Invalid DIRECTION (expected OUTGOING, INCOMING, or BOTH)."; return result; }
+    }
+
+    for (const Edge& e : visible) {
+        if (haveId && e.id.value() != idVal) continue;
+        if (haveLabel && e.label != labelVal) continue;
+        // FROM with a direction: match the requested endpoint role.
+        if (haveFrom) {
+            NodeId anchor(fromVal);
+            bool ok = false;
+            if (dir == OUTGOING)      ok = (e.from == anchor);
+            else if (dir == INCOMING) ok = (e.to == anchor);
+            else                      ok = (e.from == anchor || e.to == anchor);
+            if (!ok) continue;
+        }
+        if (haveTo) {
+            NodeId target(toVal);
+            if (!(e.to == target || e.from == target)) continue;
+        }
+        result.edges.push_back(e);
+    }
+
+    result.success = true;
+    applyLimit(result.edges);                // apply TOP <n> row cap
+    result.message = "Found " + std::to_string(result.edges.size()) + " row(s).";
     return result;
 }
 

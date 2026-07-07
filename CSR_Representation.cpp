@@ -1,7 +1,22 @@
 #include "CSR_Representation.h"
 
-// constructor only takes in a Graph
-CSR_Representation::CSR_Representation(Graph& g) : graph(g) { }
+// constructor only takes in a Graph. Registering with the graph's MVCC registry
+// captures the current version as this snapshot's point in time and guarantees
+// the graph retains history visible at that version until this object is
+// destroyed.
+CSR_Representation::CSR_Representation(Graph& g)
+	: graph(g), owner_(&g)
+{
+	snapshotVersion_ = owner_->CaptureSnapshot();
+}
+
+// Destructor: release the snapshot registration so retained history can be
+// garbage-collected once no other snapshot needs it.
+CSR_Representation::~CSR_Representation()
+{
+	if (owner_)
+		owner_->ReleaseSnapshot(snapshotVersion_);
+}
 
 // Load_CSR
 void CSR_Representation::Load_CSR() {
@@ -79,4 +94,3 @@ const std::vector<NodeId>& CSR_Representation::GetCSRNodeMapping() const
 {
 	return csrToNode;
 }
-

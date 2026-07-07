@@ -128,6 +128,13 @@ private:
     // execution helpers
     QueryResult executeSelectNodes(Graph& graph) const;
     QueryResult executeSelectEdges(Graph& graph) const;
+
+    // Snapshot-mode SELECT: resolve rows against the graph's MVCC history at the
+    // supplied point-in-time version rather than the live graph. Supports the
+    // same WHERE forms as the live path (ID / LABEL filters, plus property
+    // filters for nodes), applied over the set visible at `snapshotVersion`.
+    QueryResult executeSelectNodesSnapshot(Graph& graph, uint64_t snapshotVersion) const;
+    QueryResult executeSelectEdgesSnapshot(Graph& graph, uint64_t snapshotVersion) const;
     QueryResult executeInsertNodes(Graph& graph) const;
     QueryResult executeInsertEdges(Graph& graph) const;
     QueryResult executeDeleteNodes(Graph& graph) const;

@@ -95,9 +95,11 @@ identically whichever engine serves it — only *which point in time* it observe
 and *how fast* it runs, differ. A query chooses its engine with the trailing
 `LIVE` / `SNAPSHOT` keyword (see §2.5).
 
-Because the CSR snapshot indexes only adjacency (not labels or properties), the
-snapshot engine serves `MATCH` traversals only. `SELECT`, `INSERT`, and `DELETE`
-always run against the live graph.
+The CSR snapshot indexes only adjacency (not labels or properties), so the CSR
+*traversal* engine serves `MATCH` only. Point-in-time `SELECT ... SNAPSHOT`
+reads, however, are served from the graph's MVCC history at the snapshot's
+captured version (see §2.5), so a snapshot can return full node/edge rows too.
+`INSERT` and `DELETE` always run against the live graph and reject `SNAPSHOT`.
 
 ### 1.5 Persistence (`StorageEngine`)
 
@@ -130,7 +132,7 @@ General rules that apply everywhere:
   **lexicographic** (string) comparisons, since all values are stored as strings.
 - A statement may end with an optional **execution-mode keyword**, `LIVE` (the
   default) or `SNAPSHOT`. `LIVE` reads the current graph; `SNAPSHOT` reads a
-  frozen CSR snapshot and applies to `MATCH` only. See §2.5.
+  point-in-time view and applies to reads (`SELECT`, `MATCH`) only. See §2.5.
 - `SELECT` and `MATCH` accept an optional leading **`TOP <n>`** that caps the
   number of rows returned. `SELECT` also accepts a **column projection** in place
   of `*`. See §2.1 and §2.4.
@@ -382,12 +384,17 @@ view of the graph the query resolves against:
 `LIVE` is the default, so omitting the keyword is the same as writing `LIVE`.
 Writing it explicitly is a harmless no-op that documents intent.
 
-`SNAPSHOT` routes a `MATCH` traversal to the CSR snapshot engine
-(`CSR_Searcher` over a `CSR_Representation`) instead of the live `BFS_Searcher`.
-The snapshot is captured once and does not change afterwards, so a `SNAPSHOT`
-query keeps observing the graph as it was at capture time even as the live graph
-is mutated. This gives **point-in-time consistency** for read-heavy traversal
-workloads, and the CSR layout makes those traversals fast.
+`SNAPSHOT` selects a **point-in-time** view of the graph: the state as it was at
+the moment the snapshot was captured, unaffected by any insert or delete applied
+afterwards. It is valid on both kinds of read — `MATCH` traversals and `SELECT`
+queries — but not on the mutations `INSERT` / `DELETE`, which always apply to the
+live graph.
+
+- A **`MATCH ... SNAPSHOT`** traversal runs on the CSR snapshot engine
+  (`CSR_Searcher` over a `CSR_Representation`) rather than the live
+  `BFS_Searcher`. The CSR layout makes these traversals fast.
+- A **`SELECT ... SNAPSHOT`** query resolves against the graph's MVCC history at
+  the snapshot's captured version (see "How snapshots work: MVCC" below).
 
 ```sql
 -- Live traversal (default): reflects every insert/delete so far
@@ -397,40 +404,91 @@ MATCH REACHABLE FROM 1 LIVE          -- identical, explicit
 -- Snapshot traversal: reads the frozen CSR snapshot
 MATCH SHORTEST_PATH FROM 1 TO 3 SNAPSHOT
 MATCH KHOP FROM 1 STEPS 2 SNAPSHOT
+
+-- Snapshot SELECT: point-in-time reads over nodes / edges
+SELECT * FROM NODES SNAPSHOT                              -- full point-in-time scan
+SELECT * FROM NODES WHERE LABEL = 'Person' SNAPSHOT
+SELECT name, age FROM NODES WHERE LABEL = 'Person' SNAPSHOT
+SELECT TOP 10 * FROM NODES SNAPSHOT
+SELECT * FROM EDGES WHERE LABEL = 'KNOWS' SNAPSHOT
 ```
 
 Rules and behaviour:
 
-- **`SNAPSHOT` applies to `MATCH` only.** Because the CSR snapshot indexes only
-  adjacency, `SELECT`, `INSERT`, and `DELETE` cannot be served from it and are
-  **rejected at parse time** when combined with `SNAPSHOT`
-  (`SNAPSHOT applies only to MATCH traversals; SELECT, INSERT, and DELETE always
-  run against the live graph.`).
+- **`SNAPSHOT` applies to reads only.** `SELECT` and `MATCH` accept it; `INSERT`
+  and `DELETE` **reject it at parse time**
+  (`SNAPSHOT applies only to reads (SELECT, MATCH); INSERT and DELETE always run
+  against the live graph.`).
+- **A `SELECT ... SNAPSHOT` may omit `WHERE`.** Because a snapshot materializes
+  the whole point-in-time set, an unfiltered `SELECT * FROM NODES SNAPSHOT` is a
+  well-defined full scan. (The live `SELECT` still requires a `WHERE ID`/`LABEL`
+  predicate, since the live path is index-driven.) The same `WHERE` forms as the
+  live path are otherwise supported: `ID`/`LABEL` and property filters for nodes;
+  `ID`/`LABEL`/`FROM`(+`DIRECTION`)/`TO` for edges. Projection (`col1, col2`) and
+  `TOP <n>` compose with `SNAPSHOT` exactly as they do live.
 - **A snapshot must actually exist.** The snapshot is supplied by the caller
   (`Query::execute(Graph& live, CSR_Representation& snapshot)`). If a `SNAPSHOT`
   query is executed with no snapshot available (the single-argument
-  `Query::execute(Graph&)`), it **gracefully falls back** to a live BFS
-  traversal rather than failing.
+  `Query::execute(Graph&)`), it **gracefully falls back** to the live path
+  (live BFS for `MATCH`, the live graph for `SELECT`) rather than failing.
 - **The keyword is a reserved trailing token.** Only a bare, final `LIVE` /
   `SNAPSHOT` is treated as a mode keyword; a quoted value such as `'SNAPSHOT'`
   keeps its quotes and is left untouched, so
   `SELECT * FROM NODES WHERE LABEL = 'SNAPSHOT'` is an ordinary live query.
 - Results and messages are identical to the live equivalents — a `SNAPSHOT`
-  `REACHABLE` returns `Found <n> reachable node(s).`, and so on.
+  `SELECT` returns `Found <n> row(s).`, a `SNAPSHOT` `REACHABLE` returns the
+  reachable set, and so on.
 
-From code, the two forms are:
+#### How snapshots work: MVCC (Multi-Version Concurrency Control)
+
+Snapshots do **not** copy the graph. Instead the graph maintains a monotonic
+version counter that is bumped on every mutation, and every node/edge carries a
+`createdAtVersion` and (once deleted) a `deletedAtVersion` in a retained history
+store. Deletions are recorded as **tombstones** rather than discarding data.
+
+A row is visible to a snapshot captured at version `V` iff it was created at or
+before `V` **and** either has not been deleted or was deleted strictly after `V`:
+
+```
+visible(row, V)  ==  createdAtVersion <= V
+                     && (deletedAtVersion == 0 || deletedAtVersion > V)
+```
+
+Building a `CSR_Representation` captures the current version as the snapshot id
+(`CaptureSnapshot()`); destroying it releases that registration
+(`ReleaseSnapshot()`). This is RAII — the snapshot is a resource whose lifetime
+bounds how long the graph must retain the history it can observe.
+
+**Garbage collection.** History that predates every active snapshot can no longer
+be observed by any snapshot, so it is reclaimed. When a snapshot is released (and
+opportunistically after each delete), the graph drops any tombstoned record whose
+`deletedAtVersion` is at or before the oldest active snapshot's version — or all
+tombstones when no snapshot is active. Live (non-deleted) records are never
+reclaimed. This bounds memory: tombstones do not accumulate indefinitely, they
+persist only as long as some snapshot still needs them. Copying is avoided
+entirely — a snapshot costs a version number plus whatever history its lifetime
+pins in place, not a duplicate of the graph.
+
+From code, the two execution forms are:
 
 ```cpp
-CSR_Representation snapshot(graph);
-snapshot.Load_CSR();                 // freeze the graph as it is now
+CSR_Representation snapshot(graph);  // captures the current version (RAII)
+snapshot.Load_CSR();                 // freeze adjacency for MATCH traversals
 
 Query q;
+
+// MATCH: CSR traversal vs live BFS fallback
 q.parse("MATCH REACHABLE FROM 1 SNAPSHOT");
 QueryResult live = q.execute(graph);            // no snapshot -> live BFS fallback
 QueryResult snap = q.execute(graph, snapshot);  // CSR snapshot traversal
 
-// Later mutations to `graph` are visible to LIVE queries but NOT to `snapshot`,
-// until a fresh CSR_Representation is built.
+// SELECT: point-in-time read at the snapshot's captured version
+q.parse("SELECT * FROM NODES WHERE LABEL = 'Person' SNAPSHOT");
+QueryResult rows = q.execute(graph, snapshot);  // resolved against MVCC history
+
+// Later mutations to `graph` are visible to LIVE queries but NOT to `snapshot`.
+// When `snapshot` goes out of scope, its registration is released and any
+// history only it was pinning becomes eligible for garbage collection.
 ```
 
 ---
@@ -485,7 +543,7 @@ the executor reports the outcome). Below is the authoritative list.
 | `MATCH KHOP: expected STEPS.` | `KHOP` without `STEPS`. |
 | `MATCH KHOP: expected a numeric step count after STEPS.` | Non-numeric step count. |
 | `MATCH: unexpected trailing tokens.` | Extra tokens after a complete `MATCH`. |
-| `SNAPSHOT applies only to MATCH traversals; SELECT, INSERT, and DELETE always run against the live graph.` | `SNAPSHOT` keyword used on a `SELECT`, `INSERT`, or `DELETE`. |
+| `SNAPSHOT applies only to reads (SELECT, MATCH); INSERT and DELETE always run against the live graph.` | `SNAPSHOT` keyword used on an `INSERT` or `DELETE`. |
 | `WHERE: expected operator.` | Property with no operator. |
 | `WHERE: invalid operator '<op>'.` | Operator not in the valid set. |
 | `WHERE: expected value.` | Operator with no right-hand value. |

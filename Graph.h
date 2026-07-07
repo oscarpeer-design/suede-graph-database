@@ -2,6 +2,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <set>
+#include <cstdint>
 
 #include "ErrorCodes.h"
 #include "Types.h"
@@ -87,6 +89,61 @@ private:
     std::vector<NodeId> nodeInsertionOrder;
     // vector for insertion order of edges
     std::vector<EdgeId> edgeInsertionOrder;
+
+    // ---------------------------------------------------------------------
+    // MVCC (Multi-Version Concurrency Control) state
+    //
+    // Instead of physically copying the whole graph to serve a point-in-time
+    // SELECT ... SNAPSHOT, every mutation stamps a monotonically increasing
+    // version number, and deletions are recorded as tombstones rather than
+    // discarding history. A "snapshot" is simply the version number captured
+    // at the moment a CSR_Representation is built. A row is visible to a
+    // snapshot at version V iff it was created at or before V and either has
+    // not been deleted or was deleted strictly after V.
+    //
+    // The live maps (nodes/edges above) remain the fast path for LIVE queries
+    // and are untouched by this machinery. The parallel history stores below
+    // retain rows (including deleted ones) so that older snapshots can still
+    // observe them until no active snapshot needs them, at which point
+    // garbageCollect() reclaims the space.
+    // ---------------------------------------------------------------------
+
+    // History record for a node retained for snapshot visibility.
+    struct NodeVersion {
+        Node node;                    // full node payload as created
+        uint64_t createdAtVersion;    // version at which this node became visible
+        uint64_t deletedAtVersion;    // 0 == still live; else version of deletion
+    };
+
+    // History record for an edge retained for snapshot visibility.
+    struct EdgeVersion {
+        Edge edge;                    // full edge payload as created
+        uint64_t createdAtVersion;    // version at which this edge became visible
+        uint64_t deletedAtVersion;    // 0 == still live; else version of deletion
+    };
+
+    // Monotonic global version counter. Bumped before each mutation so that
+    // the resulting create/delete stamp is unique and ordered.
+    uint64_t currentVersion_ = 0;
+
+    // Versions handed out by captureSnapshot() that have not yet been released.
+    // garbageCollect() may only reclaim history older than the oldest of these.
+    std::multiset<uint64_t> activeSnapshots_;
+
+    // Retained node/edge history, keyed by id. Mirrors every create; records a
+    // deletedAtVersion on delete. Physically erased only by garbageCollect().
+    std::unordered_map<NodeId, NodeVersion> mvccNodes_;
+    std::unordered_map<EdgeId, EdgeVersion> mvccEdges_;
+
+    // Insertion order of node ids in the MVCC store (kept for deterministic,
+    // insertion-ordered snapshot scans, mirroring nodeInsertionOrder).
+    std::vector<NodeId> mvccNodeOrder_;
+
+    // Reclaim history that predates every active snapshot. A node/edge tombstoned
+    // at version D can be physically dropped once D is older than the oldest
+    // active snapshot (or when there are no active snapshots at all), because no
+    // reachable snapshot can observe its pre-deletion state any longer.
+    void garbageCollect();
 
     // checks if node exists
     bool nodeLabelExists(std::string label) {
@@ -239,35 +296,66 @@ private:
         EraseValue(neighbourIn[edge.to], edge.from);
     }
 
-    public:
+public:
 
-        Graph();
+    Graph();
 
-        NodeId CreateNode(std::string label, propertiesMap properties);
+    NodeId CreateNode(std::string label, propertiesMap properties);
 
-        EdgeId CreateEdge(NodeId from, NodeId to, std::string label, int& warning);
+    EdgeId CreateEdge(NodeId from, NodeId to, std::string label, int& warning);
 
-        void FindNodes(std::vector<Node>& foundNodes, std::string label, int& warning);
+    void FindNodes(std::vector<Node>& foundNodes, std::string label, int& warning);
 
-        void FindEdgesByLabel(std::vector<Edge>& out, const std::string& label, int& warning);
+    void FindEdgesByLabel(std::vector<Edge>& out, const std::string& label, int& warning);
 
-        void FindEdgesByNodeId(NodeId node, std::vector<Edge>& out, EdgeDirection dir, int& warning);
+    void FindEdgesByNodeId(NodeId node, std::vector<Edge>& out, EdgeDirection dir, int& warning);
 
-        void FindEdgesByNodeAndLabel(NodeId node, const std::string& edgeLabel, std::vector<Edge>& out, EdgeDirection dir, int& warning);
+    void FindEdgesByNodeAndLabel(NodeId node, const std::string& edgeLabel, std::vector<Edge>& out, EdgeDirection dir, int& warning);
 
-        void GetNeighboursById(NodeId node, std::vector<Node>& foundNeighbours, EdgeDirection dir, int& warning);
+    void GetNeighboursById(NodeId node, std::vector<Node>& foundNeighbours, EdgeDirection dir, int& warning);
 
-        void DeleteEdge(EdgeId id, int& warning);
+    void DeleteEdge(EdgeId id, int& warning);
 
-        void DeleteNode(NodeId id, int& warning);
+    void DeleteNode(NodeId id, int& warning);
 
-        void GetNeighbourIdsForTraversal(NodeId node, std::vector<NodeId>& neighbours, EdgeDirection dir, int& warning) const;
+    void GetNeighbourIdsForTraversal(NodeId node, std::vector<NodeId>& neighbours, EdgeDirection dir, int& warning) const;
 
-        void GetNodeIdOrder(std::vector<NodeId>& out) const;
+    void GetNodeIdOrder(std::vector<NodeId>& out) const;
 
-        void GetAllEdgeIds(std::vector<EdgeId>& out) const;
+    void GetAllEdgeIds(std::vector<EdgeId>& out) const;
 
-        bool GetNode(NodeId id, Node& out) const;
+    bool GetNode(NodeId id, Node& out) const;
 
-        bool GetEdge(EdgeId id, Edge& out) const;
+    bool GetEdge(EdgeId id, Edge& out) const;
+
+    // ----------------------------- MVCC API -----------------------------
+
+    // The graph's current logical version (number of mutations applied).
+    uint64_t GetVersion() const { return currentVersion_; }
+
+    // Register interest in the current version and return it as a snapshot
+    // id. History visible at this version is guaranteed to remain readable
+    // until the matching ReleaseSnapshot(). CSR_Representation calls this at
+    // construction time.
+    uint64_t CaptureSnapshot();
+
+    // Release a snapshot previously obtained from CaptureSnapshot() and run
+    // opportunistic garbage collection. Safe to call with a version that was
+    // captured; releasing an unknown version is a no-op on the multiset.
+    void ReleaseSnapshot(uint64_t version);
+
+    // Number of snapshots currently held (exposed for testing/introspection).
+    size_t ActiveSnapshotCount() const { return activeSnapshots_.size(); }
+
+    // Total node history records currently retained, including tombstones
+    // (exposed so tests can assert that garbage collection reclaims space).
+    size_t MvccNodeHistorySize() const { return mvccNodes_.size(); }
+
+    // Collect every node visible to the snapshot taken at `snapshotVersion`,
+    // in insertion order. A node is visible iff it was created at or before
+    // the version and not deleted at or before it. Used by SELECT ... SNAPSHOT.
+    void GetNodesAtVersion(std::vector<Node>& out, uint64_t snapshotVersion) const;
+
+    // Collect every edge visible to the snapshot taken at `snapshotVersion`.
+    void GetEdgesAtVersion(std::vector<Edge>& out, uint64_t snapshotVersion) const;
 };

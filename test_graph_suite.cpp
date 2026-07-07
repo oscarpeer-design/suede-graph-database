@@ -889,8 +889,16 @@ static int test_query_layer_part2() {
             q.parse("SELECT * FROM NODES WHERE LABEL = 'SNAPSHOT'") &&
             q.executionMode() == ExecutionMode::Live);
 
-        // SNAPSHOT is only valid on MATCH; the other statements reject it.
-        check("reject SELECT ... SNAPSHOT", !q.parse("SELECT * FROM NODES WHERE ID = 1 SNAPSHOT"));
+        // SNAPSHOT is valid on reads (SELECT, MATCH); mutations reject it.
+        check("accept SELECT ... SNAPSHOT (node id filter)",
+            q.parse("SELECT * FROM NODES WHERE ID = 1 SNAPSHOT") &&
+            q.executionMode() == ExecutionMode::Snapshot);
+        check("accept SELECT ... SNAPSHOT (unfiltered full scan)",
+            q.parse("SELECT * FROM NODES SNAPSHOT") &&
+            q.executionMode() == ExecutionMode::Snapshot);
+        check("accept SELECT ... SNAPSHOT (edges)",
+            q.parse("SELECT * FROM EDGES SNAPSHOT") &&
+            q.executionMode() == ExecutionMode::Snapshot);
         check("reject INSERT ... SNAPSHOT", !q.parse("INSERT INTO NODES (label) VALUES ('X') SNAPSHOT"));
         check("reject DELETE ... SNAPSHOT", !q.parse("DELETE FROM NODES WHERE ID = 1 SNAPSHOT"));
     }
@@ -1042,13 +1050,266 @@ static int test_query_layer_part2() {
     return fail == 0 ? 0 : 1;
 }
 
-// Public entry point: prints the banner and runs both halves of the suite.
-// Returns non-zero if either half recorded a failure.
+// =====================================================================
+// SELECT ... SNAPSHOT test suite (MVCC point-in-time reads)
+// =====================================================================
+//
+// Kept in its own function (rather than folded into test_query_layer_part2)
+// so its per-block Graph / CSR_Representation locals do not add to that
+// function's stack frame -- summing them there re-tripped the compiler
+// stack-size warning. The pass/fail counters are file-static, so splitting
+// this out is transparent to the reported totals.
+//
+// These verify that a SELECT resolved against a CSR snapshot observes the
+// graph exactly as it was when the snapshot was captured, independent of any
+// later inserts or deletes on the live graph. Tests avoid hardcoded NodeIds
+// where the assertion is about counts/content; where an id is needed it is
+// captured from CreateNode's return value.
+static int test_select_snapshot() {
+    std::cout << "\n============= SELECT ... SNAPSHOT (MVCC) =============\n";
+
+    std::cout << "\n== Execute: SELECT ... SNAPSHOT (point-in-time isolation) ==\n";
+    {
+        Graph graph;
+        buildQueryFixture(graph);           // 3 nodes: 2 Person, 1 City
+
+        // Freeze a snapshot at three nodes.
+        CSR_Representation snap(graph);
+        snap.Load_CSR();
+
+        Query q;
+        QueryResult r;
+
+        // Unfiltered full scan over the snapshot sees exactly the frozen 3 nodes.
+        q.parse("SELECT * FROM NODES SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("snapshot select all: success", r.success);
+        check("snapshot select all: 3 rows", r.nodes.size() == 3);
+
+        // Label filter over the snapshot: two Person nodes.
+        q.parse("SELECT * FROM NODES WHERE LABEL = 'Person' SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("snapshot select label=Person: 2 rows",
+            r.success && r.nodes.size() == 2);
+
+        // Now mutate the LIVE graph AFTER the snapshot was captured.
+        graph.CreateNode("Person", { {"name", "Dave"}, {"age", "40"} });
+        graph.CreateNode("Person", { {"name", "Eve"},  {"age", "50"} });
+
+        // LIVE label select sees the two new Person nodes (4 total).
+        q.parse("SELECT * FROM NODES WHERE LABEL = 'Person'");
+        r = q.execute(graph, snap);
+        check("live select label=Person after inserts: 4 rows",
+            r.success && r.nodes.size() == 4);
+
+        // SNAPSHOT is unchanged: still the 2 Person nodes frozen at capture time.
+        q.parse("SELECT * FROM NODES WHERE LABEL = 'Person' SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("snapshot select label=Person after inserts: still 2 rows",
+            r.success && r.nodes.size() == 2);
+
+        // Full snapshot scan still 3, ignoring the two later inserts.
+        q.parse("SELECT * FROM NODES SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("snapshot select all after inserts: still 3 rows",
+            r.success && r.nodes.size() == 3);
+    }
+
+    std::cout << "\n== Execute: SELECT ... SNAPSHOT ignores later DELETEs ==\n";
+    {
+        Graph graph;
+        NodeId keep = graph.CreateNode("Person", { {"name", "Keep"} });
+        NodeId drop = graph.CreateNode("Person", { {"name", "Drop"} });
+        (void)keep;
+
+        // Snapshot with both nodes present.
+        CSR_Representation snap(graph);
+        snap.Load_CSR();
+
+        Query q;
+        QueryResult r;
+
+        // Sanity: live and snapshot both see 2 Person nodes to start.
+        q.parse("SELECT * FROM NODES WHERE LABEL = 'Person' SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("pre-delete snapshot: 2 Person rows", r.success && r.nodes.size() == 2);
+
+        // Delete one node on the LIVE graph.
+        int warning = operationSuccessful;
+        graph.DeleteNode(drop, warning);
+        check("delete on live: success", warning == operationSuccessful);
+
+        // LIVE now sees only 1 Person node.
+        q.parse("SELECT * FROM NODES WHERE LABEL = 'Person'");
+        r = q.execute(graph, snap);
+        check("live after delete: 1 Person row", r.success && r.nodes.size() == 1);
+
+        // SNAPSHOT still sees the deleted node -- point-in-time is preserved.
+        q.parse("SELECT * FROM NODES WHERE LABEL = 'Person' SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("snapshot after delete: still 2 Person rows (tombstone visible)",
+            r.success && r.nodes.size() == 2);
+
+        // The deleted node is fetchable by id through the snapshot but not live.
+        q.parse("SELECT * FROM NODES WHERE ID = " + std::to_string(drop.value()) + " SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("snapshot fetch deleted node by id: 1 row",
+            r.success && r.nodes.size() == 1);
+
+        q.parse("SELECT * FROM NODES WHERE ID = " + std::to_string(drop.value()));
+        r = q.execute(graph, snap);
+        check("live fetch deleted node by id: 0 rows",
+            r.success && r.nodes.size() == 0);
+    }
+
+    std::cout << "\n== Execute: SELECT ... SNAPSHOT with projection and TOP ==\n";
+    {
+        Graph graph;
+        graph.CreateNode("Widget", { {"color", "red"},   {"size", "L"} });
+        graph.CreateNode("Widget", { {"color", "blue"},  {"size", "M"} });
+        graph.CreateNode("Widget", { {"color", "green"}, {"size", "S"} });
+
+        CSR_Representation snap(graph);
+        snap.Load_CSR();
+
+        // Mutate live afterwards; snapshot queries must ignore this.
+        graph.CreateNode("Widget", { {"color", "black"}, {"size", "XL"} });
+
+        Query q;
+        QueryResult r;
+
+        // Projection over the snapshot: only 'color' retained, id/label structural.
+        q.parse("SELECT color FROM NODES WHERE LABEL = 'Widget' SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("snapshot projection: 3 rows (ignores later insert)",
+            r.success && r.nodes.size() == 3);
+        bool onlyColor = !r.nodes.empty();
+        for (const Node& n : r.nodes) {
+            if (n.properties.size() != 1 || n.properties.find("color") == n.properties.end())
+                onlyColor = false;
+        }
+        check("snapshot projection: each row has only 'color'", onlyColor);
+
+        // TOP over the snapshot caps rows.
+        q.parse("SELECT TOP 2 * FROM NODES WHERE LABEL = 'Widget' SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("snapshot TOP 2: 2 rows", r.success && r.nodes.size() == 2);
+
+        // TOP composes with projection on the snapshot.
+        q.parse("SELECT TOP 1 color FROM NODES WHERE LABEL = 'Widget' SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("snapshot TOP 1 + projection: 1 row",
+            r.success && r.nodes.size() == 1);
+        check("snapshot TOP 1 + projection: only 'color'",
+            r.nodes.size() == 1 && r.nodes[0].properties.size() == 1 &&
+            r.nodes[0].properties.count("color") == 1);
+
+        // TOP 0 yields no rows even on the snapshot.
+        q.parse("SELECT TOP 0 * FROM NODES WHERE LABEL = 'Widget' SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("snapshot TOP 0: 0 rows", r.success && r.nodes.empty());
+    }
+
+    std::cout << "\n== Execute: SELECT ... SNAPSHOT over EDGES ==\n";
+    {
+        Graph graph;
+        NodeId a = graph.CreateNode("Person", { {"name", "A"} });
+        NodeId b = graph.CreateNode("Person", { {"name", "B"} });
+        NodeId c = graph.CreateNode("Person", { {"name", "C"} });
+        int warning = operationSuccessful;
+        graph.CreateEdge(a, b, "KNOWS", warning);
+        graph.CreateEdge(b, c, "KNOWS", warning);
+
+        CSR_Representation snap(graph);
+        snap.Load_CSR();
+
+        // Add another edge on the live graph after capture.
+        graph.CreateEdge(a, c, "KNOWS", warning);
+
+        Query q;
+        QueryResult r;
+
+        // Snapshot edge scan by label: the 2 frozen edges, not the 3rd.
+        q.parse("SELECT * FROM EDGES WHERE LABEL = 'KNOWS' SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("snapshot edges by label: 2 rows (ignores later edge)",
+            r.success && r.edges.size() == 2);
+
+        // Live sees all 3 edges.
+        q.parse("SELECT * FROM EDGES WHERE LABEL = 'KNOWS'");
+        r = q.execute(graph, snap);
+        check("live edges by label: 3 rows", r.success && r.edges.size() == 3);
+
+        // Snapshot outgoing edges from 'a': only the frozen a->b edge.
+        q.parse("SELECT * FROM EDGES WHERE FROM = " + std::to_string(a.value()) +
+            " AND DIRECTION = 'OUTGOING' SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("snapshot edges FROM a OUTGOING: 1 row (a->b only)",
+            r.success && r.edges.size() == 1);
+    }
+
+    std::cout << "\n== Execute: snapshot history reclaimed after release (GC) ==\n";
+    {
+        Graph graph;
+        NodeId n1 = graph.CreateNode("Temp", { {"k", "v1"} });
+        NodeId n2 = graph.CreateNode("Temp", { {"k", "v2"} });
+        (void)n1;
+
+        int warning = operationSuccessful;
+        {
+            // Hold a snapshot; delete a node. History must be retained while the
+            // snapshot is alive so the snapshot can still observe the deleted node.
+            CSR_Representation snap(graph);
+            snap.Load_CSR();
+            check("snapshot active while alive", graph.ActiveSnapshotCount() == 1);
+
+            graph.DeleteNode(n2, warning);
+
+            Query q;
+            q.parse("SELECT * FROM NODES WHERE LABEL = 'Temp' SNAPSHOT");
+            QueryResult r = q.execute(graph, snap);
+            check("held snapshot still sees deleted node: 2 rows",
+                r.success && r.nodes.size() == 2);
+            // History retains the tombstoned node while the snapshot is held.
+            check("history retained while snapshot held (>= 2 records)",
+                graph.MvccNodeHistorySize() >= 2);
+        } // snap destructor releases the snapshot and triggers garbage collection
+
+        check("no active snapshots after release", graph.ActiveSnapshotCount() == 0);
+        // With no snapshot to preserve it, the tombstoned node's history is
+        // reclaimed, leaving only the one surviving live node.
+        check("tombstoned history reclaimed after release (1 record)",
+            graph.MvccNodeHistorySize() == 1);
+    }
+
+    std::cout << "\n== Execute: SELECT ... SNAPSHOT falls back to live without a snapshot ==\n";
+    {
+        Graph graph;
+        buildQueryFixture(graph);           // 3 nodes
+
+        Query q;
+        // No CSR snapshot supplied: single-argument execute. SELECT ... SNAPSHOT
+        // has no captured version, so it resolves against the live graph. An id
+        // lookup still works because the live path handles WHERE ID.
+        q.parse("SELECT * FROM NODES WHERE LABEL = 'Person' SNAPSHOT");
+        QueryResult r = q.execute(graph);
+        check("snapshot select, no snapshot supplied: falls back to live (2 Person)",
+            r.success && r.nodes.size() == 2);
+    }
+
+    std::cout << "\n" << pass << " passed, " << fail << " failed (cumulative).\n";
+    return fail == 0 ? 0 : 1;
+}
+
+// Public entry point: prints the banner and runs both halves of the query-layer
+// suite plus the SELECT ... SNAPSHOT suite. Returns non-zero if any recorded a
+// failure.
 int test_query_layer() {
     std::cout << "\n==================== QUERY LAYER ====================\n";
     int rc1 = test_query_layer_part1();
     int rc2 = test_query_layer_part2();
-    return (rc1 == 0 && rc2 == 0) ? 0 : 1;
+    int rc3 = test_select_snapshot();
+    return (rc1 == 0 && rc2 == 0 && rc3 == 0) ? 0 : 1;
 }
 
 // =====================================================================

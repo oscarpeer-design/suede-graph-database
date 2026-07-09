@@ -233,6 +233,77 @@ void Graph::DeleteNode(NodeId id, int& warning) {
     warning = operationSuccessful;
 }
 
+// UpdateNodeProperties
+void Graph::UpdateNodeProperties(NodeId id, const propertiesMap& updates, int& warning) {
+    // locate the live node
+    auto it = nodes.find(id);
+    if (it == nodes.end()) {
+        warning = errNodeDoesntExist;
+        return;
+    }
+    // merge the updates into the live node's property map. Existing keys are
+    // overwritten; new keys are added; unmentioned keys are left as-is.
+    for (const auto& kv : updates)
+        it->second.properties[kv.first] = kv.second;
+    // MVCC: bump the version to mark that a mutation occurred, then refresh the
+    // retained history record so it mirrors the live node. The history store keeps
+    // a single record per id (keyed by NodeId, scanned via mvccNodeOrder_), so the
+    // update is reflected in place: the record's payload is refreshed and its
+    // createdAtVersion advanced to the new version. NOTE: because only one record
+    // per node is retained, a SELECT ... SNAPSHOT taken *before* an update sees the
+    // node as created at the update's version; property history is not versioned
+    // independently (snapshots reflect create/delete presence, not per-property
+    // revisions).
+    ++currentVersion_;
+    auto histIt = mvccNodes_.find(id);
+    if (histIt != mvccNodes_.end()) {
+        histIt->second.node = it->second;               // refresh payload
+        histIt->second.createdAtVersion = currentVersion_;
+        histIt->second.deletedAtVersion = 0;            // still live
+    } else {
+        // no retained record (e.g. already reclaimed): re-create one and ensure the
+        // id participates in ordered snapshot scans.
+        mvccNodes_[id] = NodeVersion{ it->second, currentVersion_, 0 };
+        mvccNodeOrder_.push_back(id);
+    }
+    warning = operationSuccessful;
+}
+
+// UpdateEdgeLabel
+void Graph::UpdateEdgeLabel(EdgeId id, const std::string& newLabel, int& warning) {
+    // locate the live edge
+    auto it = edges.find(id);
+    if (it == edges.end()) {
+        warning = errEdgeDoesntExist;
+        return;
+    }
+    Edge& edge = it->second;
+    // if the label is unchanged there is nothing to do; report success and avoid a
+    // spurious version bump / history churn.
+    if (edge.label == newLabel) {
+        warning = operationSuccessful;
+        return;
+    }
+    // maintain the label -> edge-id index: drop from the old bucket, add to the new.
+    EraseValue(labelToEdges[edge.label], id);
+    labelToEdges[newLabel].push_back(id);
+    // apply the new label to the live edge
+    edge.label = newLabel;
+    // MVCC: bump the version and refresh the retained edge history in place so it
+    // mirrors the live edge (single record per id, same caveat as
+    // UpdateNodeProperties).
+    ++currentVersion_;
+    auto histIt = mvccEdges_.find(id);
+    if (histIt != mvccEdges_.end()) {
+        histIt->second.edge = edge;
+        histIt->second.createdAtVersion = currentVersion_;
+        histIt->second.deletedAtVersion = 0;
+    } else {
+        mvccEdges_[id] = EdgeVersion{ edge, currentVersion_, 0 };
+    }
+    warning = operationSuccessful;
+}
+
 // get neighbouring node ids for graph traversal
 // used internally by BFS searchers
 // this differs from the other functions because it is designed for traversal and not user access

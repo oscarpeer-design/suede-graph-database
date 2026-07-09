@@ -20,7 +20,10 @@ enum class QueryOperation {
     Select,
     Insert,
     Delete,
-    Match
+    Match,
+    Update,
+    Load,
+    Save
 };
 
 enum class QueryTarget {
@@ -107,6 +110,14 @@ public:
     bool hasLimit() const { return hasLimit_; }
     size_t limit() const { return limit_; }
 
+    // Operation / target of the parsed statement, the LOAD/SAVE file path, and the
+    // last parse error. Exposed so an outer coordinator (e.g. a GraphHandler that
+    // owns a StorageEngine) can route LOAD/SAVE and inspect parse failures.
+    QueryOperation operation() const { return operation_; }
+    QueryTarget target() const { return target_; }
+    const std::string& filePath() const { return filePath_; }
+    const std::string& lastError() const { return errorMessage_; }
+
 private:
     // small helpers
     std::string toUpper(const std::string& s) const;
@@ -123,7 +134,14 @@ private:
     bool parseInsert(const std::vector<std::string>& tokens, size_t pos);
     bool parseDelete(const std::vector<std::string>& tokens, size_t pos);
     bool parseMatch(const std::vector<std::string>& tokens, size_t pos);
+    bool parseUpdate(const std::vector<std::string>& tokens, size_t pos);
+    bool parseLoad(const std::vector<std::string>& tokens, size_t pos);
+    bool parseSave(const std::vector<std::string>& tokens, size_t pos);
     bool parseWhereClause(const std::vector<std::string>& tokens, size_t pos);
+
+    // Parse the SET key=value[, key=value ...] list of an UPDATE. Fills values_.
+    // `pos` should point at the first token after the SET keyword.
+    bool parseSetClause(const std::vector<std::string>& tokens, size_t pos);
 
     // execution helpers
     QueryResult executeSelectNodes(Graph& graph) const;
@@ -140,6 +158,8 @@ private:
     QueryResult executeDeleteNodes(Graph& graph) const;
     QueryResult executeDeleteEdges(Graph& graph) const;
     QueryResult executeMatch(Graph& graph) const;
+    QueryResult executeUpdateNodes(Graph& graph) const;
+    QueryResult executeUpdateEdges(Graph& graph) const;
 
     // CSR-backed MATCH execution: runs the traversal on CSR_Searcher over the
     // supplied point-in-time snapshot.
@@ -167,7 +187,8 @@ private:
     std::string errorMessage_;                 // last parse error
 
     std::vector<Condition> conditions_;        // parsed WHERE conditions
-    propertiesMap values_;                     // parsed INSERT values (column -> value)
+    propertiesMap values_;                     // parsed INSERT / UPDATE values (column -> value)
+    std::string filePath_;                     // parsed path for LOAD / SAVE FILE
 
     QueryOperation operation_ = QueryOperation::Unknown;
     QueryTarget target_ = QueryTarget::Unknown;

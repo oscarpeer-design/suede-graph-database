@@ -11,6 +11,7 @@
 #include "CSR_Representation.h"
 #include "CSR_Searcher.h"
 #include "Query.h"
+#include "GraphHandler.h"
 
 // test file
 #include "test_graph_suite.h"

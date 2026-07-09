@@ -134,7 +134,8 @@ bool Query::parse() {
     parsed_ = false;                             // clear parse success flag
     errorMessage_.clear();                       // clear any existing error text
     conditions_.clear();                         // clear parsed WHERE conditions
-    values_.clear();                             // clear parsed INSERT values
+    values_.clear();                             // clear parsed INSERT / UPDATE values
+    filePath_.clear();                           // clear parsed LOAD / SAVE path
     operation_ = QueryOperation::Unknown;        // reset operation type
     target_ = QueryTarget::Unknown;              // reset target type
     executionMode_ = ExecutionMode::Live;        // reset to the default (live) view
@@ -176,7 +177,7 @@ bool Query::parse() {
     // version; MATCH ... SNAPSHOT traverses the frozen CSR snapshot.
     if (executionMode_ == ExecutionMode::Snapshot &&
         keyword != "MATCH" && keyword != "SELECT") {
-        setError("SNAPSHOT applies only to reads (SELECT, MATCH); INSERT and DELETE always run against the live graph.");
+        setError("SNAPSHOT applies only to reads (SELECT, MATCH); INSERT, DELETE, and UPDATE always run against the live graph.");
         return false;
     }
 
@@ -197,6 +198,18 @@ bool Query::parse() {
     else if (keyword == "MATCH") {             // MATCH traversal dispatch
         operation_ = QueryOperation::Match;
         ok = parseMatch(tokens, 1);
+    }
+    else if (keyword == "UPDATE") {            // UPDATE statement dispatch
+        operation_ = QueryOperation::Update;
+        ok = parseUpdate(tokens, 1);
+    }
+    else if (keyword == "LOAD") {              // LOAD FILE dispatch
+        operation_ = QueryOperation::Load;
+        ok = parseLoad(tokens, 1);
+    }
+    else if (keyword == "SAVE") {              // SAVE FILE dispatch
+        operation_ = QueryOperation::Save;
+        ok = parseSave(tokens, 1);
     }
     else {                                     // unknown top-level keyword
         setError("Unrecognized query keyword: " + tokens[0]); // error out with original token shown
@@ -534,6 +547,19 @@ QueryResult Query::executeResolved(Graph& live, CSR_Representation* snapshot) co
         if (executionMode_ == ExecutionMode::Snapshot && snapshot != nullptr)
             return executeMatchCSR(*snapshot);
         return executeMatch(live);
+    case QueryOperation::Update:
+        return (target_ == QueryTarget::Nodes) ? executeUpdateNodes(live) : executeUpdateEdges(live);
+    case QueryOperation::Load:
+    case QueryOperation::Save:
+        // LOAD / SAVE are storage operations, not graph operations. The Query
+        // layer only parses them (path via filePath()); a coordinator that owns a
+        // StorageEngine performs the actual I/O. Bare execution against a Graph
+        // alone cannot reach storage, so report that.
+        result.success = false;
+        result.message = (operation_ == QueryOperation::Load)
+            ? "LOAD must be executed by a coordinator that owns a StorageEngine."
+            : "SAVE must be executed by a coordinator that owns a StorageEngine.";
+        return result;
     case QueryOperation::Unknown:
     default:
         result.success = false;               // unknown operation is an execution error
@@ -1124,5 +1150,244 @@ QueryResult Query::executeMatchCSR(CSR_Representation& snapshot) const {
     result.success = true;
     result.message = "Found " + std::to_string(result.traversalResult.size()) + " node(s) within " +
         std::to_string(matchK_) + " hop(s).";
+    return result;
+}
+// --------------------------- UPDATE / LOAD / SAVE -----------------------------
+
+// parseUpdate: UPDATE NODES|EDGES WHERE <conditions> SET key=value[, key=value ...]
+// The WHERE region runs from just after the target up to (not including) SET;
+// the SET region is everything after SET.
+bool Query::parseUpdate(const std::vector<std::string>& tokens, size_t pos) {
+    if (pos >= tokens.size() || !parseTarget(tokens[pos], target_)) {
+        setError("UPDATE: expected NODES or EDGES.");
+        return false;
+    }
+    ++pos;                                        // advance past target
+
+    if (pos >= tokens.size() || toUpper(tokens[pos]) != "WHERE") {
+        setError("UPDATE: a WHERE clause is required.");
+        return false;
+    }
+    ++pos;                                        // first WHERE condition token
+    const size_t whereStart = pos;
+
+    // find the SET keyword that terminates the WHERE region
+    size_t setPos = whereStart;
+    while (setPos < tokens.size() && toUpper(tokens[setPos]) != "SET") ++setPos;
+    if (setPos >= tokens.size()) {
+        setError("UPDATE: a SET clause is required.");
+        return false;
+    }
+    if (setPos == whereStart) {
+        setError("WHERE: no conditions found.");
+        return false;
+    }
+
+    // parse WHERE from the slice [whereStart, setPos)
+    std::vector<std::string> whereTokens(tokens.begin() + whereStart, tokens.begin() + setPos);
+    if (!parseWhereClause(whereTokens, 0)) return false;
+
+    // parse the SET assignments after SET
+    if (!parseSetClause(tokens, setPos + 1)) return false;
+
+    return true;
+}
+
+// parseSetClause: key=value[, key=value ...] from tokens[pos]. The tokenizer
+// splits on '=' and ',', so each assignment arrives as <key> '=' <value>.
+bool Query::parseSetClause(const std::vector<std::string>& tokens, size_t pos) {
+    values_.clear();
+    if (pos >= tokens.size()) {
+        setError("SET: expected at least one key=value assignment.");
+        return false;
+    }
+
+    bool expectPair = true;
+    while (pos < tokens.size()) {
+        if (!expectPair) {
+            if (tokens[pos] != ",") { setError("SET: expected ',' between assignments."); return false; }
+            ++pos;
+        }
+        if (pos >= tokens.size() || tokens[pos] == "," || tokens[pos] == "=") {
+            setError("SET: expected a column name."); return false;
+        }
+        std::string key = tokens[pos];
+        ++pos;
+        if (pos >= tokens.size() || tokens[pos] != "=") {
+            setError("SET: expected '=' after column name."); return false;
+        }
+        ++pos;
+        if (pos >= tokens.size() || tokens[pos] == "," || tokens[pos] == "=") {
+            setError("SET: expected a value after '='."); return false;
+        }
+        values_[key] = stripQuotes(tokens[pos]);
+        ++pos;
+        expectPair = false;
+    }
+    if (values_.empty()) {
+        setError("SET: expected at least one key=value assignment.");
+        return false;
+    }
+    return true;
+}
+
+// parseLoad: LOAD FILE '<path>'
+bool Query::parseLoad(const std::vector<std::string>& tokens, size_t pos) {
+    if (pos >= tokens.size() || toUpper(tokens[pos]) != "FILE") {
+        setError("LOAD: expected FILE (syntax: LOAD FILE '<path>')."); return false;
+    }
+    ++pos;
+    if (pos >= tokens.size()) { setError("LOAD FILE: expected a file path."); return false; }
+    filePath_ = stripQuotes(tokens[pos]);
+    ++pos;
+    if (filePath_.empty()) { setError("LOAD FILE: file path cannot be empty."); return false; }
+    if (pos != tokens.size()) { setError("LOAD FILE: unexpected trailing tokens."); return false; }
+    return true;
+}
+
+// parseSave: SAVE FILE '<path>'
+bool Query::parseSave(const std::vector<std::string>& tokens, size_t pos) {
+    if (pos >= tokens.size() || toUpper(tokens[pos]) != "FILE") {
+        setError("SAVE: expected FILE (syntax: SAVE FILE '<path>')."); return false;
+    }
+    ++pos;
+    if (pos >= tokens.size()) { setError("SAVE FILE: expected a file path."); return false; }
+    filePath_ = stripQuotes(tokens[pos]);
+    ++pos;
+    if (filePath_.empty()) { setError("SAVE FILE: file path cannot be empty."); return false; }
+    if (pos != tokens.size()) { setError("SAVE FILE: unexpected trailing tokens."); return false; }
+    return true;
+}
+
+// updateUpper: uppercase a property name for reserved-word comparison (ID/LABEL).
+static std::string updateUpper(const std::string& s) {
+    std::string out(s.size(), '\0');
+    for (size_t i = 0; i < s.size(); ++i)
+        out[i] = static_cast<char>(std::toupper((unsigned char)s[i]));
+    return out;
+}
+
+// updateParseUInt: parse a base-10 unsigned integer (file-local).
+static bool updateParseUInt(const std::string& token, uint64_t& out) {
+    if (token.empty()) return false;
+    for (char c : token)
+        if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+    out = std::strtoull(token.c_str(), nullptr, 10);
+    return true;
+}
+
+// nodeMatchesConditions: evaluate parsed WHERE conditions against one node.
+// Supports ID (=, !=), LABEL (=, !=), and property comparisons (all operators),
+// combined with AND.
+static bool nodeMatchesConditions(const Node& node, const std::vector<Condition>& conditions) {
+    for (const Condition& c : conditions) {
+        const std::string upper = updateUpper(c.property);
+        bool ok = false;
+        if (upper == "ID") {
+            uint64_t idVal = 0;
+            if (!updateParseUInt(c.value, idVal)) return false;
+            bool eq = (node.id == NodeId(idVal));
+            if (c.op == "=") ok = eq; else if (c.op == "!=") ok = !eq; else ok = false;
+        } else if (upper == "LABEL") {
+            if (c.op == "=") ok = (node.label == c.value);
+            else if (c.op == "!=") ok = (node.label != c.value);
+            else ok = false;
+        } else {
+            auto it = node.properties.find(c.property);
+            std::string actual = (it != node.properties.end()) ? it->second : "";
+            if (c.op == "=") ok = (actual == c.value);
+            else if (c.op == "!=") ok = (actual != c.value);
+            else if (c.op == "<") ok = (actual < c.value);
+            else if (c.op == ">") ok = (actual > c.value);
+            else if (c.op == "<=") ok = (actual <= c.value);
+            else if (c.op == ">=") ok = (actual >= c.value);
+            else ok = false;
+        }
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// edgeMatchesConditions: ID and LABEL (= / !=) for edges; properties never match.
+static bool edgeMatchesConditions(const Edge& edge, const std::vector<Condition>& conditions) {
+    for (const Condition& c : conditions) {
+        const std::string upper = updateUpper(c.property);
+        bool ok = false;
+        if (upper == "ID") {
+            uint64_t idVal = 0;
+            if (!updateParseUInt(c.value, idVal)) return false;
+            bool eq = (edge.id == EdgeId(idVal));
+            if (c.op == "=") ok = eq; else if (c.op == "!=") ok = !eq; else ok = false;
+        } else if (upper == "LABEL") {
+            if (c.op == "=") ok = (edge.label == c.value);
+            else if (c.op == "!=") ok = (edge.label != c.value);
+            else ok = false;
+        } else {
+            return false;
+        }
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// executeUpdateNodes: apply SET assignments to every node matching WHERE.
+QueryResult Query::executeUpdateNodes(Graph& graph) const {
+    QueryResult result;
+    if (conditions_.empty()) {
+        result.success = false;
+        result.message = "UPDATE NODES requires a WHERE clause.";
+        return result;
+    }
+    std::vector<NodeId> ids;
+    graph.GetNodeIdOrder(ids);
+    size_t updated = 0;
+    for (NodeId id : ids) {
+        Node node;
+        if (!graph.GetNode(id, node)) continue;
+        if (!nodeMatchesConditions(node, conditions_)) continue;
+        int warning = operationSuccessful;
+        graph.UpdateNodeProperties(id, values_, warning);
+        if (warning == operationSuccessful) ++updated;
+    }
+    result.success = true;
+    result.message = "Updated " + std::to_string(updated) + " node(s).";
+    return result;
+}
+
+// executeUpdateEdges: change the label of every edge matching WHERE. Only the
+// 'label' column may be assigned.
+QueryResult Query::executeUpdateEdges(Graph& graph) const {
+    QueryResult result;
+    if (conditions_.empty()) {
+        result.success = false;
+        result.message = "UPDATE EDGES requires a WHERE clause.";
+        return result;
+    }
+    for (const auto& kv : values_) {
+        if (kv.first != "label") {
+            result.success = false;
+            result.message = "UPDATE EDGES: only the 'label' column can be updated.";
+            return result;
+        }
+    }
+    auto labelIt = values_.find("label");
+    if (labelIt == values_.end()) {
+        result.success = false;
+        result.message = "UPDATE EDGES: SET label = <value> is required.";
+        return result;
+    }
+    std::vector<EdgeId> ids;
+    graph.GetAllEdgeIds(ids);
+    size_t updated = 0;
+    for (EdgeId id : ids) {
+        Edge edge;
+        if (!graph.GetEdge(id, edge)) continue;
+        if (!edgeMatchesConditions(edge, conditions_)) continue;
+        int warning = operationSuccessful;
+        graph.UpdateEdgeLabel(id, labelIt->second, warning);
+        if (warning == operationSuccessful) ++updated;
+    }
+    result.success = true;
+    result.message = "Updated " + std::to_string(updated) + " edge(s).";
     return result;
 }

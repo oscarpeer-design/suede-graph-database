@@ -1301,15 +1301,190 @@ static int test_select_snapshot() {
     return fail == 0 ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// UPDATE / LOAD / SAVE query commands
+// ---------------------------------------------------------------------------
+static int test_update_load_save() {
+    std::cout << "\n============= UPDATE / LOAD / SAVE =============\n";
+
+    // -- UPDATE NODES by property value ---------------------------------------
+    {
+        Graph graph;
+        graph.CreateNode("Person", { {"name", "Alice"}, {"age", "25"} });
+        graph.CreateNode("Person", { {"name", "Bob"},   {"age", "25"} });
+        graph.CreateNode("City",   { {"name", "Sydney"} });
+
+        Query q;
+        QueryResult r = q.run("UPDATE NODES WHERE age = 25 SET age = 26", graph);
+        check("UPDATE NODES by property: success", r.success);
+        check("UPDATE NODES by property: 2 updated", r.message == "Updated 2 node(s).");
+
+        QueryResult v = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND age = 26", graph);
+        check("UPDATE NODES by property: 2 rows now match new value",
+              v.success && v.nodes.size() == 2);
+        QueryResult old = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND age = 25", graph);
+        check("UPDATE NODES by property: 0 rows at old value",
+              old.success && old.nodes.empty());
+
+        QueryResult city = q.run("SELECT * FROM NODES WHERE LABEL = 'City'", graph);
+        check("UPDATE NODES by property: non-matching row untouched",
+              city.success && city.nodes.size() == 1 &&
+              city.nodes[0].properties.find("age") == city.nodes[0].properties.end());
+    }
+
+    // -- UPDATE NODES by id ----------------------------------------------------
+    {
+        Graph graph;
+        NodeId alice = graph.CreateNode("Person", { {"name", "Alice"}, {"status", "active"} });
+        NodeId bob   = graph.CreateNode("Person", { {"name", "Bob"},   {"status", "active"} });
+
+        Query q;
+        QueryResult r = q.run("UPDATE NODES WHERE ID = " + std::to_string(alice.value()) +
+                              " SET status = inactive", graph);
+        check("UPDATE NODES by id: success", r.success);
+        check("UPDATE NODES by id: 1 updated", r.message == "Updated 1 node(s).");
+
+        Node a; graph.GetNode(alice, a);
+        Node b; graph.GetNode(bob, b);
+        check("UPDATE NODES by id: target changed", a.properties.at("status") == "inactive");
+        check("UPDATE NODES by id: other unchanged", b.properties.at("status") == "active");
+    }
+
+    // -- UPDATE NODES adds a new property key ----------------------------------
+    {
+        Graph graph;
+        NodeId n = graph.CreateNode("Person", { {"name", "Alice"} });
+        Query q;
+        QueryResult r = q.run("UPDATE NODES WHERE ID = " + std::to_string(n.value()) +
+                              " SET nickname = Al", graph);
+        check("UPDATE NODES new key: success", r.success);
+        Node got; graph.GetNode(n, got);
+        check("UPDATE NODES new key: key added",
+              got.properties.count("nickname") == 1 && got.properties.at("nickname") == "Al");
+        check("UPDATE NODES new key: existing key preserved", got.properties.at("name") == "Alice");
+    }
+
+    // -- UPDATE EDGES label ----------------------------------------------------
+    {
+        Graph graph;
+        NodeId n1 = graph.CreateNode("Person", {});
+        NodeId n2 = graph.CreateNode("Person", {});
+        NodeId n3 = graph.CreateNode("City",   {});
+        int w = operationSuccessful;
+        graph.CreateEdge(n1, n2, "KNOWS", w);
+        graph.CreateEdge(n2, n3, "KNOWS", w);
+
+        Query q;
+        QueryResult r = q.run("UPDATE EDGES WHERE LABEL = 'KNOWS' SET label = BEFRIENDS", graph);
+        check("UPDATE EDGES label: success", r.success);
+        check("UPDATE EDGES label: 2 updated", r.message == "Updated 2 edge(s).");
+
+        int w2 = operationSuccessful;
+        std::vector<Edge> befriends;
+        graph.FindEdgesByLabel(befriends, "BEFRIENDS", w2);
+        check("UPDATE EDGES label: new label indexed",
+              w2 == operationSuccessful && befriends.size() == 2);
+
+        int w3 = operationSuccessful;
+        std::vector<Edge> knows;
+        graph.FindEdgesByLabel(knows, "KNOWS", w3);
+        check("UPDATE EDGES label: old label no longer present", knows.empty());
+    }
+
+    // -- UPDATE EDGES rejects a non-label column -------------------------------
+    {
+        Graph graph;
+        NodeId n1 = graph.CreateNode("Person", {});
+        NodeId n2 = graph.CreateNode("Person", {});
+        int w = operationSuccessful;
+        graph.CreateEdge(n1, n2, "KNOWS", w);
+
+        Query q;
+        QueryResult r = q.run("UPDATE EDGES WHERE LABEL = 'KNOWS' SET weight = 5", graph);
+        check("UPDATE EDGES bad column: rejected", !r.success);
+        check("UPDATE EDGES bad column: message mentions label",
+              r.message.find("label") != std::string::npos);
+    }
+
+    // -- UPDATE parse errors ---------------------------------------------------
+    {
+        Query q;
+        check("UPDATE no WHERE: parse fails", !q.parse("UPDATE NODES SET name = Bob"));
+        check("UPDATE no WHERE: WHERE mentioned", q.lastError().find("WHERE") != std::string::npos);
+
+        Query q2;
+        check("UPDATE no SET: parse fails", !q2.parse("UPDATE NODES WHERE LABEL = 'Person'"));
+        check("UPDATE no SET: SET mentioned", q2.lastError().find("SET") != std::string::npos);
+
+        Query q3;
+        check("UPDATE bad target: parse fails", !q3.parse("UPDATE THINGS WHERE ID = 1 SET x = y"));
+
+        Query q4;
+        check("UPDATE SNAPSHOT: parse fails",
+              !q4.parse("UPDATE NODES WHERE ID = 1 SET age = 30 SNAPSHOT"));
+        check("UPDATE SNAPSHOT: SNAPSHOT mentioned", q4.lastError().find("SNAPSHOT") != std::string::npos);
+    }
+
+    // -- LOAD / SAVE parse + path extraction -----------------------------------
+    {
+        Query q;
+        check("SAVE FILE: parse succeeds", q.parse("SAVE FILE 'graph.db'"));
+        check("SAVE FILE: operation is Save", q.operation() == QueryOperation::Save);
+        check("SAVE FILE: path extracted (quotes stripped)", q.filePath() == "graph.db");
+
+        Query q2;
+        check("LOAD FILE: parse succeeds", q2.parse("LOAD FILE 'graph.db'"));
+        check("LOAD FILE: operation is Load", q2.operation() == QueryOperation::Load);
+        check("LOAD FILE: path extracted", q2.filePath() == "graph.db");
+
+        Query q3;
+        check("SAVE no path: parse fails", !q3.parse("SAVE FILE"));
+
+        Query q4;
+        check("LOAD path matches SAVE path", q4.parse("LOAD FILE 'graph.db'") &&
+              q4.filePath() == "graph.db");
+    }
+
+    // -- SAVE then LOAD round-trip through StorageEngine using parsed paths -----
+    {
+        const std::string path = "test_update_roundtrip.db";
+        Graph original;
+        original.CreateNode("Person", { {"name", "Alice"} });
+        original.CreateNode("City",   { {"name", "Sydney"} });
+
+        Query saveQ;
+        check("round-trip: SAVE parses",
+              saveQ.parse("SAVE FILE '" + path + "'") && saveQ.operation() == QueryOperation::Save);
+        StorageEngine saveEngine(saveQ.filePath());
+        check("round-trip: StorageEngine.Save succeeds", saveEngine.Save(original));
+
+        Query loadQ;
+        check("round-trip: LOAD parses",
+              loadQ.parse("LOAD FILE '" + path + "'") && loadQ.operation() == QueryOperation::Load);
+        Graph restored;
+        StorageEngine loadEngine(loadQ.filePath());
+        check("round-trip: StorageEngine.Load succeeds", loadEngine.Load(restored));
+
+        std::vector<NodeId> ids;
+        restored.GetNodeIdOrder(ids);
+        check("round-trip: node count preserved", ids.size() == 2);
+        std::remove(path.c_str());
+    }
+
+    std::cout << "\n" << pass << " passed, " << fail << " failed (cumulative).\n";
+    return fail == 0 ? 0 : 1;
+}
+
 // Public entry point: prints the banner and runs both halves of the query-layer
-// suite plus the SELECT ... SNAPSHOT suite. Returns non-zero if any recorded a
-// failure.
+// suite plus the SELECT ... SNAPSHOT and UPDATE / LOAD / SAVE suites. Returns
+// non-zero if any recorded a failure.
 int test_query_layer() {
     std::cout << "\n==================== QUERY LAYER ====================\n";
     int rc1 = test_query_layer_part1();
     int rc2 = test_query_layer_part2();
     int rc3 = test_select_snapshot();
-    return (rc1 == 0 && rc2 == 0 && rc3 == 0) ? 0 : 1;
+    int rc4 = test_update_load_save();
+    return (rc1 == 0 && rc2 == 0 && rc3 == 0 && rc4 == 0) ? 0 : 1;
 }
 
 // =====================================================================

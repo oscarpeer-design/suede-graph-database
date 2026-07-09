@@ -318,6 +318,21 @@ public:
 
     void DeleteNode(NodeId id, int& warning);
 
+    // UpdateNodeProperties
+    // Merge the supplied key=value pairs into node `id`'s property map (existing
+    // keys overwritten, new keys added, unmentioned keys left untouched). The
+    // structural fields (id, label) are not affected. MVCC: bumps the version and
+    // refreshes the retained history record so it mirrors the live node.
+    // warning == operationSuccessful on success, errNodeDoesntExist if absent.
+    void UpdateNodeProperties(NodeId id, const propertiesMap& updates, int& warning);
+
+    // UpdateEdgeLabel
+    // Change edge `id`'s label to `newLabel`, keeping the label index and MVCC
+    // history consistent. Edge structure (from/to) is immutable, so only the
+    // label may change. warning == operationSuccessful on success,
+    // errEdgeDoesntExist if absent.
+    void UpdateEdgeLabel(EdgeId id, const std::string& newLabel, int& warning);
+
     void GetNeighbourIdsForTraversal(NodeId node, std::vector<NodeId>& neighbours, EdgeDirection dir, int& warning) const;
 
     void GetNodeIdOrder(std::vector<NodeId>& out) const;

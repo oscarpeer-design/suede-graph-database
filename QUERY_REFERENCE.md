@@ -137,7 +137,8 @@ General rules that apply everywhere:
   number of rows returned. `SELECT` also accepts a **column projection** in place
   of `*`. See §2.1 and §2.4.
 
-The four statements are `SELECT`, `INSERT`, `DELETE`, and `MATCH`.
+The statements are `SELECT`, `INSERT`, `DELETE`, `MATCH`, `UPDATE`, `LOAD`, and
+`SAVE`.
 
 ---
 
@@ -493,6 +494,97 @@ QueryResult rows = q.execute(graph, snapshot);  // resolved against MVCC history
 
 ---
 
+### 2.6 UPDATE
+
+Modify existing rows in place. An `UPDATE` requires both a `WHERE` clause (which
+rows to change) and a `SET` clause (what to change them to).
+
+```
+UPDATE NODES WHERE <conditions> SET key = value [, key = value ...]
+UPDATE EDGES WHERE <conditions> SET label = <value>
+```
+
+#### UPDATE NODES
+
+Merge the `SET` assignments into the property map of every node matching `WHERE`.
+Existing keys are overwritten, new keys are added, and keys not named in `SET`
+are left untouched. The structural fields `id` and `label` are not changed.
+
+```sql
+UPDATE NODES WHERE ID = 5 SET name = Alice, age = 30
+UPDATE NODES WHERE LABEL = 'Person' SET status = active
+UPDATE NODES WHERE age = 25 SET age = 26
+```
+
+`WHERE` supports the usual forms: `ID` and `LABEL` (`=` / `!=`), and property
+comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`), combined with `AND`.
+
+Result message: `Updated <n> node(s).` (matching zero rows is still a success).
+
+Because the MVCC history retains a single record per node, a
+`SELECT ... SNAPSHOT` captured *before* an update observes the node as created at
+the update's version; property revisions are not versioned independently.
+
+#### UPDATE EDGES
+
+Change the label of every edge matching `WHERE`. Edges carry only a label, so
+**`label` is the only assignable column** — any other `SET` target is rejected.
+Edge structure (`from` / `to`) is immutable. The label index is kept consistent.
+
+```sql
+UPDATE EDGES WHERE ID = 10 SET label = KNOWS
+UPDATE EDGES WHERE LABEL = 'WORKS_AT' SET label = EMPLOYED_BY
+```
+
+`WHERE` for edges supports `ID` and `LABEL` (`=` / `!=`).
+
+Result message: `Updated <n> edge(s).`
+
+`UPDATE` always runs against the live graph; `UPDATE ... SNAPSHOT` is rejected at
+parse time.
+
+---
+
+### 2.7 LOAD
+
+Load a graph from a persisted binary file.
+
+```
+LOAD FILE '<path>'
+```
+
+```sql
+LOAD FILE 'graph.db'
+LOAD FILE 'backups/graph_2026_07_09.db'
+```
+
+The quoted path is parsed and exposed via `operation()` / `filePath()`. The actual
+file read is performed by a coordinator that owns a `StorageEngine`; executing a
+bare `LOAD` against a `Graph` alone reports that a coordinator/StorageEngine is
+required, because the `Query` object has no storage of its own.
+
+---
+
+### 2.8 SAVE
+
+Save the current graph to a binary file.
+
+```
+SAVE FILE '<path>'
+```
+
+```sql
+SAVE FILE 'graph.db'
+SAVE FILE 'backups/graph_2026_07_09.db'
+```
+
+As with `LOAD`, the quoted path is parsed and exposed via `filePath()`, and the
+actual write is performed by a coordinator that owns a `StorageEngine`. This keeps
+the `Query` layer free of file-system concerns while letting file operations be
+expressed as ordinary statements.
+
+---
+
 ## 3. Error and status messages
 
 Two kinds of messages can come back: **parse errors** (the statement is
@@ -504,7 +596,14 @@ the executor reports the outcome). Below is the authoritative list.
 | Message | Triggered by |
 |---------|--------------|
 | `Empty query.` | Empty or whitespace-only input. |
-| `Unrecognized query keyword: <tok>` | First word isn't SELECT/INSERT/DELETE/MATCH. |
+| `Unrecognized query keyword: <tok>` | First word isn't SELECT/INSERT/DELETE/MATCH/UPDATE/LOAD/SAVE. |
+| `UPDATE: expected NODES or EDGES.` | `UPDATE` with a bad or missing target. |
+| `UPDATE: a WHERE clause is required.` | `UPDATE` with no `WHERE`. |
+| `UPDATE: a SET clause is required.` | `UPDATE` with no `SET`. |
+| `SET: expected a column name.` / `SET: expected '=' after column name.` / `SET: expected a value after '='.` | Malformed `SET` assignment. |
+| `SET: expected ',' between assignments.` | Two `SET` pairs with no comma. |
+| `LOAD: expected FILE ...` / `LOAD FILE: expected a file path.` | Malformed `LOAD`. |
+| `SAVE: expected FILE ...` / `SAVE FILE: expected a file path.` | Malformed `SAVE`. |
 | `SELECT: expected '*'.` | Missing projection after `SELECT`. |
 | `SELECT: expected '*' or a column list.` | No projection after `SELECT` (or after `TOP <n>`). |
 | `SELECT: expected a column name.` | Column list is empty or ends without a name. |
@@ -543,7 +642,7 @@ the executor reports the outcome). Below is the authoritative list.
 | `MATCH KHOP: expected STEPS.` | `KHOP` without `STEPS`. |
 | `MATCH KHOP: expected a numeric step count after STEPS.` | Non-numeric step count. |
 | `MATCH: unexpected trailing tokens.` | Extra tokens after a complete `MATCH`. |
-| `SNAPSHOT applies only to reads (SELECT, MATCH); INSERT and DELETE always run against the live graph.` | `SNAPSHOT` keyword used on an `INSERT` or `DELETE`. |
+| `SNAPSHOT applies only to reads (SELECT, MATCH); INSERT, DELETE, and UPDATE always run against the live graph.` | `SNAPSHOT` keyword used on an `INSERT`, `DELETE`, or `UPDATE`. |
 | `WHERE: expected operator.` | Property with no operator. |
 | `WHERE: invalid operator '<op>'.` | Operator not in the valid set. |
 | `WHERE: expected value.` | Operator with no right-hand value. |
@@ -559,6 +658,11 @@ the executor reports the outcome). Below is the authoritative list.
 | `Found <n> row(s).` | Label / edge query result count. | ✅ |
 | `Inserted node.` / `Inserted edge.` | Insert succeeded. | ✅ |
 | `Deleted node.` / `Deleted edge.` | Delete succeeded. | ✅ |
+| `Updated <n> node(s).` | `UPDATE NODES` result count. | ✅ |
+| `Updated <n> edge(s).` | `UPDATE EDGES` result count. | ✅ |
+| `UPDATE EDGES: only the 'label' column can be updated.` | `SET` on an edge column other than `label`. | ❌ |
+| `LOAD must be executed by a coordinator that owns a StorageEngine.` | Bare `LOAD` executed against a `Graph` only. | ❌ |
+| `SAVE must be executed by a coordinator that owns a StorageEngine.` | Bare `SAVE` executed against a `Graph` only. | ❌ |
 | `Found <n> reachable node(s).` | `MATCH REACHABLE` result. | ✅ |
 | `Path found with <n> node(s).` | `MATCH SHORTEST_PATH` result. | ✅ |
 | `No path found between the given nodes.` | `SHORTEST_PATH` target unreachable. | ✅ |

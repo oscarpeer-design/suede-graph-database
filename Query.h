@@ -147,12 +147,22 @@ private:
     QueryResult executeSelectNodes(Graph& graph) const;
     QueryResult executeSelectEdges(Graph& graph) const;
 
-    // Snapshot-mode SELECT: resolve rows against the graph's MVCC history at the
-    // supplied point-in-time version rather than the live graph. Supports the
-    // same WHERE forms as the live path (ID / LABEL filters, plus property
-    // filters for nodes), applied over the set visible at `snapshotVersion`.
-    QueryResult executeSelectNodesSnapshot(Graph& graph, uint64_t snapshotVersion) const;
-    QueryResult executeSelectEdgesSnapshot(Graph& graph, uint64_t snapshotVersion) const;
+    // Snapshot-mode SELECT resolves against a frozen CSR snapshot.
+    //
+    // NODES: the CSR snapshot is the authority for *which* nodes are visible --
+    //   its captured node-id set (GetCSRNodeMapping) defines membership. The node
+    //   payloads (label / properties) are read from the graph's MVCC history at the
+    //   snapshot's captured version, so filtering sees point-in-time property
+    //   values. This honours the design where CSR holds the raw index and the graph
+    //   holds the properties.
+    // EDGES: the CSR snapshot carries no edge identity (it indexes node adjacency
+    //   only), so edges resolve against the graph's MVCC history at the snapshot's
+    //   captured version; the snapshot is used only to supply that version.
+    //
+    // Both support the same WHERE forms as the live path (ID / LABEL filters, plus
+    // property filters for nodes).
+    QueryResult executeSelectNodesSnapshot(Graph& graph, const CSR_Representation& snapshot) const;
+    QueryResult executeSelectEdgesSnapshot(Graph& graph, const CSR_Representation& snapshot) const;
     QueryResult executeInsertNodes(Graph& graph) const;
     QueryResult executeInsertEdges(Graph& graph) const;
     QueryResult executeDeleteNodes(Graph& graph) const;

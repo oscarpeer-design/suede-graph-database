@@ -531,10 +531,9 @@ QueryResult Query::executeResolved(Graph& live, CSR_Representation* snapshot) co
         // Without a snapshot there is no captured version, so we fall back to
         // the live graph (documented behaviour, mirroring MATCH ... SNAPSHOT).
         if (executionMode_ == ExecutionMode::Snapshot && snapshot != nullptr) {
-            const uint64_t ver = snapshot->GetSnapshotVersion();
             return (target_ == QueryTarget::Nodes)
-                ? executeSelectNodesSnapshot(live, ver)
-                : executeSelectEdgesSnapshot(live, ver);
+                ? executeSelectNodesSnapshot(live, *snapshot)
+                : executeSelectEdgesSnapshot(live, *snapshot);
         }
         return (target_ == QueryTarget::Nodes) ? executeSelectNodes(live) : executeSelectEdges(live);
     case QueryOperation::Insert:
@@ -806,15 +805,14 @@ QueryResult Query::executeSelectEdges(Graph& graph) const {
 // path, which requires an ID or LABEL predicate.
 
 // Execute SELECT ... SNAPSHOT targeting nodes.
-QueryResult Query::executeSelectNodesSnapshot(Graph& graph, uint64_t snapshotVersion) const {
+QueryResult Query::executeSelectNodesSnapshot(Graph& graph, const CSR_Representation& snapshot) const {
     QueryResult result;
 
-    // Materialize the nodes visible at the snapshot version (insertion order).
-    std::vector<Node> visible;
-    graph.GetNodesAtVersion(visible, snapshotVersion);
+    const uint64_t snapshotVersion = snapshot.GetSnapshotVersion();
 
     // Partition conditions: an optional ID equality, an optional LABEL equality,
-    // and any remaining property filters. All are applied against the frozen set.
+    // and any remaining property filters. This walks only the WHERE conditions,
+    // not any node data.
     bool haveIdFilter = false;
     uint64_t idFilter = 0;
     bool haveLabelFilter = false;
@@ -838,24 +836,55 @@ QueryResult Query::executeSelectNodesSnapshot(Graph& graph, uint64_t snapshotVer
         }
     }
 
-    // Apply the filters to each visible node.
-    for (const Node& node : visible) {
-        if (haveIdFilter && node.id.value() != idFilter) continue;
-        if (haveLabelFilter && node.label != labelFilter) continue;
+    // TOP 0 selects nothing; short-circuit before touching any node.
+    if (hasLimit_ && limit_ == 0) {
+        result.success = true;
+        result.message = "Found 0 row(s).";
+        return result;
+    }
 
-        bool matches = true;
+    // Test one fetched node against the LABEL and property predicates, appending
+    // it to the result when it passes. Returns true once the TOP <n> cap (if any)
+    // has been reached so the caller can stop. Membership (ID) is handled by the
+    // caller's choice of which ids to fetch, so it is not re-tested here.
+    auto considerNode = [&](Node&& node) -> bool {
+        if (haveLabelFilter && node.label != labelFilter) return false;
         for (const Condition& e : propFilters) {
             auto it = node.properties.find(e.property);
             std::string actual = (it != node.properties.end()) ? it->second : "";
-            bool condResult = executeCondition(e, actual, matches);
-            if (!condResult) { matches = false; break; }
+            bool matches = true;
+            if (!executeCondition(e, actual, matches)) return false;
         }
-        if (matches) result.nodes.push_back(node);
+        result.nodes.push_back(std::move(node));
+        return hasLimit_ && result.nodes.size() >= limit_;   // true == cap reached
+        };
+
+    if (haveIdFilter) {
+        // WHERE ID = <n>: the id is the membership key. Confirm it belongs to the
+        // snapshot's captured set (O(1)), then fetch just that one node's payload
+        // at the snapshot version. No CSR iteration, no intermediate vector.
+        int warning = operationSuccessful;
+        snapshot.MapGraphNodeToCSR(NodeId(idFilter), warning);
+        if (warning == operationSuccessful) {
+            Node node;
+            if (graph.GetNodeAtVersion(NodeId(idFilter), snapshotVersion, node))
+                considerNode(std::move(node));
+        }
+    }
+    else {
+        // No id predicate: membership is the CSR snapshot's captured id set. Fetch
+        // each id's payload at-version and filter it in the same pass -- nothing is
+        // materialised except the rows that pass, and we stop early once TOP is hit.
+        for (const NodeId id : snapshot.GetCSRNodeMapping()) {
+            Node node;
+            if (!graph.GetNodeAtVersion(id, snapshotVersion, node))
+                continue;                                    // not visible at version
+            if (considerNode(std::move(node))) break;        // TOP cap reached
+        }
     }
 
     result.success = true;
     projectNodes(result.nodes);              // trim to selected columns (no-op for '*')
-    applyLimit(result.nodes);                // apply TOP <n> row cap
     result.message = (result.nodes.size() == 1)
         ? "Found 1 row."
         : "Found " + std::to_string(result.nodes.size()) + " row(s).";
@@ -863,8 +892,16 @@ QueryResult Query::executeSelectNodesSnapshot(Graph& graph, uint64_t snapshotVer
 }
 
 // Execute SELECT ... SNAPSHOT targeting edges.
-QueryResult Query::executeSelectEdgesSnapshot(Graph& graph, uint64_t snapshotVersion) const {
+//
+// The CSR snapshot indexes node adjacency, not edge identity (no edge-id set, no
+// edge labels), so edges cannot have their membership driven by CSR the way nodes
+// do. They resolve against the MVCC history at the snapshot's captured version;
+// the snapshot is used only to supply that version, keeping the point-in-time view
+// consistent with the node path.
+QueryResult Query::executeSelectEdgesSnapshot(Graph& graph, const CSR_Representation& snapshot) const {
     QueryResult result;
+
+    const uint64_t snapshotVersion = snapshot.GetSnapshotVersion();
 
     // Materialize edges visible at the snapshot version.
     std::vector<Edge> visible;
@@ -1288,11 +1325,13 @@ static bool nodeMatchesConditions(const Node& node, const std::vector<Condition>
             if (!updateParseUInt(c.value, idVal)) return false;
             bool eq = (node.id == NodeId(idVal));
             if (c.op == "=") ok = eq; else if (c.op == "!=") ok = !eq; else ok = false;
-        } else if (upper == "LABEL") {
+        }
+        else if (upper == "LABEL") {
             if (c.op == "=") ok = (node.label == c.value);
             else if (c.op == "!=") ok = (node.label != c.value);
             else ok = false;
-        } else {
+        }
+        else {
             auto it = node.properties.find(c.property);
             std::string actual = (it != node.properties.end()) ? it->second : "";
             if (c.op == "=") ok = (actual == c.value);
@@ -1318,11 +1357,13 @@ static bool edgeMatchesConditions(const Edge& edge, const std::vector<Condition>
             if (!updateParseUInt(c.value, idVal)) return false;
             bool eq = (edge.id == EdgeId(idVal));
             if (c.op == "=") ok = eq; else if (c.op == "!=") ok = !eq; else ok = false;
-        } else if (upper == "LABEL") {
+        }
+        else if (upper == "LABEL") {
             if (c.op == "=") ok = (edge.label == c.value);
             else if (c.op == "!=") ok = (edge.label != c.value);
             else ok = false;
-        } else {
+        }
+        else {
             return false;
         }
         if (!ok) return false;

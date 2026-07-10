@@ -260,7 +260,8 @@ void Graph::UpdateNodeProperties(NodeId id, const propertiesMap& updates, int& w
         histIt->second.node = it->second;               // refresh payload
         histIt->second.createdAtVersion = currentVersion_;
         histIt->second.deletedAtVersion = 0;            // still live
-    } else {
+    }
+    else {
         // no retained record (e.g. already reclaimed): re-create one and ensure the
         // id participates in ordered snapshot scans.
         mvccNodes_[id] = NodeVersion{ it->second, currentVersion_, 0 };
@@ -298,7 +299,8 @@ void Graph::UpdateEdgeLabel(EdgeId id, const std::string& newLabel, int& warning
         histIt->second.edge = edge;
         histIt->second.createdAtVersion = currentVersion_;
         histIt->second.deletedAtVersion = 0;
-    } else {
+    }
+    else {
         mvccEdges_[id] = EdgeVersion{ edge, currentVersion_, 0 };
     }
     warning = operationSuccessful;
@@ -451,6 +453,24 @@ void Graph::GetNodesAtVersion(std::vector<Node>& out, uint64_t snapshotVersion) 
         if (createdInView && notYetDeleted)
             out.push_back(nv.node);
     }
+}
+
+// Fetch one node's payload at `snapshotVersion` via an O(1) history lookup,
+// applying the same visibility rule as GetNodesAtVersion. Unlike GetNode (which
+// reads the live map), this observes tombstones: a node deleted only after the
+// version is still visible; one deleted at or before it is not.
+bool Graph::GetNodeAtVersion(NodeId id, uint64_t snapshotVersion, Node& out) const {
+    auto it = mvccNodes_.find(id);
+    if (it == mvccNodes_.end())
+        return false;                                  // absent or reclaimed
+    const NodeVersion& nv = it->second;
+    const bool createdInView = nv.createdAtVersion <= snapshotVersion;
+    const bool notYetDeleted = (nv.deletedAtVersion == 0) ||
+        (nv.deletedAtVersion > snapshotVersion);
+    if (!(createdInView && notYetDeleted))
+        return false;                                  // not visible at this version
+    out = nv.node;
+    return true;
 }
 
 // Collect edges visible to the snapshot at `snapshotVersion` under the same

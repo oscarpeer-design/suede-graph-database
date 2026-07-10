@@ -371,6 +371,17 @@ public:
     // the version and not deleted at or before it. Used by SELECT ... SNAPSHOT.
     void GetNodesAtVersion(std::vector<Node>& out, uint64_t snapshotVersion) const;
 
+    // Fetch a single node's payload as it was at `snapshotVersion`, by id. This is
+    // the point-in-time counterpart to GetNode (which reads the live map and so is
+    // blind to tombstones): it resolves against the retained MVCC history using the
+    // same visibility rule as GetNodesAtVersion. Returns true and fills `out` when
+    // the node is visible at that version (including a node deleted only *after* the
+    // version); returns false when the node did not exist at the version, was
+    // already deleted by it, or its history has been reclaimed. O(1) hash lookup --
+    // used by SELECT ... SNAPSHOT to fetch only the ids the CSR snapshot names,
+    // rather than materialising the whole visible set.
+    bool GetNodeAtVersion(NodeId id, uint64_t snapshotVersion, Node& out) const;
+
     // Collect every edge visible to the snapshot taken at `snapshotVersion`.
     void GetEdgesAtVersion(std::vector<Edge>& out, uint64_t snapshotVersion) const;
 };

@@ -9,6 +9,7 @@
 #include "Graph.h"
 #include "CSR_Representation.h"
 #include "StorageEngine.h"
+#include "Query.h"
 
 class GraphHandler {
 public:
@@ -43,5 +44,17 @@ private:
     std::unordered_map<uint64_t, std::unique_ptr<CSR_Representation>> snapshots_;
     uint64_t nextSnapshotId_ = 1;
 
+    // mutex for read and write operations
     mutable std::shared_mutex mutex_;
+
+    // check if operation is read only
+    bool isReadOnly(QueryOperation operation) {
+        // only allow SELECT and MATCH
+        return operation == QueryOperation::Unknown || operation == QueryOperation::Match;
+    }
+
+    // returns bad result if parsing fails
+    QueryResult badParsingResult(Query query) {
+        return { false, "Parse error: " + query.lastError() };
+    }
 };

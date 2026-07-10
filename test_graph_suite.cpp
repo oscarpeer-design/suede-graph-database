@@ -1297,6 +1297,59 @@ static int test_select_snapshot() {
             r.success && r.nodes.size() == 2);
     }
 
+    // -----------------------------------------------------------------------
+    // CSR-driven membership: node SELECT ... SNAPSHOT takes *which* nodes are
+    // visible from the CSR snapshot's captured id set, and reads the payload
+    // (label/properties) from the graph's MVCC history at the snapshot version.
+    // These checks distinguish the CSR-membership design from a plain
+    // version-only scan: two snapshots captured at different times must each
+    // report their own frozen node set from the same live graph.
+    // -----------------------------------------------------------------------
+    std::cout << "\n== Execute: SELECT ... SNAPSHOT membership driven by the CSR snapshot ==\n";
+    {
+        Graph graph;
+        graph.CreateNode("Person", { {"name", "A1"} });
+        graph.CreateNode("Person", { {"name", "A2"} });
+
+        // First snapshot: sees 2 nodes.
+        CSR_Representation snapEarly(graph);
+        snapEarly.Load_CSR();
+        check("early snapshot CSR size == 2", snapEarly.Size() == 2);
+
+        // Grow the live graph, then take a second snapshot: sees 4 nodes.
+        graph.CreateNode("Person", { {"name", "A3"} });
+        graph.CreateNode("Person", { {"name", "A4"} });
+        CSR_Representation snapLate(graph);
+        snapLate.Load_CSR();
+        check("late snapshot CSR size == 4", snapLate.Size() == 4);
+
+        Query q;
+        QueryResult r;
+
+        // The SAME query against two different snapshots must yield each
+        // snapshot's own frozen membership -- 2 for early, 4 for late.
+        q.parse("SELECT * FROM NODES WHERE LABEL = 'Person' SNAPSHOT");
+        r = q.execute(graph, snapEarly);
+        check("early snapshot select: 2 rows (its captured set)",
+            r.success && r.nodes.size() == 2);
+
+        q.parse("SELECT * FROM NODES WHERE LABEL = 'Person' SNAPSHOT");
+        r = q.execute(graph, snapLate);
+        check("late snapshot select: 4 rows (its captured set)",
+            r.success && r.nodes.size() == 4);
+
+        // Payloads are still resolved: the property read from MVCC history is
+        // present for a node in the early snapshot's membership.
+        q.parse("SELECT * FROM NODES SNAPSHOT");
+        r = q.execute(graph, snapEarly);
+        bool payloadOk = (r.nodes.size() == 2);
+        for (const Node& n : r.nodes) {
+            if (n.label != "Person" || n.properties.find("name") == n.properties.end())
+                payloadOk = false;
+        }
+        check("early snapshot payloads resolved (label + name present)", payloadOk);
+    }
+
     std::cout << "\n" << pass << " passed, " << fail << " failed (cumulative).\n";
     return fail == 0 ? 0 : 1;
 }
@@ -1312,7 +1365,7 @@ static int test_update_load_save() {
         Graph graph;
         graph.CreateNode("Person", { {"name", "Alice"}, {"age", "25"} });
         graph.CreateNode("Person", { {"name", "Bob"},   {"age", "25"} });
-        graph.CreateNode("City",   { {"name", "Sydney"} });
+        graph.CreateNode("City", { {"name", "Sydney"} });
 
         Query q;
         QueryResult r = q.run("UPDATE NODES WHERE age = 25 SET age = 26", graph);
@@ -1321,26 +1374,26 @@ static int test_update_load_save() {
 
         QueryResult v = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND age = 26", graph);
         check("UPDATE NODES by property: 2 rows now match new value",
-              v.success && v.nodes.size() == 2);
+            v.success && v.nodes.size() == 2);
         QueryResult old = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND age = 25", graph);
         check("UPDATE NODES by property: 0 rows at old value",
-              old.success && old.nodes.empty());
+            old.success && old.nodes.empty());
 
         QueryResult city = q.run("SELECT * FROM NODES WHERE LABEL = 'City'", graph);
         check("UPDATE NODES by property: non-matching row untouched",
-              city.success && city.nodes.size() == 1 &&
-              city.nodes[0].properties.find("age") == city.nodes[0].properties.end());
+            city.success && city.nodes.size() == 1 &&
+            city.nodes[0].properties.find("age") == city.nodes[0].properties.end());
     }
 
     // -- UPDATE NODES by id ----------------------------------------------------
     {
         Graph graph;
         NodeId alice = graph.CreateNode("Person", { {"name", "Alice"}, {"status", "active"} });
-        NodeId bob   = graph.CreateNode("Person", { {"name", "Bob"},   {"status", "active"} });
+        NodeId bob = graph.CreateNode("Person", { {"name", "Bob"},   {"status", "active"} });
 
         Query q;
         QueryResult r = q.run("UPDATE NODES WHERE ID = " + std::to_string(alice.value()) +
-                              " SET status = inactive", graph);
+            " SET status = inactive", graph);
         check("UPDATE NODES by id: success", r.success);
         check("UPDATE NODES by id: 1 updated", r.message == "Updated 1 node(s).");
 
@@ -1356,11 +1409,11 @@ static int test_update_load_save() {
         NodeId n = graph.CreateNode("Person", { {"name", "Alice"} });
         Query q;
         QueryResult r = q.run("UPDATE NODES WHERE ID = " + std::to_string(n.value()) +
-                              " SET nickname = Al", graph);
+            " SET nickname = Al", graph);
         check("UPDATE NODES new key: success", r.success);
         Node got; graph.GetNode(n, got);
         check("UPDATE NODES new key: key added",
-              got.properties.count("nickname") == 1 && got.properties.at("nickname") == "Al");
+            got.properties.count("nickname") == 1 && got.properties.at("nickname") == "Al");
         check("UPDATE NODES new key: existing key preserved", got.properties.at("name") == "Alice");
     }
 
@@ -1369,7 +1422,7 @@ static int test_update_load_save() {
         Graph graph;
         NodeId n1 = graph.CreateNode("Person", {});
         NodeId n2 = graph.CreateNode("Person", {});
-        NodeId n3 = graph.CreateNode("City",   {});
+        NodeId n3 = graph.CreateNode("City", {});
         int w = operationSuccessful;
         graph.CreateEdge(n1, n2, "KNOWS", w);
         graph.CreateEdge(n2, n3, "KNOWS", w);
@@ -1383,7 +1436,7 @@ static int test_update_load_save() {
         std::vector<Edge> befriends;
         graph.FindEdgesByLabel(befriends, "BEFRIENDS", w2);
         check("UPDATE EDGES label: new label indexed",
-              w2 == operationSuccessful && befriends.size() == 2);
+            w2 == operationSuccessful && befriends.size() == 2);
 
         int w3 = operationSuccessful;
         std::vector<Edge> knows;
@@ -1403,7 +1456,7 @@ static int test_update_load_save() {
         QueryResult r = q.run("UPDATE EDGES WHERE LABEL = 'KNOWS' SET weight = 5", graph);
         check("UPDATE EDGES bad column: rejected", !r.success);
         check("UPDATE EDGES bad column: message mentions label",
-              r.message.find("label") != std::string::npos);
+            r.message.find("label") != std::string::npos);
     }
 
     // -- UPDATE parse errors ---------------------------------------------------
@@ -1421,7 +1474,7 @@ static int test_update_load_save() {
 
         Query q4;
         check("UPDATE SNAPSHOT: parse fails",
-              !q4.parse("UPDATE NODES WHERE ID = 1 SET age = 30 SNAPSHOT"));
+            !q4.parse("UPDATE NODES WHERE ID = 1 SET age = 30 SNAPSHOT"));
         check("UPDATE SNAPSHOT: SNAPSHOT mentioned", q4.lastError().find("SNAPSHOT") != std::string::npos);
     }
 
@@ -1442,7 +1495,7 @@ static int test_update_load_save() {
 
         Query q4;
         check("LOAD path matches SAVE path", q4.parse("LOAD FILE 'graph.db'") &&
-              q4.filePath() == "graph.db");
+            q4.filePath() == "graph.db");
     }
 
     // -- SAVE then LOAD round-trip through StorageEngine using parsed paths -----
@@ -1450,17 +1503,17 @@ static int test_update_load_save() {
         const std::string path = "test_update_roundtrip.db";
         Graph original;
         original.CreateNode("Person", { {"name", "Alice"} });
-        original.CreateNode("City",   { {"name", "Sydney"} });
+        original.CreateNode("City", { {"name", "Sydney"} });
 
         Query saveQ;
         check("round-trip: SAVE parses",
-              saveQ.parse("SAVE FILE '" + path + "'") && saveQ.operation() == QueryOperation::Save);
+            saveQ.parse("SAVE FILE '" + path + "'") && saveQ.operation() == QueryOperation::Save);
         StorageEngine saveEngine(saveQ.filePath());
         check("round-trip: StorageEngine.Save succeeds", saveEngine.Save(original));
 
         Query loadQ;
         check("round-trip: LOAD parses",
-              loadQ.parse("LOAD FILE '" + path + "'") && loadQ.operation() == QueryOperation::Load);
+            loadQ.parse("LOAD FILE '" + path + "'") && loadQ.operation() == QueryOperation::Load);
         Graph restored;
         StorageEngine loadEngine(loadQ.filePath());
         check("round-trip: StorageEngine.Load succeeds", loadEngine.Load(restored));

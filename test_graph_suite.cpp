@@ -4,11 +4,18 @@
 #include "Query.h"
 #include "StorageEngine.h"
 #include "CSR_Representation.h"
+#include "GraphHandler.h"
 #include <iostream>
 #include <cassert>
 #include <fstream>
 #include <sstream>
 #include <cstdio>
+#include <thread>
+#include <vector>
+#include <chrono>
+#include <atomic>
+#include <mutex>
+#include <algorithm>
 
 // Test suite covering: GetEdges (via FindEdgesByNodeId / FindEdgesByNodeAndLabel),
 // and GetNeighbours (via GetNeighboursById) across every direction, for nodes
@@ -1736,6 +1743,211 @@ int test_storage_engine() {
     return fail == 0 ? 0 : 1;
 }
 
+// ============================================================================
+// test_graph_handler_concurrent
+// ============================================================================
+// Tests GraphHandler's thread-safety guarantees with concurrent readers and
+// writers. Verifies:
+//   1. Multiple threads can execute SELECT queries concurrently (shared_lock)
+//   2. INSERT operations serialize correctly under the exclusive lock
+//   3. Snapshots are created/released safely without data races
+//   4. Snapshot isolation: a snapshot's frozen membership is unaffected by
+//      later live mutations (SELECT ... SNAPSHOT resolves against MVCC history)
+//
+// Query grammar used here matches the parser: a live SELECT requires a WHERE
+// clause (WHERE ID/LABEL), a snapshot SELECT may be an unfiltered full scan via
+// the trailing SNAPSHOT keyword, and INSERT NODES must supply a label column.
+// ============================================================================
+
+int test_graph_handler_concurrent() {
+    std::cout << "\n== GraphHandler Concurrent Access ==\n";
+
+    int pass_count = 0, fail_count = 0;
+
+    auto check = [&](const std::string& name, bool condition) {
+        std::cout << (condition ? "  [PASS] " : "  [FAIL] ") << name << "\n";
+        if (condition) ++pass_count; else ++fail_count;
+        };
+
+    // Setup: create a graph with initial data (3 Person nodes, 2 KNOWS edges)
+    auto graph = std::make_unique<Graph>();
+    NodeId alice = graph->CreateNode("Person", { {"name", "Alice"}, {"age", "30"} });
+    NodeId bob = graph->CreateNode("Person", { {"name", "Bob"},   {"age", "25"} });
+    NodeId carol = graph->CreateNode("Person", { {"name", "Carol"}, {"age", "28"} });
+
+    int warning = operationSuccessful;
+    graph->CreateEdge(alice, bob, "KNOWS", warning);
+    graph->CreateEdge(bob, carol, "KNOWS", warning);
+
+    // Create GraphHandler that owns the graph
+    auto handler = std::make_unique<GraphHandler>(std::move(graph));
+
+    // ------------------------------------------------------------------------
+    // Test 1: many concurrent readers (shared_lock lets them all proceed)
+    // ------------------------------------------------------------------------
+    std::cout << "\n--- Test 1: Concurrent SELECT queries ---\n";
+    {
+        const int kReaders = 8;
+        std::vector<std::thread> threads;
+        std::atomic<int> select_success_count(0);
+
+        for (int i = 0; i < kReaders; ++i) {
+            threads.emplace_back([&]() {
+                // Live SELECT requires a WHERE clause; label filter returns all 3 Persons.
+                QueryResult result =
+                    handler->executeQueryLive("SELECT * FROM NODES WHERE LABEL = 'Person'");
+                if (result.success && result.nodes.size() == 3) {
+                    select_success_count++;
+                }
+                });
+        }
+
+        for (auto& t : threads) t.join();
+
+        check("8 concurrent SELECT queries all succeeded",
+            select_success_count == kReaders);
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 2: a writer under the exclusive lock mutates the graph correctly
+    // ------------------------------------------------------------------------
+    std::cout << "\n--- Test 2: Exclusive-lock write ---\n";
+    {
+        QueryResult ins = handler->executeQueryLive(
+            "INSERT INTO NODES (label, name) VALUES ('Person', 'Dave')");
+        check("INSERT succeeded", ins.success);
+        check("Node count is 4 after INSERT", handler->getNodeCount() == 4);
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 3: snapshot isolation -- a snapshot's membership is frozen
+    // ------------------------------------------------------------------------
+    std::cout << "\n--- Test 3: Snapshot isolation ---\n";
+    {
+        // Snapshot the current state (4 Person nodes).
+        uint64_t snapshot_id = handler->createSnapshot();
+        check("Snapshot created (id > 0)", snapshot_id > 0);
+        check("Active snapshot count = 1", handler->activeSnapshotCount() == 1);
+
+        // Mutate the live graph after the snapshot was taken.
+        QueryResult ins = handler->executeQueryLive(
+            "INSERT INTO NODES (label, name) VALUES ('Person', 'Eve')");
+        check("INSERT into live view succeeded", ins.success);
+        check("Live view now has 5 nodes", handler->getNodeCount() == 5);
+
+        // Snapshot SELECT is an unfiltered full scan via the SNAPSHOT keyword.
+        // It must still see the frozen 4-node membership, not the live 5.
+        QueryResult snap =
+            handler->executeQuerySnapshot(snapshot_id, "SELECT * FROM NODES SNAPSHOT");
+        check("Snapshot SELECT succeeded", snap.success);
+        check("Snapshot still sees 4 nodes (frozen)", snap.nodes.size() == 4);
+
+        handler->releaseSnapshot(snapshot_id);
+        check("Snapshot released, active count = 0",
+            handler->activeSnapshotCount() == 0);
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 4: concurrent snapshot creation is race-free
+    // ------------------------------------------------------------------------
+    std::cout << "\n--- Test 4: Concurrent snapshot creation ---\n";
+    {
+        const int kSnaps = 4;
+        std::vector<std::thread> threads;
+        std::vector<uint64_t> snapshot_ids;
+        std::mutex snap_mutex;
+
+        for (int i = 0; i < kSnaps; ++i) {
+            threads.emplace_back([&]() {
+                uint64_t id = handler->createSnapshot();
+                std::lock_guard<std::mutex> lock(snap_mutex);
+                snapshot_ids.push_back(id);
+                });
+        }
+
+        for (auto& t : threads) t.join();
+
+        check("4 snapshots created concurrently", snapshot_ids.size() == kSnaps);
+        check("Active snapshot count = 4", handler->activeSnapshotCount() == kSnaps);
+
+        // Every id must be unique (no two threads got the same snapshot id).
+        std::sort(snapshot_ids.begin(), snapshot_ids.end());
+        bool unique = std::adjacent_find(snapshot_ids.begin(),
+            snapshot_ids.end()) == snapshot_ids.end();
+        check("All snapshot ids are unique", unique);
+
+        for (uint64_t id : snapshot_ids) handler->releaseSnapshot(id);
+        check("All snapshots released, count = 0",
+            handler->activeSnapshotCount() == 0);
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 5: concurrent read-only getters (all take the shared lock)
+    // ------------------------------------------------------------------------
+    std::cout << "\n--- Test 5: Concurrent property getters ---\n";
+    {
+        const int kThreads = 8;
+        std::vector<std::thread> threads;
+        std::atomic<int> getter_success(0);
+
+        for (int i = 0; i < kThreads; ++i) {
+            threads.emplace_back([&]() {
+                size_t nodes = handler->getNodeCount();
+                size_t edges = handler->getEdgeCount();
+                uint64_t version = handler->getGraphVersion();
+                if (nodes == 5 && edges == 2 && version > 0) {
+                    getter_success++;
+                }
+                });
+        }
+
+        for (auto& t : threads) t.join();
+
+        check("8 concurrent getters saw a consistent snapshot",
+            getter_success == kThreads);
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 6: mixed readers and writers under contention
+    // ------------------------------------------------------------------------
+    std::cout << "\n--- Test 6: Mixed concurrent operations ---\n";
+    {
+        const int kReaders = 10, kWriters = 3;
+        std::vector<std::thread> threads;
+        std::atomic<int> reader_count(0), writer_count(0);
+
+        for (int i = 0; i < kReaders; ++i) {
+            threads.emplace_back([&]() {
+                QueryResult r =
+                    handler->executeQueryLive("SELECT * FROM NODES WHERE LABEL = 'Person'");
+                if (r.success) reader_count++;
+                });
+        }
+
+        for (int i = 0; i < kWriters; ++i) {
+            threads.emplace_back([&, i]() {
+                QueryResult r = handler->executeQueryLive(
+                    std::string("INSERT INTO NODES (label, name) VALUES ('Person', 'W")
+                    + std::to_string(i) + "')");
+                if (r.success) writer_count++;
+                });
+        }
+
+        for (auto& t : threads) t.join();
+
+        check("All 10 readers succeeded", reader_count == kReaders);
+        check("All 3 writers succeeded", writer_count == kWriters);
+        // Started this test with 5 nodes, added 3 writers => 8.
+        check("Node count is 8 after 3 concurrent inserts",
+            handler->getNodeCount() == 8);
+    }
+
+    std::cout << "\n== GraphHandler Concurrent Results ==\n";
+    std::cout << "Pass: " << pass_count << ", Fail: " << fail_count << "\n";
+
+    return fail_count;
+}
+
 int run_tests() {
     // test graph suite
     int fail = test_graph();
@@ -1749,6 +1961,11 @@ int run_tests() {
 
     // test storage
     fail = test_storage_engine();
+    if (fail != 0)
+        return fail;
+
+    // test graph handler concurrent access
+    fail = test_graph_handler_concurrent();
     if (fail != 0)
         return fail;
 

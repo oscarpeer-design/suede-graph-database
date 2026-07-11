@@ -129,9 +129,24 @@ public:
 	// Size of CSR Graph
 	size_t Size() const;
 
-	const std::vector<size_t>& GetRowOffsets() const;
+	// Getter for the csrToNode mapping
+	const std::vector<NodeId>& GetCSRNodeMapping() const { return csrToNode; }
 
-	const std::vector<size_t>& GetColumns() const;
+	// Getter for row offsets
+	const std::vector<size_t>& GetRowOffsets() const { return row_offsets; }
 
-	const std::vector<NodeId>& GetCSRNodeMapping() const;
+	// Getter for columns
+	const std::vector<size_t>& GetColumns() const { return columns; }
+
+	// Setter for snapshot version
+	void SetSnapshotVersion(uint64_t version) { snapshotVersion_ = version; }
+
+	// Setter for csrToNode mapping
+	void SetCSRNodeMapping(std::vector<NodeId> mapping) { csrToNode = std::move(mapping); }
+
+	// Setter for row offsets
+	void SetRowOffsets(std::vector<size_t> offsets) { row_offsets = std::move(offsets); }
+
+	// Setter for columns
+	void SetColumns(std::vector<size_t> cols) { columns = std::move(cols); }
 };

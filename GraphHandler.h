@@ -31,11 +31,28 @@ public:
     size_t activeSnapshotCount() const;
 
     // Persistence operations
-    void persistSnapshot(uint64_t snapshotId, const std::string& filename);
-    void loadSnapshot(const std::string& filename);
+    bool persistSnapshot(uint64_t snapshotId, const std::string& filename);
+    bool loadSnapshot(const std::string& filename);
 
     // Manual flush to storage
-    void flush();
+    bool flush();
+
+    // Load live graph
+    bool loadLive();
+
+    // Graph information / introspection
+    size_t getNodeCount() const;
+    size_t getEdgeCount() const;
+
+    // Direct graph access (read-only)
+    bool getNode(NodeId id, Node& out) const;
+    bool getEdge(EdgeId id, Edge& out) const;
+
+    // Storage status
+    bool hasStorage() const;
+
+    // Get graph version (useful for snapshot tracking)
+    uint64_t getGraphVersion() const;
 
 private:
     std::unique_ptr<Graph> graph_;
@@ -48,13 +65,13 @@ private:
     mutable std::shared_mutex mutex_;
 
     // check if operation is read only
-    bool isReadOnly(QueryOperation operation) {
+    bool isReadOnly(QueryOperation operation) const {
         // only allow SELECT and MATCH
-        return operation == QueryOperation::Unknown || operation == QueryOperation::Match;
+        return operation == QueryOperation::Select || operation == QueryOperation::Match;
     }
 
     // returns bad result if parsing fails
-    QueryResult badParsingResult(Query query) {
+    QueryResult badParsingResult(const Query& query) const {
         return { false, "Parse error: " + query.lastError() };
     }
 };

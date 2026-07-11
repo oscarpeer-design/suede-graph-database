@@ -8,6 +8,7 @@
 #include "ErrorCodes.h"
 #include "Types.h"
 #include "Graph.h"
+#include "CSR_Representation.h"
 
 // constant expressions for File header and version
 static constexpr char FILE_MAGIC[8] = "GRAPHDB";
@@ -577,16 +578,24 @@ class StorageEngine {
 		// constructor
 		StorageEngine(std::string path);
 
-		// storage methods
-
+		// load graph
 		bool Load(Graph& graph);
 
+		// save graph to binary
 		bool Save(const Graph& graph);
 
+		// convert CSV to Graph
 		bool ImportCSV(Graph& graph, const std::string& csvFilePath);
 
+		// export CSV to Graph
 		bool ExportCSV(const Graph& graph, const std::string& csvFilePath);
 
 		// validation that the produced graph matches the stored graph
 		bool ValidateGraph(const Graph& graph);
+
+		// Save a CSR snapshot to disk
+		bool SaveSnapshot(const CSR_Representation& snapshot, const std::string& snapshotFilePath);
+
+		// Load a CSR snapshot from disk
+		bool LoadSnapshot(CSR_Representation& snapshot, const std::string& snapshotFilePath);
 };

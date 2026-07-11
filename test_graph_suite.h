@@ -12,4 +12,9 @@ int test_query_layer();
 // round-trips, ValidateGraph integrity checks, and CSV import/export.
 int test_storage_engine();
 
+// Exercises GraphHandler concurrent access: multiple threads executing queries,
+// creating/releasing snapshots, and persisting. Verifies thread-safety with
+// shared_mutex, snapshot isolation, and consistent concurrent reads.
+int test_graph_handler_concurrent();
+
 int run_tests();

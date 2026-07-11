@@ -76,21 +76,3 @@ size_t CSR_Representation::Size() const
 {
 	return csrToNode.size();
 }
-
-// Get Row Offsets
-const std::vector<size_t>& CSR_Representation::GetRowOffsets() const
-{
-	return row_offsets;
-}
-
-// Get Columns
-const std::vector<size_t>& CSR_Representation::GetColumns() const
-{
-	return columns;
-}
-
-// Get Node Mapping
-const std::vector<NodeId>& CSR_Representation::GetCSRNodeMapping() const
-{
-	return csrToNode;
-}

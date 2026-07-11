@@ -122,3 +122,180 @@ bool StorageEngine::ExportCSV(const Graph& graph, const std::string& csvFilePath
 
     return true;
 }
+
+// SaveSnapshot
+// Serializes a CSR_Representation to disk in binary format.
+// Format:
+//   [snapshotVersion:uint64_t]
+//   [nodeCount:uint64_t]
+//   [csrToNode:NodeId[nodeCount]]
+//   [rowOffsetsSize:uint64_t]
+//   [rowOffsets:size_t[rowOffsetsSize]]
+//   [columnsSize:uint64_t]
+//   [columns:size_t[columnsSize]]
+bool StorageEngine::SaveSnapshot(const CSR_Representation& snapshot, const std::string& snapshotFilePath)
+{
+    // open snapshot file for writing
+    std::fstream snapshotFile;
+    snapshotFile.open(snapshotFilePath, std::ios::binary | std::ios::out | std::ios::trunc);
+    if (!snapshotFile.is_open())
+        return false;
+
+    // write snapshot version
+    uint64_t version = snapshot.GetSnapshotVersion();
+    snapshotFile.write(reinterpret_cast<const char*>(&version), sizeof(uint64_t));
+
+    // get the node mapping (CSR ID -> NodeId)
+    const std::vector<NodeId>& csrToNode = snapshot.GetCSRNodeMapping();
+
+    // write node count
+    uint64_t nodeCount = csrToNode.size();
+    snapshotFile.write(reinterpret_cast<const char*>(&nodeCount), sizeof(uint64_t));
+
+    // write node IDs (directly as NodeId, respecting type constraints)
+    for (const NodeId& nodeId : csrToNode)
+    {
+        snapshotFile.write(reinterpret_cast<const char*>(&nodeId), sizeof(NodeId));
+    }
+
+    // get row offsets
+    const std::vector<size_t>& rowOffsets = snapshot.GetRowOffsets();
+
+    // write row offsets size
+    uint64_t rowOffsetsSize = rowOffsets.size();
+    snapshotFile.write(reinterpret_cast<const char*>(&rowOffsetsSize), sizeof(uint64_t));
+
+    // write row offsets
+    for (size_t offset : rowOffsets)
+    {
+        snapshotFile.write(reinterpret_cast<const char*>(&offset), sizeof(size_t));
+    }
+
+    // get columns (adjacency list)
+    const std::vector<size_t>& columns = snapshot.GetColumns();
+
+    // write columns size
+    uint64_t columnsSize = columns.size();
+    snapshotFile.write(reinterpret_cast<const char*>(&columnsSize), sizeof(uint64_t));
+
+    // write columns
+    for (size_t col : columns)
+    {
+        snapshotFile.write(reinterpret_cast<const char*>(&col), sizeof(size_t));
+    }
+
+    // check if write succeeded
+    bool success = snapshotFile.good();
+
+    // close file
+    snapshotFile.close();
+
+    return success;
+}
+
+// LoadSnapshot
+// Deserializes a CSR_Representation from disk. Note: the snapshot object
+// is NOT connected to a graph (owner_ stays null). This is a frozen view
+// for read-only access. To use it for queries, the caller must integrate
+// it with a live Graph.
+bool StorageEngine::LoadSnapshot(CSR_Representation& snapshot, const std::string& snapshotFilePath)
+{
+    // open snapshot file for reading
+    std::fstream snapshotFile;
+    snapshotFile.open(snapshotFilePath, std::ios::binary | std::ios::in);
+
+    if (!snapshotFile.is_open())
+        return false;
+
+    // read snapshot version
+    uint64_t version;
+    snapshotFile.read(reinterpret_cast<char*>(&version), sizeof(uint64_t));
+    if (!snapshotFile.good())
+    {
+        snapshotFile.close();
+        return false;
+    }
+
+    // read node count
+    uint64_t nodeCount;
+    snapshotFile.read(reinterpret_cast<char*>(&nodeCount), sizeof(uint64_t));
+    if (!snapshotFile.good())
+    {
+        snapshotFile.close();
+        return false;
+    }
+
+    // read node IDs into csrToNode
+    std::vector<NodeId> csrToNode;
+    csrToNode.reserve(nodeCount);
+    for (uint64_t i = 0; i < nodeCount; ++i)
+    {
+        NodeId nodeId;
+        snapshotFile.read(reinterpret_cast<char*>(&nodeId), sizeof(NodeId));
+        if (!snapshotFile.good())
+        {
+            snapshotFile.close();
+            return false;
+        }
+        csrToNode.push_back(nodeId);
+    }
+
+    // read row offsets size
+    uint64_t rowOffsetsSize;
+    snapshotFile.read(reinterpret_cast<char*>(&rowOffsetsSize), sizeof(uint64_t));
+    if (!snapshotFile.good())
+    {
+        snapshotFile.close();
+        return false;
+    }
+
+    // read row offsets
+    std::vector<size_t> rowOffsets;
+    rowOffsets.reserve(rowOffsetsSize);
+    for (uint64_t i = 0; i < rowOffsetsSize; ++i)
+    {
+        size_t offset;
+        snapshotFile.read(reinterpret_cast<char*>(&offset), sizeof(size_t));
+        if (!snapshotFile.good())
+        {
+            snapshotFile.close();
+            return false;
+        }
+        rowOffsets.push_back(offset);
+    }
+
+    // read columns size
+    uint64_t columnsSize;
+    snapshotFile.read(reinterpret_cast<char*>(&columnsSize), sizeof(uint64_t));
+    if (!snapshotFile.good())
+    {
+        snapshotFile.close();
+        return false;
+    }
+
+    // read columns
+    std::vector<size_t> columns;
+    columns.reserve(columnsSize);
+    for (uint64_t i = 0; i < columnsSize; ++i)
+    {
+        size_t col;
+        snapshotFile.read(reinterpret_cast<char*>(&col), sizeof(size_t));
+        if (!snapshotFile.good())
+        {
+            snapshotFile.close();
+            return false;
+        }
+        columns.push_back(col);
+    }
+
+    // close file
+    snapshotFile.close();
+
+    // Reconstruct snapshot using setters
+    snapshot.SetSnapshotVersion(version);
+    snapshot.SetCSRNodeMapping(std::move(csrToNode));
+    snapshot.SetRowOffsets(std::move(rowOffsets));
+    snapshot.SetColumns(std::move(columns));
+
+    return true;
+}

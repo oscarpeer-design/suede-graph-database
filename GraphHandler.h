@@ -11,6 +11,53 @@
 #include "StorageEngine.h"
 #include "Query.h"
 
+// commandType 
+// This is separate from query type because queries handle execution and this matches parsing strategy
+enum class CommandType {
+    SNAPSHOT_CREATE,
+    SNAPSHOT_RELEASE,
+    FLUSH,
+    LOAD,
+    NODE_COUNT,
+    EDGE_COUNT,
+    QUERY,
+    UNKNOWN
+};
+
+// Compares the beginning of str against prefix, ignoring case.
+// Returns true if str starts with prefix (case-insensitive).
+static bool startsWithNoCase(const std::string& str, const std::string& prefix) {
+    // check tring length discrepancies
+    if (str.size() < prefix.size())
+        return false;
+    // check if each character is equal or not
+    // do this in a case-insensitive manner
+    for (size_t i = 0; i < prefix.size(); ++i) {
+        if (std::tolower(str[i]) != std::tolower(prefix[i]))
+            return false;
+    }
+    return true;
+}
+
+// Parse command string into CommandType
+static CommandType parseCommandType(const std::string& command) {
+    if (startsWithNoCase(command, "SNAPSHOT CREATE"))
+        return CommandType::SNAPSHOT_CREATE;
+    if (startsWithNoCase(command, "SNAPSHOT RELEASE"))
+        return CommandType::SNAPSHOT_RELEASE;
+    if (startsWithNoCase(command, "FLUSH"))
+        return CommandType::FLUSH;
+    if (startsWithNoCase(command, "LOAD"))
+        return CommandType::LOAD;
+    if (startsWithNoCase(command, "NODE COUNT"))
+        return CommandType::NODE_COUNT;
+    if (startsWithNoCase(command, "EDGE COUNT"))
+        return CommandType::EDGE_COUNT;
+
+    // If it's not a special command, treat it as a query
+    return CommandType::QUERY;
+}
+
 class GraphHandler {
 public:
     // Constructor: provide both graph and storage engine
@@ -53,6 +100,9 @@ public:
 
     // Get graph version (useful for snapshot tracking)
     uint64_t getGraphVersion() const;
+
+    // Execute any command: queries, snapshots, persistence
+    QueryResult executeCommand(const std::string& commandStr);
 
 private:
     std::unique_ptr<Graph> graph_;

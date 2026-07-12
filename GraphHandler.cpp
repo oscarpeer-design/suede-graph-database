@@ -204,3 +204,66 @@ uint64_t GraphHandler::getGraphVersion() const {
     // return graph version
     return graph_->GetVersion();
 }
+
+// executeCommand
+// this is the interface for all users
+QueryResult GraphHandler::executeCommand(const std::string& commandStr) {
+    std::string command = commandStr;
+
+    // trim leading whitespace
+    size_t start = command.find_first_not_of(" \t");
+    if (start != std::string::npos)
+        command = command.substr(start);
+    // get command type
+    CommandType type = parseCommandType(command);
+    // check each type and execute query based on said type
+    switch (type) {
+    // create snapshot
+    case CommandType::SNAPSHOT_CREATE: {
+        uint64_t id = createSnapshot();
+        // return snapshot result
+        return { true, "Snapshot created with ID: " + std::to_string(id) };
+    }
+    // release snapshot from memory
+    case CommandType::SNAPSHOT_RELEASE: {
+        size_t idStart = command.find_last_of(" ") + 1;
+        uint64_t id = std::stoull(command.substr(idStart));
+        releaseSnapshot(id);
+        // return snapshot release result
+        return { true, "Snapshot " + std::to_string(id) + " released" };
+    }
+    // flush raw graph to storage
+    case CommandType::FLUSH: {
+        bool success = flush();
+        // return graph flush result
+        return { success, success ? "Graph flushed to storage" : "Flush failed" };
+    }
+    // load live graph
+    case CommandType::LOAD: {
+        bool success = loadLive();
+        // return graph loading result
+        return { success, success ? "Graph loaded from storage" : "Load failed" };
+    }
+    // get node count
+    case CommandType::NODE_COUNT: {
+        size_t count = getNodeCount();
+        // return node count
+        return { true, "Node count: " + std::to_string(count) };
+    }
+    // get edge count
+    case CommandType::EDGE_COUNT: {
+        size_t count = getEdgeCount();
+        // return edge count
+        return { true, "Edge count: " + std::to_string(count) };
+    }
+    // query operation (includes SELECT, SNAPSHOT, LIVE, MATCH, ect)
+    case CommandType::QUERY: {
+        // execute live query
+        return executeQueryLive(command);
+    }
+    default:
+        // unknown command error
+        return { false, "Unknown command" };
+    }
+}
+

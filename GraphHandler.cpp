@@ -152,6 +152,29 @@ bool GraphHandler::loadLive() {
     return storage_->Load(*graph_);
 }
 
+// flush Graph to an explicit runtime-chosen path
+bool GraphHandler::flush(const std::string& path) {
+    // Acquire EXCLUSIVE lock (Save reads the entire graph, must be consistent)
+    std::lock_guard<std::shared_mutex> lock(mutex_);
+    // Create a StorageEngine on demand if this session had no persistence, so the
+    // user can save to a brand-new file they just picked.
+    if (!storage_)
+        storage_ = std::make_unique<StorageEngine>(path);
+    // Save the live graph to the explicit path (retargets the engine's file).
+    return storage_->Save(*graph_, path);
+}
+
+// load live Graph from an explicit runtime-chosen path
+bool GraphHandler::loadLive(const std::string& path) {
+    // Acquire exclusive lock
+    std::lock_guard<std::shared_mutex> lock(mutex_);
+    // Create a StorageEngine on demand if this session had no persistence.
+    if (!storage_)
+        storage_ = std::make_unique<StorageEngine>(path);
+    // Load the live graph from the explicit path (retargets the engine's file).
+    return storage_->Load(*graph_, path);
+}
+
 /**********************************
 Getter Methods Wrapped around Graph
 ***********************************/
@@ -218,13 +241,13 @@ QueryResult GraphHandler::executeCommand(const std::string& commandStr) {
     CommandType type = parseCommandType(command);
     // check each type and execute query based on said type
     switch (type) {
-    // create snapshot
+        // create snapshot
     case CommandType::SNAPSHOT_CREATE: {
         uint64_t id = createSnapshot();
         // return snapshot result
         return { true, "Snapshot created with ID: " + std::to_string(id) };
     }
-    // release snapshot from memory
+                                     // release snapshot from memory
     case CommandType::SNAPSHOT_RELEASE: {
         size_t idStart = command.find_last_of(" ") + 1;
         uint64_t id = std::stoull(command.substr(idStart));
@@ -232,31 +255,31 @@ QueryResult GraphHandler::executeCommand(const std::string& commandStr) {
         // return snapshot release result
         return { true, "Snapshot " + std::to_string(id) + " released" };
     }
-    // flush raw graph to storage
+                                      // flush raw graph to storage
     case CommandType::FLUSH: {
         bool success = flush();
         // return graph flush result
         return { success, success ? "Graph flushed to storage" : "Flush failed" };
     }
-    // load live graph
+                           // load live graph
     case CommandType::LOAD: {
         bool success = loadLive();
         // return graph loading result
         return { success, success ? "Graph loaded from storage" : "Load failed" };
     }
-    // get node count
+                          // get node count
     case CommandType::NODE_COUNT: {
         size_t count = getNodeCount();
         // return node count
         return { true, "Node count: " + std::to_string(count) };
     }
-    // get edge count
+                                // get edge count
     case CommandType::EDGE_COUNT: {
         size_t count = getEdgeCount();
         // return edge count
         return { true, "Edge count: " + std::to_string(count) };
     }
-    // query operation (includes SELECT, SNAPSHOT, LIVE, MATCH, ect)
+                                // query operation (includes SELECT, SNAPSHOT, LIVE, MATCH, ect)
     case CommandType::QUERY: {
         // execute live query
         return executeQueryLive(command);
@@ -266,4 +289,3 @@ QueryResult GraphHandler::executeCommand(const std::string& commandStr) {
         return { false, "Unknown command" };
     }
 }
-

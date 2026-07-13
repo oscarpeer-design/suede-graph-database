@@ -2,6 +2,9 @@
 
 // Included libraries
 #include <iostream>
+#include <fstream>
+#include <memory>
+#include <string>
 
 // Included header files
 #include "Types.h"
@@ -12,37 +15,12 @@
 #include "CSR_Searcher.h"
 #include "Query.h"
 #include "GraphHandler.h"
+#include "FileHandling.h"
+#include "InteractiveApp.h"   // runInteractive() — the entire GUI behind one call
 
 // test file
 #include "test_graph_suite.h"
 
-// check correct file extension 
-static bool endsWithExtension(const std::string& path, const std::string& ext) {
-    // determine if the file ends with a .txt
-    return path.size() >= ext.size() &&
-        path.compare(path.size() - ext.size(), ext.size(), ext) == 0;
-}
-
-// Initialize storage engine based on user input
-// Returns a unique_ptr to StorageEngine, or nullptr if user chooses no persistence
-// or provides an invalid file path
-static std::unique_ptr<StorageEngine> initializeStorage() {
-    // get name of <graph>.bin file from user
-    std::string graphFile;
-    std::cout << "Enter the path of the graph file for persistence (leave blank for no persistence): ";
-    std::getline(std::cin, graphFile);
-    // if empty, no persistence
-    if (graphFile.empty()) {
-        return nullptr;
-    }
-    // check for .bin extension
-    if (!endsWithExtension(graphFile, ".bin")) {
-        std::cerr << "Error: graph file must have .bin extension. Got '" << graphFile << "'\n";
-        return nullptr;
-    }
-    // create and return storage engine
-    return std::make_unique<StorageEngine>(graphFile);
-}
 
 // openAndRunCommandsFile
 static int openAndRunCommandsFile(const std::string& commandsFilePath) {
@@ -65,20 +43,29 @@ static int openAndRunCommandsFile(const std::string& commandsFilePath) {
         return 1;
     }
 
+    // Ask about persistence up front, before we start streaming results, so the
+    // storage prompt doesn't appear in the middle of batch execution.
+    auto storage = initializeStorage();
+
     // build the handler once, reuse across all lines
     auto graph = std::make_unique<Graph>();
-    auto storage = initializeStorage();
     GraphHandler handler(std::move(graph), std::move(storage));
+
     // read and interpret each line
     std::string line;
-    size_t lineNo = 1;
+    size_t lineNo = 0;
     bool errorFound = false; // halt execution on first error
     while (std::getline(in, line) && !errorFound) {
+        // count this physical line first, so blank/comment lines don't throw
+        // off the numbering used in "[lineNo] ERROR" reporting.
+        ++lineNo;
+
         // skip blank lines and comments
-        if (line.empty()) 
+        if (line.empty())
             continue;
-        if (line[0] == '#') 
+        if (line[0] == '#')
             continue;
+
         // parse and run
         QueryResult result = handler.executeCommand(line);
         if (!result.success) {
@@ -93,15 +80,19 @@ static int openAndRunCommandsFile(const std::string& commandsFilePath) {
             out << "[" << lineNo << "] " << line << " -> " << result.message << "\n";
             out.flush();
         }
-        // increment line number
-        lineNo ++;
     }
 
     return 0;
 }
 
+// testing purposes
+//int main() {
+//    int iErr = run_tests();
+//    return iErr;
+//}
+
 int main(int argc, char* argv[]) {
-    // check we habe two arguments
+    // check we have two arguments
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <batch|interactive>\n";
         return 1;
@@ -120,7 +111,9 @@ int main(int argc, char* argv[]) {
             return iErr;
     }
     else if (mode == "interactive") {
-        // launch UI
+        // launch the desktop UI — the entire GUI (storage prompt, handler,
+        // window, event loop) lives behind this one call.
+        return runInteractive(argc, argv);
     }
     // Unknown
     else {
@@ -130,3 +123,4 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
+

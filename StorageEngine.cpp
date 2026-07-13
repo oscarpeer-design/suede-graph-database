@@ -1,7 +1,7 @@
 #include "StorageEngine.h"
 
 // constructor
-StorageEngine::StorageEngine(std::string path): graphFilePath(path) {}
+StorageEngine::StorageEngine(std::string path) : graphFilePath(path) {}
 
 // ValidateGraph
 // verifies that the reconstructed graph matches the file header
@@ -79,6 +79,22 @@ bool StorageEngine::Save(const Graph& graph)
     CloseOutputFile();
 
     return true;
+}
+
+// Load the live graph from an explicit runtime-chosen path.
+// Retarget graphFilePath (all the private Open/Read helpers read this member),
+// then delegate to the existing Load. The path persists as the current file.
+bool StorageEngine::Load(Graph& graph, const std::string& path)
+{
+    graphFilePath = path;
+    return Load(graph);
+}
+
+// Save the live graph to an explicit runtime-chosen path (same approach).
+bool StorageEngine::Save(const Graph& graph, const std::string& path)
+{
+    graphFilePath = path;
+    return Save(graph);
 }
 
 // Import CSV

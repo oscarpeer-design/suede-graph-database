@@ -81,11 +81,19 @@ public:
     bool persistSnapshot(uint64_t snapshotId, const std::string& filename);
     bool loadSnapshot(const std::string& filename);
 
-    // Manual flush to storage
+    // Manual flush to storage (to the path the StorageEngine was built with)
     bool flush();
 
-    // Load live graph
+    // Load live graph (from the path the StorageEngine was built with)
     bool loadLive();
+
+    // Flush / load the live graph to an EXPLICIT path chosen at runtime (e.g. a
+    // file the interactive user picked from a dialog). If no StorageEngine exists
+    // yet (an in-memory session with no persistence chosen up front), one is
+    // created on demand targeting this path -- so the interactive user can save a
+    // graph to a brand-new file without having answered a storage prompt.
+    bool flush(const std::string& path);
+    bool loadLive(const std::string& path);
 
     // Graph information / introspection
     size_t getNodeCount() const;

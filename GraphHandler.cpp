@@ -39,6 +39,21 @@ QueryResult GraphHandler::executeQueryLive(const std::string& queryStr) {
     if (!query.parse(queryStr)) {
         return badParsingResult(query);
     }
+
+    // IMPORT CSV / EXPORT CSV are storage operations the Query layer parses but
+    // cannot execute (it owns no StorageEngine). This coordinator does: route
+    // them to importCSV/exportCSV, which own the CSV I/O. These take their own
+    // exclusive lock, so we must NOT hold a lock here when calling them
+    // (std::shared_mutex is non-recursive).
+    const QueryOperation op = query.operation();
+    if (op == QueryOperation::Import || op == QueryOperation::Export) {
+        const std::string& path = query.filePath();
+        const bool isImport = (op == QueryOperation::Import);
+        const bool ok = isImport ? importCSV(path) : exportCSV(path);
+        const std::string verb = isImport ? "IMPORT" : "EXPORT";
+        return { ok, verb + " CSV " + (ok ? "succeeded: " : "failed: ") + path };
+    }
+
     // check read-only
     if (isReadOnly(query.operation())) {
         // Shared lock for reads (SELECT, MATCH)
@@ -193,6 +208,30 @@ bool GraphHandler::loadLive(const std::string& path) {
         storage_ = std::make_unique<StorageEngine>(path);
     // Load the live graph from the explicit path (retargets the engine's file).
     return storage_->Load(*graph_, path);
+}
+
+// importCSV: read a CSV file into the live graph (IMPORT CSV '<path>').
+bool GraphHandler::importCSV(const std::string& path) {
+    // Acquire EXCLUSIVE lock: ImportCSV mutates the graph (creates nodes/edges).
+    std::lock_guard<std::shared_mutex> lock(mutex_);
+    // Create a StorageEngine on demand if this session had no persistence, so
+    // CSV import works without a storage choice up front.
+    if (!storage_)
+        storage_ = std::make_unique<StorageEngine>(path);
+    // Delegate to the engine's existing CSV importer.
+    return storage_->ImportCSV(*graph_, path);
+}
+
+// exportCSV: write the live graph to a CSV file (EXPORT CSV '<path>').
+bool GraphHandler::exportCSV(const std::string& path) {
+    // Acquire EXCLUSIVE lock so the export sees a consistent whole-graph view
+    // (ExportCSV reads every node and edge).
+    std::lock_guard<std::shared_mutex> lock(mutex_);
+    // Create a StorageEngine on demand if this session had no persistence.
+    if (!storage_)
+        storage_ = std::make_unique<StorageEngine>(path);
+    // Delegate to the engine's existing CSV exporter.
+    return storage_->ExportCSV(*graph_, path);
 }
 
 /**********************************

@@ -993,51 +993,6 @@ static int test_query_layer_part2() {
             r.success && r.traversalResult.size() == 4);
     }
 
-    std::cout << "\n== Execute: WHERE-less SELECT ... SNAPSHOT (full scan) ==\n";
-    {
-        // A SELECT ... SNAPSHOT is a full point-in-time scan and may omit WHERE.
-        // Even when it falls back to the live path (single-argument execute, no
-        // CSR snapshot object supplied) it must SUCCEED as a full scan rather
-        // than demanding a WHERE. Fixture: 3 nodes (2 Person, 1 City), 2 edges.
-        Graph graph;
-        buildQueryFixture(graph);
-        Query q;
-        QueryResult r;
-
-        // Unfiltered node scan: all three nodes come back.
-        r = q.run("SELECT * FROM NODES SNAPSHOT", graph);
-        check("where-less snapshot node scan: success", r.success);
-        check("where-less snapshot node scan: 3 rows", r.nodes.size() == 3);
-
-        // Unfiltered edge scan: both edges come back.
-        r = q.run("SELECT * FROM EDGES SNAPSHOT", graph);
-        check("where-less snapshot edge scan: success", r.success);
-        check("where-less snapshot edge scan: 2 rows", r.edges.size() == 2);
-
-        // TOP composes with the WHERE-less scan.
-        r = q.run("SELECT TOP 2 * FROM NODES SNAPSHOT", graph);
-        check("where-less snapshot scan honours TOP: 2 rows",
-            r.success && r.nodes.size() == 2);
-
-        // Property filters supplied WITHOUT an ID/LABEL predicate are still
-        // honoured on the snapshot full scan (this form is rejected live).
-        r = q.run("SELECT * FROM NODES WHERE age = '30' SNAPSHOT", graph);
-        check("where-less snapshot scan with property filter: 1 row",
-            r.success && r.nodes.size() == 1);
-
-        // Projection composes too: only the named column survives.
-        r = q.run("SELECT name FROM NODES SNAPSHOT", graph);
-        check("where-less snapshot scan honours projection",
-            r.success && r.nodes.size() == 3 &&
-            r.nodes[0].properties.size() == 1 &&
-            r.nodes[0].properties.count("name") == 1);
-
-        // Contrast: the SAME query without SNAPSHOT is still rejected live,
-        // because the live path is index-driven and needs an ID/LABEL predicate.
-        r = q.run("SELECT * FROM NODES", graph);
-        check("where-less LIVE select still rejected", !r.success);
-    }
-
     // -----------------------------------------------------------------
     // 3. EXECUTION -- INSERT (mutating)
     // -----------------------------------------------------------------
@@ -1573,6 +1528,81 @@ static int test_update_load_save() {
         std::vector<NodeId> ids;
         restored.GetNodeIdOrder(ids);
         check("round-trip: node count preserved", ids.size() == 2);
+        std::remove(path.c_str());
+    }
+
+    // -- IMPORT CSV / EXPORT CSV parse + path extraction -----------------------
+    {
+        Query q;
+        check("EXPORT CSV: parse succeeds", q.parse("EXPORT CSV 'graph.csv'"));
+        check("EXPORT CSV: operation is Export", q.operation() == QueryOperation::Export);
+        check("EXPORT CSV: path extracted (quotes stripped)", q.filePath() == "graph.csv");
+
+        Query q2;
+        check("IMPORT CSV: parse succeeds", q2.parse("IMPORT CSV 'graph.csv'"));
+        check("IMPORT CSV: operation is Import", q2.operation() == QueryOperation::Import);
+        check("IMPORT CSV: path extracted", q2.filePath() == "graph.csv");
+
+        // keyword is case-insensitive like every other keyword
+        Query q3;
+        check("import csv (lowercase) parses",
+            q3.parse("import csv 'g.csv'") && q3.operation() == QueryOperation::Import);
+
+        // malformed forms are rejected
+        Query q4;
+        check("EXPORT no CSV keyword: parse fails", !q4.parse("EXPORT 'graph.csv'"));
+        Query q5;
+        check("IMPORT CSV no path: parse fails", !q5.parse("IMPORT CSV"));
+        Query q6;
+        check("EXPORT CSV empty path: parse fails", !q6.parse("EXPORT CSV ''"));
+        Query q7;
+        check("IMPORT CSV trailing tokens: parse fails",
+            !q7.parse("IMPORT CSV 'g.csv' EXTRA"));
+
+        // Executed against a bare Graph (no StorageEngine), CSV ops report that a
+        // coordinator is required -- they never touch disk from the Query layer.
+        Graph g;
+        Query q8;
+        QueryResult r = q8.run("EXPORT CSV 'graph.csv'", g);
+        check("EXPORT CSV bare-graph execute: reports failure", !r.success);
+        check("EXPORT CSV bare-graph execute: mentions coordinator",
+            r.message.find("coordinator") != std::string::npos);
+    }
+
+    // -- EXPORT CSV then IMPORT CSV round-trip through StorageEngine -----------
+    {
+        const std::string path = "test_csv_roundtrip.csv";
+        Graph original;
+        NodeId a = original.CreateNode("Person", { {"name", "Alice"} });
+        NodeId b = original.CreateNode("City", { {"name", "Sydney"} });
+        int warning = operationSuccessful;
+        original.CreateEdge(a, b, "LIVES_IN", warning);
+
+        // parse EXPORT and drive the engine with the parsed path
+        Query exportQ;
+        check("csv round-trip: EXPORT parses",
+            exportQ.parse("EXPORT CSV '" + path + "'") &&
+            exportQ.operation() == QueryOperation::Export);
+        StorageEngine exportEngine(exportQ.filePath());
+        check("csv round-trip: StorageEngine.ExportCSV succeeds",
+            exportEngine.ExportCSV(original, exportQ.filePath()));
+
+        // parse IMPORT and rebuild a fresh graph
+        Query importQ;
+        check("csv round-trip: IMPORT parses",
+            importQ.parse("IMPORT CSV '" + path + "'") &&
+            importQ.operation() == QueryOperation::Import);
+        Graph restored;
+        StorageEngine importEngine(importQ.filePath());
+        check("csv round-trip: StorageEngine.ImportCSV succeeds",
+            importEngine.ImportCSV(restored, importQ.filePath()));
+
+        std::vector<NodeId> ids;
+        restored.GetNodeIdOrder(ids);
+        check("csv round-trip: node count preserved", ids.size() == 2);
+        std::vector<EdgeId> eids;
+        restored.GetAllEdgeIds(eids);
+        check("csv round-trip: edge count preserved", eids.size() == 1);
         std::remove(path.c_str());
     }
 

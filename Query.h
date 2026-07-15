@@ -23,7 +23,9 @@ enum class QueryOperation {
     Match,
     Update,
     Load,
-    Save
+    Save,
+    Import,   // IMPORT CSV '<path>' -- parsed here, executed by a coordinator
+    Export    // EXPORT CSV '<path>' -- parsed here, executed by a coordinator
 };
 
 enum class QueryTarget {
@@ -137,6 +139,11 @@ private:
     bool parseUpdate(const std::vector<std::string>& tokens, size_t pos);
     bool parseLoad(const std::vector<std::string>& tokens, size_t pos);
     bool parseSave(const std::vector<std::string>& tokens, size_t pos);
+    // IMPORT CSV '<path>' / EXPORT CSV '<path>'. Like LOAD/SAVE these only parse
+    // the statement and record the path in filePath_; a coordinator that owns a
+    // StorageEngine performs the actual CSV read/write.
+    bool parseImport(const std::vector<std::string>& tokens, size_t pos);
+    bool parseExport(const std::vector<std::string>& tokens, size_t pos);
     bool parseWhereClause(const std::vector<std::string>& tokens, size_t pos);
 
     // Parse the SET key=value[, key=value ...] list of an UPDATE. Fills values_.

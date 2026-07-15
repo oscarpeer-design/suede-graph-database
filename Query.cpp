@@ -211,6 +211,14 @@ bool Query::parse() {
         operation_ = QueryOperation::Save;
         ok = parseSave(tokens, 1);
     }
+    else if (keyword == "IMPORT") {            // IMPORT CSV dispatch
+        operation_ = QueryOperation::Import;
+        ok = parseImport(tokens, 1);
+    }
+    else if (keyword == "EXPORT") {            // EXPORT CSV dispatch
+        operation_ = QueryOperation::Export;
+        ok = parseExport(tokens, 1);
+    }
     else {                                     // unknown top-level keyword
         setError("Unrecognized query keyword: " + tokens[0]); // error out with original token shown
         return false;
@@ -558,6 +566,17 @@ QueryResult Query::executeResolved(Graph& live, CSR_Representation* snapshot) co
         result.message = (operation_ == QueryOperation::Load)
             ? "LOAD must be executed by a coordinator that owns a StorageEngine."
             : "SAVE must be executed by a coordinator that owns a StorageEngine.";
+        return result;
+    case QueryOperation::Import:
+    case QueryOperation::Export:
+        // IMPORT CSV / EXPORT CSV are storage operations too, exactly like
+        // LOAD / SAVE: the Query layer parses them and records the path, but the
+        // StorageEngine (owned by a coordinator) does the CSV read/write. Bare
+        // execution against a Graph alone cannot reach storage.
+        result.success = false;
+        result.message = (operation_ == QueryOperation::Import)
+            ? "IMPORT CSV must be executed by a coordinator that owns a StorageEngine."
+            : "EXPORT CSV must be executed by a coordinator that owns a StorageEngine.";
         return result;
     case QueryOperation::Unknown:
     default:
@@ -1346,6 +1365,47 @@ bool Query::parseSave(const std::vector<std::string>& tokens, size_t pos) {
     ++pos;
     if (filePath_.empty()) { setError("SAVE FILE: file path cannot be empty."); return false; }
     if (pos != tokens.size()) { setError("SAVE FILE: unexpected trailing tokens."); return false; }
+    return true;
+}
+
+// parseImport: IMPORT CSV '<path>'
+// Mirrors parseLoad/parseSave: validates the CSV keyword and a quoted path, and
+// records the path in filePath_. Execution (the actual CSV read) is done by a
+// coordinator that owns a StorageEngine -- the Query layer never touches disk.
+bool Query::parseImport(const std::vector<std::string>& tokens, size_t pos) {
+    if (pos >= tokens.size() || toUpper(tokens[pos]) != "CSV") {
+        setError("IMPORT: expected CSV (syntax: IMPORT CSV '<path>')."); 
+        return false;
+    }
+    ++pos;
+    if (pos >= tokens.size()) { 
+        setError("IMPORT CSV: expected a file path."); 
+    return false; 
+    }
+    filePath_ = stripQuotes(tokens[pos]);
+    ++pos;
+    if (filePath_.empty()) { 
+        setError("IMPORT CSV: file path cannot be empty."); 
+        return false; 
+    }
+    if (pos != tokens.size()) { 
+        setError("IMPORT CSV: unexpected trailing tokens."); 
+        return false; 
+    }
+    return true;
+}
+
+// parseExport: EXPORT CSV '<path>'
+bool Query::parseExport(const std::vector<std::string>& tokens, size_t pos) {
+    if (pos >= tokens.size() || toUpper(tokens[pos]) != "CSV") {
+        setError("EXPORT: expected CSV (syntax: EXPORT CSV '<path>')."); return false;
+    }
+    ++pos;
+    if (pos >= tokens.size()) { setError("EXPORT CSV: expected a file path."); return false; }
+    filePath_ = stripQuotes(tokens[pos]);
+    ++pos;
+    if (filePath_.empty()) { setError("EXPORT CSV: file path cannot be empty."); return false; }
+    if (pos != tokens.size()) { setError("EXPORT CSV: unexpected trailing tokens."); return false; }
     return true;
 }
 

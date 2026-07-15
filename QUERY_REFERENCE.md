@@ -57,9 +57,10 @@ A statement flows through three stages:
 1. **Tokenize** — the raw string is split into tokens: identifiers/keywords,
    numbers, quoted strings (`'...'` or `"..."`), the punctuation `(`, `)`, `,`,
    and the comparison operators `=`, `!=`, `<`, `>`, `<=`, `>=`.
-2. **Parse** — the first keyword (`SELECT`, `INSERT`, `DELETE`, `MATCH`)
-   selects a clause parser, which validates the grammar and records the
-   operation, target, conditions, and values. Keywords are case-insensitive.
+2. **Parse** — the first keyword (`SELECT`, `INSERT`, `DELETE`, `MATCH`,
+   `UPDATE`, `LOAD`, `SAVE`, `IMPORT`, `EXPORT`) selects a clause parser, which
+   validates the grammar and records the operation, target, conditions, and
+   values. Keywords are case-insensitive.
 3. **Execute** — the parsed statement runs against a `Graph`, returning a
    `QueryResult`.
 
@@ -141,8 +142,10 @@ General rules that apply everywhere:
   relational-style live full-table scan. A **`SELECT ... SNAPSHOT`** may omit
   `WHERE` and scan the whole point-in-time set. See §2.1 and §2.5.
 
-The statements are `SELECT`, `INSERT`, `DELETE`, `MATCH`, `UPDATE`, `LOAD`, and
-`SAVE`.
+The statements are `SELECT`, `INSERT`, `DELETE`, `MATCH`, `UPDATE`, `LOAD`,
+`SAVE`, `IMPORT`, and `EXPORT`. `LOAD`/`SAVE` move the graph to and from the
+compact **binary** format; `IMPORT`/`EXPORT` do the same with the human-readable
+**CSV** format (see §2.9, §2.10, and §4).
 
 ---
 
@@ -632,6 +635,56 @@ expressed as ordinary statements.
 
 ---
 
+### 2.9 IMPORT
+
+Build the current graph from a human-readable **CSV** file.
+
+```
+IMPORT CSV '<path>'
+```
+
+```sql
+IMPORT CSV 'social.csv'
+IMPORT CSV 'data/people_2026.csv'
+```
+
+`IMPORT`/`EXPORT` are the CSV counterparts of the binary `LOAD`/`SAVE`. The
+distinct keyword pair keeps the two formats unambiguous at a glance: `LOAD FILE`
+/ `SAVE FILE` are binary `.bin`; `IMPORT CSV` / `EXPORT CSV` are CSV. Exactly like
+`LOAD`/`SAVE`, the `Query` layer only **parses** the statement and records the
+quoted path via `filePath()`; a coordinator that owns a `StorageEngine` performs
+the actual read (`StorageEngine::ImportCSV`). Executed against a bare `Graph`
+alone it reports that a coordinator is required.
+
+`IMPORT CSV` builds nodes and edges **into the current graph** (it does not clear
+first), so importing into an already-populated graph adds to it. To reconstruct a
+saved graph faithfully, import into a fresh, empty session. The CSV layout is
+given in §4.2.
+
+---
+
+### 2.10 EXPORT
+
+Write the current graph to a human-readable **CSV** file.
+
+```
+EXPORT CSV '<path>'
+```
+
+```sql
+EXPORT CSV 'social.csv'
+EXPORT CSV 'backups/graph_2026_07_09.csv'
+```
+
+The mirror of `IMPORT`. The quoted path is parsed and exposed via `filePath()`,
+and a coordinator that owns a `StorageEngine` performs the write
+(`StorageEngine::ExportCSV`). The output is two blocks — nodes, a blank-line
+separator, then edges — exactly the format `IMPORT CSV` reads back (§4.2), so an
+`EXPORT CSV` followed by an `IMPORT CSV` into a fresh session round-trips the
+graph.
+
+---
+
 ## 3. Error and status messages
 
 Two kinds of messages can come back: **parse errors** (the statement is
@@ -643,7 +696,7 @@ the executor reports the outcome). Below is the authoritative list.
 | Message | Triggered by |
 |---------|--------------|
 | `Empty query.` | Empty or whitespace-only input. |
-| `Unrecognized query keyword: <tok>` | First word isn't SELECT/INSERT/DELETE/MATCH/UPDATE/LOAD/SAVE. |
+| `Unrecognized query keyword: <tok>` | First word isn't SELECT/INSERT/DELETE/MATCH/UPDATE/LOAD/SAVE/IMPORT/EXPORT. |
 | `UPDATE: expected NODES or EDGES.` | `UPDATE` with a bad or missing target. |
 | `UPDATE: a WHERE clause is required.` | `UPDATE` with no `WHERE`. |
 | `UPDATE: a SET clause is required.` | `UPDATE` with no `SET`. |
@@ -651,6 +704,8 @@ the executor reports the outcome). Below is the authoritative list.
 | `SET: expected ',' between assignments.` | Two `SET` pairs with no comma. |
 | `LOAD: expected FILE ...` / `LOAD FILE: expected a file path.` | Malformed `LOAD`. |
 | `SAVE: expected FILE ...` / `SAVE FILE: expected a file path.` | Malformed `SAVE`. |
+| `IMPORT: expected CSV ...` / `IMPORT CSV: expected a file path.` / `IMPORT CSV: file path cannot be empty.` / `IMPORT CSV: unexpected trailing tokens.` | Malformed `IMPORT CSV`. |
+| `EXPORT: expected CSV ...` / `EXPORT CSV: expected a file path.` / `EXPORT CSV: file path cannot be empty.` / `EXPORT CSV: unexpected trailing tokens.` | Malformed `EXPORT CSV`. |
 | `SELECT: expected '*'.` | Missing projection after `SELECT`. |
 | `SELECT: expected '*' or a column list.` | No projection after `SELECT` (or after `TOP <n>`). |
 | `SELECT: expected a column name.` | Column list is empty or ends without a name. |
@@ -710,6 +765,8 @@ the executor reports the outcome). Below is the authoritative list.
 | `UPDATE EDGES: only the 'label' column can be updated.` | `SET` on an edge column other than `label`. | ❌ |
 | `LOAD must be executed by a coordinator that owns a StorageEngine.` | Bare `LOAD` executed against a `Graph` only. | ❌ |
 | `SAVE must be executed by a coordinator that owns a StorageEngine.` | Bare `SAVE` executed against a `Graph` only. | ❌ |
+| `IMPORT CSV must be executed by a coordinator that owns a StorageEngine.` | Bare `IMPORT CSV` executed against a `Graph` only. | ❌ |
+| `EXPORT CSV must be executed by a coordinator that owns a StorageEngine.` | Bare `EXPORT CSV` executed against a `Graph` only. | ❌ |
 | `Found <n> reachable node(s).` | `MATCH REACHABLE` result. | ✅ |
 | `Path found with <n> node(s).` | `MATCH SHORTEST_PATH` result. | ✅ |
 | `No path found between the given nodes.` | `SHORTEST_PATH` target unreachable. | ✅ |

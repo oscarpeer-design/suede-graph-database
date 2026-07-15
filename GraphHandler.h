@@ -95,6 +95,15 @@ public:
     bool flush(const std::string& path);
     bool loadLive(const std::string& path);
 
+    // CSV import / export. These bridge the parsed IMPORT CSV / EXPORT CSV
+    // statements to the StorageEngine's existing ImportCSV / ExportCSV. As with
+    // the inline-path flush/loadLive, a StorageEngine is created on demand if the
+    // session had none, so CSV works without a persistence choice up front. The
+    // engine's binary Load/Save machinery is untouched -- these call the separate
+    // CSV code paths only.
+    bool importCSV(const std::string& path);
+    bool exportCSV(const std::string& path);
+
     // Graph information / introspection
     size_t getNodeCount() const;
     size_t getEdgeCount() const;

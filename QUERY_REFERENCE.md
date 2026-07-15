@@ -136,6 +136,10 @@ General rules that apply everywhere:
 - `SELECT` and `MATCH` accept an optional leading **`TOP <n>`** that caps the
   number of rows returned. `SELECT` also accepts a **column projection** in place
   of `*`. See §2.1 and §2.4.
+- A **live** `SELECT` **requires** a `WHERE ID`/`LABEL` predicate — Suede is a
+  graph store optimised for indexed, traversal-style access, so there is no
+  relational-style live full-table scan. A **`SELECT ... SNAPSHOT`** may omit
+  `WHERE` and scan the whole point-in-time set. See §2.1 and §2.5.
 
 The statements are `SELECT`, `INSERT`, `DELETE`, `MATCH`, `UPDATE`, `LOAD`, and
 `SAVE`.
@@ -144,14 +148,45 @@ The statements are `SELECT`, `INSERT`, `DELETE`, `MATCH`, `UPDATE`, `LOAD`, and
 
 ### 2.1 SELECT
 
-Retrieve nodes or edges. A `WHERE` clause is **required**. The projection may be
+Retrieve nodes or edges. On the **live** graph a `WHERE` clause is **required**
+(see "Why live SELECT requires WHERE" below); a **`SELECT ... SNAPSHOT`** may
+omit it and scan the whole point-in-time set (see §2.5). The projection may be
 `*` (whole rows) or a comma-separated list of columns, and an optional leading
 `TOP <n>` caps the number of rows returned.
 
 ```
 SELECT [TOP <n>] <* | col1, col2, ...> FROM NODES WHERE <conditions>
 SELECT [TOP <n>] *                     FROM EDGES WHERE <conditions>
+
+SELECT [TOP <n>] <* | col1, col2, ...> FROM NODES [WHERE <conditions>] SNAPSHOT
+SELECT [TOP <n>] *                     FROM EDGES [WHERE <conditions>] SNAPSHOT
 ```
+
+#### Why live SELECT requires WHERE
+
+This is a deliberate design choice that reflects what Suede is: a **graph
+database**, not a relational one. A relational `SELECT * FROM table` with no
+predicate means "scan the whole table" — a sequential pass over every row. Suede
+is built around the opposite access pattern: you **enter the graph at a known
+point** (a node id or a label) and traverse relationships from there. The engine
+is optimised for exactly that — id and label are backed by hash indexes, and
+edges by adjacency lists — so a live read wants an `ID`/`LABEL` predicate to use
+as its entry key. There is intentionally **no** live full-table scan: a bare
+`SELECT * FROM NODES` is rejected with
+
+```
+SELECT: a WHERE clause is required (WHERE ID = ... or WHERE LABEL = ...).
+```
+
+and `SELECT * FROM EDGES` likewise. Requiring the predicate steers callers toward
+the indexed, traversal-oriented access the store is designed to serve, rather
+than bolting a relational-style scan onto the live graph.
+
+The one place an unfiltered scan **is** well-defined is a snapshot: a
+`CSR_Representation` has already materialised the whole point-in-time set as
+contiguous arrays, so `SELECT * FROM NODES SNAPSHOT` is a cheap, well-defined
+full scan. That is why the WHERE requirement is lifted for `SNAPSHOT` reads and
+nowhere else — it matches how the data is physically laid out. See §2.5.
 
 #### Projection (selective columns)
 
@@ -423,10 +458,22 @@ Rules and behaviour:
 - **A `SELECT ... SNAPSHOT` may omit `WHERE`.** Because a snapshot materializes
   the whole point-in-time set, an unfiltered `SELECT * FROM NODES SNAPSHOT` is a
   well-defined full scan. (The live `SELECT` still requires a `WHERE ID`/`LABEL`
-  predicate, since the live path is index-driven.) The same `WHERE` forms as the
-  live path are otherwise supported: `ID`/`LABEL` and property filters for nodes;
+  predicate, since the live path is index-driven — see §2.1 "Why live SELECT
+  requires WHERE".) The same `WHERE` forms as the live path are otherwise
+  supported: `ID`/`LABEL` and property filters for nodes;
   `ID`/`LABEL`/`FROM`(+`DIRECTION`)/`TO` for edges. Projection (`col1, col2`) and
   `TOP <n>` compose with `SNAPSHOT` exactly as they do live.
+
+  This full-scan behaviour holds **regardless of whether a CSR snapshot object is
+  supplied**. When executed with a snapshot (`execute(Graph&,
+  CSR_Representation&)`) the read resolves against MVCC history at the captured
+  version; when executed with no snapshot available (the single-argument
+  `execute(Graph&)`, e.g. the batch command route), a `SELECT ... SNAPSHOT`
+  gracefully **falls back to a live full scan** rather than demanding a `WHERE`.
+  Either way, an unfiltered `SELECT ... SNAPSHOT` succeeds — only *which* version
+  of the graph it observes differs. A property filter supplied without any
+  `ID`/`LABEL` predicate (e.g. `SELECT * FROM NODES WHERE age > '20' SNAPSHOT`) is
+  honoured on this scan, a form the live path rejects.
 - **A snapshot must actually exist.** The snapshot is supplied by the caller
   (`Query::execute(Graph& live, CSR_Representation& snapshot)`). If a `SNAPSHOT`
   query is executed with no snapshot available (the single-argument
@@ -671,8 +718,8 @@ the executor reports the outcome). Below is the authoritative list.
 | `No nodes found with that label.` | `SELECT NODES` label unknown. | ❌ |
 | `No edges found with that label.` | `SELECT EDGES` label unknown. | ❌ |
 | `No edges found for that node.` | Edge lookup for a node failed. | ❌ |
-| `SELECT FROM NODES requires WHERE ID = ... or WHERE LABEL = ....` | Unsupported node `WHERE`. | ❌ |
-| `SELECT FROM EDGES requires WHERE ID = ..., WHERE LABEL = ..., or WHERE FROM = ....` | Unsupported edge `WHERE`. | ❌ |
+| `SELECT FROM NODES requires WHERE ID = ... or WHERE LABEL = ....` | A live node `SELECT` with an unsupported / absent `WHERE`. Live reads are indexed graph access, not a relational table scan (§2.1); use `SNAPSHOT` for an unfiltered full scan. | ❌ |
+| `SELECT FROM EDGES requires WHERE ID = ..., WHERE LABEL = ..., or WHERE FROM = ....` | A live edge `SELECT` with an unsupported / absent `WHERE`. Same rationale as nodes; use `SNAPSHOT` for a full scan. | ❌ |
 | `Invalid DIRECTION (expected OUTGOING, INCOMING, or BOTH).` | Bad `DIRECTION` value. | ❌ |
 | `Invalid FROM node id.` / `Invalid TO node id.` | Non-numeric `FROM` / `TO`. | ❌ |
 | `INSERT INTO EDGES: 'from' and 'to' must be numeric node ids.` | Non-numeric endpoints. | ❌ |

@@ -43,21 +43,19 @@ static int openAndRunCommandsFile(const std::string& commandsFilePath) {
         return 1;
     }
 
-    // Ask about persistence up front, before we start streaming results, so the
-    // storage prompt doesn't appear in the middle of batch execution.
-    auto storage = initializeStorage();
-
-    // build the handler once, reuse across all lines
+    // Build the handler with NO storage engine. The batch session is purely
+    // in-memory: no persistence prompt, no .bin file, no StorageEngine required.
+    // Commands like FLUSH / LOAD that would need storage simply return their
+    // normal failure result and the batch keeps going.
     auto graph = std::make_unique<Graph>();
-    GraphHandler handler(std::move(graph), std::move(storage));
+    GraphHandler handler(std::move(graph), nullptr);
 
     // read and interpret each line
     std::string line;
     size_t lineNo = 0;
-    bool errorFound = false; // halt execution on first error
-    while (std::getline(in, line) && !errorFound) {
+    while (std::getline(in, line)) {
         // count this physical line first, so blank/comment lines don't throw
-        // off the numbering used in "[lineNo] ERROR" reporting.
+        // off the numbering used in "[lineNo]" reporting.
         ++lineNo;
 
         // skip blank lines and comments
@@ -66,22 +64,19 @@ static int openAndRunCommandsFile(const std::string& commandsFilePath) {
         if (line[0] == '#')
             continue;
 
-        // parse and run
+        // Parse and run. Every command executes; a failure does NOT halt the
+        // batch. Both successes and errors are written to the .results file.
         QueryResult result = handler.executeCommand(line);
         if (!result.success) {
-            // errors to console only (immediate feedback)
             std::cerr << "[" << lineNo << "] ERROR: " << result.message << "\n";
-            errorFound = true;
+            out << "[" << lineNo << "] " << line << " -> ERROR: " << result.message << "\n";
         }
         else {
-            // output results
-            std::cout << result.message;
-            // add results to file (permanent record)
+            std::cout << result.message << std::endl;
             out << "[" << lineNo << "] " << line << " -> " << result.message << "\n";
-            out.flush();
         }
+        out.flush();
     }
-
     return 0;
 }
 

@@ -623,6 +623,12 @@ void Query::projectNodes(std::vector<Node>& nodes) const {
 
 
 
+// Forward declarations for the WHERE-matching helpers used by the Snapshot-mode
+// full-scan fallback below. Their definitions live further down (they are also
+// used by UPDATE); declaring them here lets the SELECT executors reuse them.
+static bool nodeMatchesConditions(const Node& node, const std::vector<Condition>& conditions);
+static bool edgeMatchesConditions(const Edge& edge, const std::vector<Condition>& conditions);
+
 // Execute a SELECT query targeting nodes.
 QueryResult Query::executeSelectNodes(Graph& graph) const {
     QueryResult result;                           // prepare result container
@@ -691,7 +697,32 @@ QueryResult Query::executeSelectNodes(Graph& graph) const {
         }
     }
 
-    // If neither ID nor LABEL were provided, return an informative error.
+    // No ID/LABEL predicate. A SELECT ... SNAPSHOT is defined as a full
+    // point-in-time scan and may omit WHERE, so when this query is in Snapshot
+    // mode we materialize the whole set here (honouring any property conditions
+    // that WERE supplied) instead of demanding a WHERE. This mirrors the
+    // dedicated snapshot executor and is the path taken when a trailing SNAPSHOT
+    // read falls back to the live graph (no CSR snapshot object supplied).
+    if (executionMode_ == ExecutionMode::Snapshot) {
+        std::vector<NodeId> ids;
+        graph.GetNodeIdOrder(ids);                // deterministic insertion order
+        for (NodeId id : ids) {
+            Node node;
+            if (!graph.GetNode(id, node)) continue;
+            // Apply any conditions present (empty conditions_ => keep everything).
+            if (!nodeMatchesConditions(node, conditions_)) continue;
+            result.nodes.push_back(node);
+        }
+        result.success = true;
+        projectNodes(result.nodes);               // trim to selected columns (no-op for '*')
+        applyLimit(result.nodes);                 // apply TOP <n> row cap
+        result.message = (result.nodes.size() == 1)
+            ? "Found 1 row."
+            : "Found " + std::to_string(result.nodes.size()) + " row(s).";
+        return result;
+    }
+
+    // Live SELECT is index-driven and still requires an ID/LABEL predicate.
     result.success = false;
     result.message = "SELECT FROM NODES requires WHERE ID = ... or WHERE LABEL = ....";
     return result;
@@ -785,6 +816,28 @@ QueryResult Query::executeSelectEdges(Graph& graph) const {
         result.success = true;
         applyLimit(result.edges);                 // apply TOP <n> row cap
         result.message = "Found " + std::to_string(result.edges.size()) + " row(s).";
+        return result;
+    }
+
+    // No supported WHERE form present. As with nodes, a SELECT ... SNAPSHOT is a
+    // full point-in-time scan and may omit WHERE: in Snapshot mode we enumerate
+    // every edge here (honouring any ID/LABEL conditions supplied) rather than
+    // demanding a WHERE. This is the live-fallback path for a trailing SNAPSHOT
+    // read when no CSR snapshot object was supplied.
+    if (executionMode_ == ExecutionMode::Snapshot) {
+        std::vector<EdgeId> ids;
+        graph.GetAllEdgeIds(ids);
+        for (EdgeId id : ids) {
+            Edge edge;
+            if (!graph.GetEdge(id, edge)) continue;
+            if (!edgeMatchesConditions(edge, conditions_)) continue;
+            result.edges.push_back(edge);
+        }
+        result.success = true;
+        applyLimit(result.edges);                 // apply TOP <n> row cap
+        result.message = (result.edges.size() == 1)
+            ? "Found 1 row."
+            : "Found " + std::to_string(result.edges.size()) + " row(s).";
         return result;
     }
 

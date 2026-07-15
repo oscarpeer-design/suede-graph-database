@@ -993,6 +993,51 @@ static int test_query_layer_part2() {
             r.success && r.traversalResult.size() == 4);
     }
 
+    std::cout << "\n== Execute: WHERE-less SELECT ... SNAPSHOT (full scan) ==\n";
+    {
+        // A SELECT ... SNAPSHOT is a full point-in-time scan and may omit WHERE.
+        // Even when it falls back to the live path (single-argument execute, no
+        // CSR snapshot object supplied) it must SUCCEED as a full scan rather
+        // than demanding a WHERE. Fixture: 3 nodes (2 Person, 1 City), 2 edges.
+        Graph graph;
+        buildQueryFixture(graph);
+        Query q;
+        QueryResult r;
+
+        // Unfiltered node scan: all three nodes come back.
+        r = q.run("SELECT * FROM NODES SNAPSHOT", graph);
+        check("where-less snapshot node scan: success", r.success);
+        check("where-less snapshot node scan: 3 rows", r.nodes.size() == 3);
+
+        // Unfiltered edge scan: both edges come back.
+        r = q.run("SELECT * FROM EDGES SNAPSHOT", graph);
+        check("where-less snapshot edge scan: success", r.success);
+        check("where-less snapshot edge scan: 2 rows", r.edges.size() == 2);
+
+        // TOP composes with the WHERE-less scan.
+        r = q.run("SELECT TOP 2 * FROM NODES SNAPSHOT", graph);
+        check("where-less snapshot scan honours TOP: 2 rows",
+            r.success && r.nodes.size() == 2);
+
+        // Property filters supplied WITHOUT an ID/LABEL predicate are still
+        // honoured on the snapshot full scan (this form is rejected live).
+        r = q.run("SELECT * FROM NODES WHERE age = '30' SNAPSHOT", graph);
+        check("where-less snapshot scan with property filter: 1 row",
+            r.success && r.nodes.size() == 1);
+
+        // Projection composes too: only the named column survives.
+        r = q.run("SELECT name FROM NODES SNAPSHOT", graph);
+        check("where-less snapshot scan honours projection",
+            r.success && r.nodes.size() == 3 &&
+            r.nodes[0].properties.size() == 1 &&
+            r.nodes[0].properties.count("name") == 1);
+
+        // Contrast: the SAME query without SNAPSHOT is still rejected live,
+        // because the live path is index-driven and needs an ID/LABEL predicate.
+        r = q.run("SELECT * FROM NODES", graph);
+        check("where-less LIVE select still rejected", !r.success);
+    }
+
     // -----------------------------------------------------------------
     // 3. EXECUTION -- INSERT (mutating)
     // -----------------------------------------------------------------

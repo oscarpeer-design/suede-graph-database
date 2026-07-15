@@ -1,5 +1,25 @@
 #include "GraphHandler.h"
 
+// commandArgument
+// Returns the trimmed argument that follows a leading keyword in a command,
+// e.g. commandArgument("FLUSH  /tmp/g.bin", "FLUSH") -> "/tmp/g.bin".
+// If the keyword has no argument (bare "FLUSH"), returns "". This lets FLUSH /
+// LOAD carry an explicit path so persistence is driven by the command itself,
+// with no reliance on a pre-initialised storage engine.
+static std::string commandArgument(const std::string& command, const std::string& keyword) {
+    // argument begins right after the keyword
+    if (command.size() <= keyword.size())
+        return std::string();
+    std::string rest = command.substr(keyword.size());
+    // trim leading whitespace
+    size_t begin = rest.find_first_not_of(" \t");
+    if (begin == std::string::npos)
+        return std::string();
+    // trim trailing whitespace
+    size_t end = rest.find_last_not_of(" \t\r\n");
+    return rest.substr(begin, end - begin + 1);
+}
+
 // explicit constructor
 GraphHandler::GraphHandler(
     std::unique_ptr<Graph> graph,
@@ -257,15 +277,26 @@ QueryResult GraphHandler::executeCommand(const std::string& commandStr) {
     }
                                       // flush raw graph to storage
     case CommandType::FLUSH: {
-        bool success = flush();
+        // A path may be given inline: "FLUSH <path>". If so, save to that path
+        // (creating a StorageEngine on demand -- no pre-initialised engine
+        // needed). Bare "FLUSH" uses the engine's existing path, if any.
+        std::string path = commandArgument(command, "FLUSH");
+        bool success = path.empty() ? flush() : flush(path);
         // return graph flush result
-        return { success, success ? "Graph flushed to storage" : "Flush failed" };
+        return { success,
+                 success ? ("Graph flushed to storage" + (path.empty() ? std::string() : (": " + path)))
+                         : "Flush failed" };
     }
                            // load live graph
     case CommandType::LOAD: {
-        bool success = loadLive();
+        // Same as FLUSH: "LOAD <path>" loads from an explicit path (creating a
+        // StorageEngine on demand); bare "LOAD" uses the engine's existing path.
+        std::string path = commandArgument(command, "LOAD");
+        bool success = path.empty() ? loadLive() : loadLive(path);
         // return graph loading result
-        return { success, success ? "Graph loaded from storage" : "Load failed" };
+        return { success,
+                 success ? ("Graph loaded from storage" + (path.empty() ? std::string() : (": " + path)))
+                         : "Load failed" };
     }
                           // get node count
     case CommandType::NODE_COUNT: {

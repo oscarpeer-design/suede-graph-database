@@ -1,7 +1,7 @@
 #include "StorageEngine.h"
 
 // constructor
-StorageEngine::StorageEngine(std::string path) : graphFilePath(path) {}
+StorageEngine::StorageEngine(std::string path) : graphFilePath(path), nodeCount(0), edgeCount(0) {}
 
 // ValidateGraph
 // verifies that the reconstructed graph matches the file header
@@ -34,26 +34,21 @@ bool StorageEngine::Load(Graph& graph)
     if (!OpenInputFile())
         return false;
 
-    // verify file header
-    if (!ReadHeader())
-        return false;
+    // From here the file is OPEN: every exit path must close it. Previously only
+    // the success path called CloseInputFile(), so a failed load (e.g. a bad or
+    // wrong-format header) left the shared graphFile stream open with its error
+    // bits set -- and a subsequent Save could not re-open it, making the file
+    // permanently un-writable for the rest of the session. `ok` + a single close
+    // at the end guarantees the handle is always released.
+    bool ok = ReadHeader()      // verify file header
+        && ReadNodes(graph)     // reconstruct nodes
+        && ReadEdges(graph)     // reconstruct edges
+        && ValidateGraph(graph); // verify graph integrity
 
-    // reconstruct nodes
-    if (!ReadNodes(graph))
-        return false;
-
-    // reconstruct edges
-    if (!ReadEdges(graph))
-        return false;
-
-    // verify graph integrity
-    if (!ValidateGraph(graph))
-        return false;
-
-    // close file
+    // Always close, whether we succeeded or failed.
     CloseInputFile();
 
-    return true;
+    return ok;
 }
 
 // save Graph
@@ -63,22 +58,16 @@ bool StorageEngine::Save(const Graph& graph)
     if (!OpenOutputFile())
         return false;
 
-    // write file header
-    if (!WriteHeader(graph))
-        return false;
+    // As with Load: the file is open now, so close on EVERY exit path. A failed
+    // write otherwise leaked the handle and blocked all later saves/loads.
+    bool ok = WriteHeader(graph)  // write file header
+        && WriteNodes(graph)      // write every node
+        && WriteEdges(graph);     // write every edge
 
-    // write every node
-    if (!WriteNodes(graph))
-        return false;
-
-    // write every edge
-    if (!WriteEdges(graph))
-        return false;
-
-    // flush and close file
+    // Always flush and close, whether we succeeded or failed.
     CloseOutputFile();
 
-    return true;
+    return ok;
 }
 
 // Load the live graph from an explicit runtime-chosen path.

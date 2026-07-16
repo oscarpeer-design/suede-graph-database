@@ -1,4 +1,4 @@
-// InteractiveApp.cpp
+ï»¿// InteractiveApp.cpp
 //
 // Win32 RichEdit implementation of interactive mode. ALL platform GUI code is
 // contained in this one translation unit and exposed through the single
@@ -36,6 +36,15 @@
 #endif
 
 #include <windows.h>
+// Request RichEdit 4.1 symbols (MSFTEDIT_CLASS) BEFORE including richedit.h.
+// MSFTEDIT_CLASS ("RICHEDIT50W") is the window class registered by Msftedit.dll,
+// which is the DLL we LoadLibrary below. The older RICHEDIT_CLASSW
+// ("RichEdit20W") belongs to Riched20.dll, which we do NOT load -- creating a
+// control with that class after loading only Msftedit.dll yields a control that
+// never renders (the "blank editor" bug). This macro must precede <richedit.h>.
+#ifndef _RICHEDIT_VER
+#define _RICHEDIT_VER 0x0410
+#endif
 #include <richedit.h>
 #include <commdlg.h>          // GetOpenFileName / GetSaveFileName
 
@@ -45,6 +54,7 @@
 #include <vector>
 #include <cwctype>
 #include <utility>
+#include <cstring>            // std::memcmp for the graph-magic file check
 
 #include "Graph.h"
 #include "GraphHandler.h"
@@ -107,6 +117,32 @@ namespace {
         return w;
     }
 
+    // Normalize any mix of line endings (lone "\n" from Unix files, lone "\r",
+    // or already-correct "\r\n") to Windows "\r\n". The Win32 RichEdit control
+    // only breaks lines on "\r\n" when text is set via SetWindowTextW: a file
+    // saved with bare "\n" would otherwise collapse onto a single unreadable
+    // line. Call this on any text loaded from disk before showing it.
+    std::wstring normalizeNewlines(const std::wstring& in) {
+        std::wstring out;
+        out.reserve(in.size() + in.size() / 8 + 16);
+        for (size_t i = 0; i < in.size(); ++i) {
+            wchar_t c = in[i];
+            if (c == L'\r') {
+                // collapse "\r" or "\r\n" into a single "\r\n"
+                out += L"\r\n";
+                if (i + 1 < in.size() && in[i + 1] == L'\n')
+                    ++i;                          // skip the paired '\n'
+            }
+            else if (c == L'\n') {
+                out += L"\r\n";                   // lone '\n' -> "\r\n"
+            }
+            else {
+                out += c;
+            }
+        }
+        return out;
+    }
+
     std::wstring getCtrlTextW(HWND hwnd) {
         int len = GetWindowTextLengthW(hwnd);
         if (len <= 0) return {};
@@ -140,6 +176,15 @@ namespace {
     // HALT on the first error. Only the output sink differs (results console).
     void runCommands(InteractiveState* state) {
         SetWindowTextW(state->results, L"");
+
+        // Reset to a clean, empty graph before every Run. The interactive session
+        // otherwise holds ONE persistent graph, so pressing Run twice would
+        // execute the INSERTs twice and duplicate everything (2x, 3x, ... the
+        // rows). Rebuilding the handler here makes each Run reproducible: the
+        // buffer always executes against an empty graph, exactly like a fresh
+        // batch invocation. (Any snapshots from a prior Run are dropped too.)
+        state->handler = std::make_unique<GraphHandler>(
+            std::make_unique<Graph>(), nullptr);
 
         const std::wstring all = getCtrlTextW(state->commands);
         std::wstringstream ss(all);
@@ -217,6 +262,60 @@ namespace {
         SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
     }
 
+    // Core tokenizer/colourer. Scans `text` (the whole editor buffer) and applies
+    // colour ONLY to tokens that fall within [applyFrom, applyTo). Scanning the
+    // full buffer keeps token boundaries correct even when the range starts or
+    // ends mid-line; restricting where colour is *applied* is what makes a
+    // line-local recolour cheap. Colour is: keywords blue, numbers teal, quoted
+    // strings dark red, everything else default black.
+    //
+    // A token is applied if it overlaps the range at all, so a multi-line quoted
+    // string that reaches into the range still gets coloured. The caller has
+    // already reset [applyFrom, applyTo) to default, so untouched spans stay black.
+    void colourTokens(HWND edit, const std::wstring& text,
+        int applyFrom, int applyTo) {
+        const int n = (int)text.size();
+
+        // Helper: colour [s,e) only if it overlaps the apply window.
+        auto applyIfInRange = [&](int s, int e, COLORREF colour) {
+            if (e > applyFrom && s < applyTo)
+                colorRange(edit, s, e, colour);
+            };
+
+        int i = 0;
+        while (i < n) {
+            wchar_t c = text[i];
+
+            // quoted string '...'
+            if (c == L'\'') {
+                int start = i++;
+                while (i < n && text[i] != L'\'') ++i;
+                if (i < n) ++i;                  // include closing quote
+                applyIfInRange(start, i, RGB(163, 21, 21));
+                continue;
+            }
+            // identifier / keyword
+            if (isWordChar(c) && !iswdigit(c)) {
+                int start = i;
+                while (i < n && isWordChar(text[i])) ++i;
+                std::wstring word = text.substr(start, i - start);
+                if (isKeyword(word))
+                    applyIfInRange(start, i, RGB(0, 0, 200));
+                continue;
+            }
+            // number
+            if (iswdigit(c)) {
+                int start = i;
+                while (i < n && (iswdigit(text[i]) || text[i] == L'.')) ++i;
+                applyIfInRange(start, i, RGB(9, 134, 88));
+                continue;
+            }
+            ++i;
+        }
+    }
+
+    // Full-document highlight. Used once on load (open file / starter template),
+    // where a single O(document) pass is fine. NOT called on every keystroke.
     void highlightSyntax(InteractiveState* state) {
         if (state->highlighting) return;        // guard against EN_CHANGE recursion
         state->highlighting = true;
@@ -234,46 +333,56 @@ namespace {
         const std::wstring text = getCtrlTextW(edit);
         const int n = (int)text.size();
 
-        // Reset everything to the default colour first.
-        colorRange(edit, 0, n, RGB(0, 0, 0));
-
-        // Walk words; colour keywords blue, numbers teal, quoted strings dark red.
-        int i = 0;
-        while (i < n) {
-            wchar_t c = text[i];
-
-            // quoted string '...'
-            if (c == L'\'') {
-                int start = i++;
-                while (i < n && text[i] != L'\'') ++i;
-                if (i < n) ++i;                  // include closing quote
-                colorRange(edit, start, i, RGB(163, 21, 21));
-                continue;
-            }
-            // identifier / keyword
-            if (isWordChar(c) && !iswdigit(c)) {
-                int start = i;
-                while (i < n && isWordChar(text[i])) ++i;
-                std::wstring word = text.substr(start, i - start);
-                if (isKeyword(word))
-                    colorRange(edit, start, i, RGB(0, 0, 200));
-                continue;
-            }
-            // number
-            if (iswdigit(c)) {
-                int start = i;
-                while (i < n && (iswdigit(text[i]) || text[i] == L'.')) ++i;
-                colorRange(edit, start, i, RGB(9, 134, 88));
-                continue;
-            }
-            ++i;
-        }
+        colorRange(edit, 0, n, RGB(0, 0, 0));   // reset whole doc to default
+        colourTokens(edit, text, 0, n);         // colour every token
 
         // Restore caret/selection, notifications, and redraw.
         SendMessageW(edit, EM_SETSEL, (WPARAM)selStart, (LPARAM)selEnd);
         SendMessageW(edit, EM_SETEVENTMASK, 0, (LPARAM)savedMask);
         SendMessageW(edit, WM_SETREDRAW, TRUE, 0);
         InvalidateRect(edit, nullptr, TRUE);
+
+        state->highlighting = false;
+    }
+
+    // Line-local highlight. Recolours ONLY the line containing the caret, which
+    // is all a single-character edit can affect (for a one-statement-per-line
+    // command language). This is O(line) work plus a small repaint, so typing in
+    // a large file stays smooth. Called on EN_CHANGE instead of highlightSyntax.
+    //
+    // Caveat by design: a quoted string spanning multiple lines won't fully
+    // recolour until each affected line is touched -- acceptable here because
+    // Suede commands are single-line and string literals are short.
+    void highlightCaretLine(InteractiveState* state) {
+        if (state->highlighting) return;        // guard against EN_CHANGE recursion
+        state->highlighting = true;
+
+        HWND edit = state->commands;
+
+        DWORD selStart = 0, selEnd = 0;
+        SendMessageW(edit, EM_GETSEL, (WPARAM)&selStart, (LPARAM)&selEnd);
+
+        // Character range of the caret's line: [lineStart, lineStart + lineLen).
+        int line = (int)SendMessageW(edit, EM_LINEFROMCHAR, (WPARAM)selStart, 0);
+        int lineStart = (int)SendMessageW(edit, EM_LINEINDEX, (WPARAM)line, 0);
+        int lineLen = (int)SendMessageW(edit, EM_LINELENGTH, (WPARAM)lineStart, 0);
+        int lineEnd = lineStart + lineLen;
+
+        SendMessageW(edit, WM_SETREDRAW, FALSE, 0);
+        DWORD savedMask = (DWORD)SendMessageW(edit, EM_SETEVENTMASK, 0, 0);
+
+        const std::wstring text = getCtrlTextW(edit);
+
+        // Reset just this line to default, then colour tokens overlapping it.
+        colorRange(edit, lineStart, lineEnd, RGB(0, 0, 0));
+        colourTokens(edit, text, lineStart, lineEnd);
+
+        SendMessageW(edit, EM_SETSEL, (WPARAM)selStart, (LPARAM)selEnd);
+        SendMessageW(edit, EM_SETEVENTMASK, 0, (LPARAM)savedMask);
+        SendMessageW(edit, WM_SETREDRAW, TRUE, 0);
+        // Repaint only the editor (RichEdit invalidates the changed line region
+        // itself); no full-document InvalidateRect needed here.
+        InvalidateRect(edit, nullptr, FALSE);
 
         state->highlighting = false;
     }
@@ -301,24 +410,44 @@ namespace {
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(120, 120, 120));
 
-        // First visible character index, and total line count.
+        // Total logical lines, and the first line currently scrolled into view.
         int firstVisible = (int)SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0);
         int lineCount = (int)SendMessageW(edit, EM_GETLINECOUNT, 0, 0);
 
-        // Height of one line: measure the font.
+        // Font metrics for the row height used when drawing each number.
         TEXTMETRICW tm;
         GetTextMetricsW(dc, &tm);
         int lineH = tm.tmHeight + tm.tmExternalLeading;
         if (lineH <= 0) lineH = 14;
 
-        int y = 2;
+        // Ask the RICHEDIT for the actual pixel Y of each line, instead of
+        // guessing from a fixed start offset and an assumed line height. The old
+        // code started at y=2 and stepped by its own lineH, which did not match
+        // the editor's top inset or exact line spacing -- so the numbers drifted
+        // out of alignment (landing between two text rows), worse further down
+        // and while scrolling. EM_POSFROMCHAR gives the true position of a line's
+        // first character in the editor's client coordinates; since the gutter
+        // sits at the same vertical offset as the editor, that Y is exactly where
+        // the number belongs.
         for (int ln = firstVisible; ln < lineCount; ++ln) {
-            if (y > rc.bottom) break;
+            // First character index of this logical line.
+            int chIndex = (int)SendMessageW(edit, EM_LINEINDEX, (WPARAM)ln, 0);
+            if (chIndex < 0) break;
+
+            // Pixel position of that character within the editor's client area.
+            // RichEdit 4.1 returns the point packed in the result: x in the low
+            // word, y in the high word (signed).
+            POINTL pt = { 0, 0 };
+            SendMessageW(edit, EM_POSFROMCHAR, (WPARAM)&pt, (LPARAM)chIndex);
+            int y = pt.y;
+
+            if (y > rc.bottom) break;            // past the bottom of the view
+            if (y + lineH < 0) continue;         // above the top (shouldn't happen)
+
             std::wstring num = std::to_wstring(ln + 1);
             RECT lineRc = { rc.left, y, rc.right - 4, y + lineH };
             DrawTextW(dc, num.c_str(), (int)num.size(), &lineRc,
                 DT_RIGHT | DT_SINGLELINE | DT_TOP);
-            y += lineH;
         }
 
         SelectObject(dc, old);
@@ -364,11 +493,21 @@ namespace {
         DWORD size = GetFileSize(h, nullptr);
         std::string bytes(size, '\0');
         DWORD read = 0;
-        ReadFile(h, &bytes[0], size, &read, nullptr);
+        // Check the ReadFile result: on failure `read` stays 0 and we'd otherwise
+        // silently load an empty file. Report the error and bail instead.
+        BOOL readOk = ReadFile(h, &bytes[0], size, &read, nullptr);
         CloseHandle(h);
+        if (!readOk) {
+            MessageBoxW(hwnd, L"Could not read the file.", L"Open Commands",
+                MB_OK | MB_ICONERROR);
+            return;
+        }
         bytes.resize(read);
 
-        SetWindowTextW(state->commands, utf8ToWide(bytes).c_str());
+        // Normalize line endings so files saved with bare "\n" (e.g. produced on
+        // Unix) display as separate lines rather than collapsing onto one line.
+        SetWindowTextW(state->commands,
+            normalizeNewlines(utf8ToWide(bytes)).c_str());
         state->currentCmdFile = path;
         highlightSyntax(state);
         InvalidateRect(state->gutter, nullptr, TRUE);
@@ -393,9 +532,60 @@ namespace {
             return;
         }
         DWORD written = 0;
-        WriteFile(h, bytes.data(), (DWORD)bytes.size(), &written, nullptr);
+        // Check the WriteFile result so a failed save doesn't pass silently (and
+        // so we don't record currentCmdFile for a file we never wrote).
+        BOOL writeOk = WriteFile(h, bytes.data(), (DWORD)bytes.size(), &written, nullptr);
         CloseHandle(h);
+        if (!writeOk || written != (DWORD)bytes.size()) {
+            MessageBoxW(hwnd, L"Could not save the file.", L"Save Commands",
+                MB_OK | MB_ICONERROR);
+            return;
+        }
         state->currentCmdFile = path;
+    }
+
+    // --------- graph/snapshot file-kind guards (prevent format clobber) --------
+    //
+    // Graph binaries begin with the 8-byte magic "GRAPHDB" (see StorageEngine's
+    // FileHeader). Snapshot files do NOT -- they start with a raw uint64 version.
+    // These helpers peek the file so we can warn before a Save writes one format
+    // over a file that holds the other (the corruption that made graph.bin
+    // unusable: a snapshot written over a graph binary).
+
+    bool fileExistsNonEmpty(const std::wstring& path) {
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD size = GetFileSize(h, nullptr);
+        CloseHandle(h);
+        return size > 0;
+    }
+
+    // True if the file exists and starts with the graph magic "GRAPHDB".
+    bool fileLooksLikeGraph(const std::wstring& path) {
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        char magic[7] = { 0 };
+        DWORD read = 0;
+        BOOL ok = ReadFile(h, magic, 7, &read, nullptr);
+        CloseHandle(h);
+        if (!ok || read < 7) return false;
+        return std::memcmp(magic, "GRAPHDB", 7) == 0;
+    }
+
+    // Ask the user to confirm overwriting a file that holds the OTHER format.
+    // savingGraph = true  -> we're about to write a graph over a non-graph file.
+    // savingGraph = false -> we're about to write a snapshot over a graph file.
+    bool confirmOverwriteWrongKind(HWND hwnd, const std::wstring& path, bool savingGraph) {
+        std::wstring msg = savingGraph
+            ? L"This file does not look like a graph binary (it may be a snapshot).\n\n"
+            L"Overwrite it with a GRAPH binary anyway?\n\n" + path
+            : L"This file looks like a GRAPH binary, not a snapshot.\n\n"
+            L"Overwriting it with a snapshot will corrupt the graph. Continue?\n\n" + path;
+        int r = MessageBoxW(hwnd, msg.c_str(), L"Overwrite different file type?",
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+        return r == IDYES;
     }
 
     // Graph / snapshot persistence via dialogs -> handler methods. Reports the
@@ -404,6 +594,11 @@ namespace {
         std::wstring path = chooseFile(hwnd, L"Graph binary\0*.bin\0All files\0*.*\0",
             L"bin", /*saving=*/true);
         if (path.empty()) return;
+        // Guard: if the chosen file is a snapshot (or at least isn't a graph
+        // binary) but already exists with content, warn before overwriting it.
+        if (fileExistsNonEmpty(path) && !fileLooksLikeGraph(path) &&
+            !confirmOverwriteWrongKind(hwnd, path, /*savingGraph=*/true))
+            return;
         bool ok = state->handler->flush(wideToUtf8(path));
         appendResult(state->results,
             ok ? L"Graph saved to " + path : L"Failed to save graph to " + path, !ok);
@@ -419,9 +614,18 @@ namespace {
     }
 
     void saveSnapshot(HWND hwnd, InteractiveState* state) {
-        std::wstring path = chooseFile(hwnd, L"Snapshot binary\0*.bin\0All files\0*.*\0",
-            L"bin", /*saving=*/true);
+        // Snapshots use a DISTINCT extension (.snap) from graph files (.bin) so
+        // the dialog defaults away from graph binaries -- this is what stops a
+        // "Save Snapshot" from silently clobbering a graph.bin (the two formats
+        // are incompatible; a snapshot written over a graph corrupts it).
+        std::wstring path = chooseFile(hwnd, L"Snapshot\0*.snap\0All files\0*.*\0",
+            L"snap", /*saving=*/true);
         if (path.empty()) return;
+        // Guard: if the chosen file already holds a GRAPH binary, warn before we
+        // overwrite it with snapshot bytes.
+        if (fileLooksLikeGraph(path) &&
+            !confirmOverwriteWrongKind(hwnd, path, /*savingGraph=*/false))
+            return;
         // Create a fresh snapshot of the current graph, then persist it.
         uint64_t id = state->handler->createSnapshot();
         bool ok = state->handler->persistSnapshot(id, wideToUtf8(path));
@@ -430,8 +634,8 @@ namespace {
     }
 
     void loadSnapshot(HWND hwnd, InteractiveState* state) {
-        std::wstring path = chooseFile(hwnd, L"Snapshot binary\0*.bin\0All files\0*.*\0",
-            L"bin", /*saving=*/false);
+        std::wstring path = chooseFile(hwnd, L"Snapshot\0*.snap\0All files\0*.*\0",
+            L"snap", /*saving=*/false);
         if (path.empty()) return;
         bool ok = state->handler->loadSnapshot(wideToUtf8(path));
         appendResult(state->results,
@@ -456,14 +660,29 @@ namespace {
 
         // Command editor (top).
         state->commands = CreateWindowExW(
-            WS_EX_CLIENTEDGE, RICHEDIT_CLASSW, L"",
+            WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, L"",
+            // ES_AUTOHSCROLL + WS_HSCROLL disable word-wrap: long lines scroll
+            // horizontally instead of wrapping. This keeps ONE logical line == ONE
+            // display line, so the gutter's line numbers and the [n] prefixes in
+            // the results console (which count logical lines) stay in sync. With
+            // wrapping on, a wrapped line counted as 2 display rows in the gutter
+            // but 1 logical line when run, drifting the numbers apart.
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_WANTRETURN |
-            WS_VSCROLL | ES_AUTOVSCROLL,
+            WS_VSCROLL | ES_AUTOVSCROLL | WS_HSCROLL | ES_AUTOHSCROLL,
             0, 0, 0, 0, parent, (HMENU)(INT_PTR)ID_EDIT_COMMANDS, inst, nullptr);
+
+        // Force RichEdit to NOT word-wrap. The documented "line width 0" special
+        // case (EM_SETTARGETDEVICE(NULL, 0)) is unreliable in Msftedit.dll and did
+        // NOT disable wrapping here. The robust approach is to give a HUGE fixed
+        // layout width: RichEdit lays text out as if the page were enormously
+        // wide, so no line ever reaches a wrap boundary at any window size. Text
+        // then scrolls horizontally (we have WS_HSCROLL/ES_AUTOHSCROLL) instead of
+        // wrapping, keeping one logical line == one display line.
+        SendMessageW(state->commands, EM_SETTARGETDEVICE, 0, (LPARAM)0x30000);
 
         // Results console (bottom).
         state->results = CreateWindowExW(
-            WS_EX_CLIENTEDGE, RICHEDIT_CLASSW, L"",
+            WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, L"",
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY |
             WS_VSCROLL | ES_AUTOVSCROLL,
             0, 0, 0, 0, parent, (HMENU)(INT_PTR)ID_EDIT_RESULTS, inst, nullptr);
@@ -502,6 +721,14 @@ namespace {
         y += editorH + MARGIN;
         // results console (bottom, full width)
         MoveWindow(state->results, MARGIN, y, w - 2 * MARGIN, resultsH, TRUE);
+
+        // Re-assert no-wrap AFTER resizing the editor. RichEdit re-flows its text
+        // to the new client width on resize, which re-enables word-wrapping unless
+        // we re-apply the large fixed layout width. Without this, resizing made
+        // long lines wrap, changing how many display lines exist and thus which
+        // line numbers were visible. The huge width keeps one logical line == one
+        // display line at every size. (See createControls for why width 0 fails.)
+        SendMessageW(state->commands, EM_SETTARGETDEVICE, 0, (LPARAM)0x30000);
 
         InvalidateRect(state->gutter, nullptr, TRUE);
     }
@@ -568,9 +795,20 @@ namespace {
             if (!state) break;
             int id = LOWORD(wParam);
 
-            // RichEdit change notifications: re-highlight + repaint gutter.
+            // RichEdit change notifications: recolour ONLY the caret's line (cheap)
+            // and repaint the gutter. Full-document highlightSyntax runs only on
+            // load, not on every keystroke -- that was the cause of the typing lag.
             if (HIWORD(wParam) == EN_CHANGE && id == ID_EDIT_COMMANDS) {
-                highlightSyntax(state);
+                highlightCaretLine(state);
+                InvalidateRect(state->gutter, nullptr, TRUE);
+                return 0;
+            }
+
+            // Editor scrolled (ENM_SCROLL was enabled): the first visible line
+            // changed, so the gutter's numbers must be redrawn from the new top.
+            // Without this the gutter only repainted incidentally and the numbers
+            // appeared "stuck" until the next edit/resize.
+            if (HIWORD(wParam) == EN_VSCROLL && id == ID_EDIT_COMMANDS) {
                 InvalidateRect(state->gutter, nullptr, TRUE);
                 return 0;
             }
@@ -598,11 +836,12 @@ namespace {
 } // namespace
 
 // ---------------------------------------------------------------------------
-// runInteractive — the single entry point main() calls (Windows build)
+// runInteractive ï¿½ the single entry point main() calls (Windows build)
 // ---------------------------------------------------------------------------
 int runInteractive(int /*argc*/, char* /*argv*/[]) {
-    // RichEdit lives in a DLL that must be loaded before RICHEDIT_CLASSW can be
-    // created. Msftedit.dll provides RichEdit 4.1.
+    // RichEdit lives in a DLL that must be loaded before its window class
+    // (MSFTEDIT_CLASS / "RICHEDIT50W") can be created. Msftedit.dll provides
+    // RichEdit 4.1 and registers that class on load.
     HMODULE richLib = LoadLibraryW(L"Msftedit.dll");
     if (!richLib) {
         MessageBoxW(nullptr, L"Failed to load RichEdit (Msftedit.dll).",

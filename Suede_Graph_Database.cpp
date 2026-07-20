@@ -5,6 +5,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <unordered_map>
 // lower case using std::transform()
 #include <algorithm>
 #include <cctype>     // std::tolower
@@ -31,6 +32,23 @@ enum CommandMode {
     BATCH,
     UNKNOWN
 };
+
+const std::unordered_map<std::string, CommandMode> modes = { {"batch", BATCH}, {"interactive", INTERACTIVE}, {"debug", DEBUG}};
+
+// get commands mode
+static CommandMode getMode(std::string sMode) {
+    // convert to lowercase. Cast each char to unsigned before std::tolower:
+    // passing a negative char (high-bit set) straight to tolower(int) is undefined behaviour.
+    std::transform(sMode.begin(), sMode.end(), sMode.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    // get value
+    auto it = modes.find(sMode);
+    if (it == modes.end()) {
+        // unknown command
+        return UNKNOWN;
+    }
+    return it->second;
+}
 
 // runCommandsFile
 // The shared engine of both batch and debug modes: read a commands .txt file,
@@ -111,23 +129,6 @@ static int runCommandsFile(const CommandMode mode, const std::string& commandsFi
 //    int iErr = run_tests();
 //    return iErr;
 //}
-
-// get commands mode
-static CommandMode getMode(std::string sMode) {
-    // convert to lowercase. Cast each char to unsigned before std::tolower:
-    // passing a negative char (high-bit set) straight to tolower(int) is undefined behaviour.
-    std::transform(sMode.begin(), sMode.end(), sMode.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    // get value
-    if (sMode == "batch")
-        return BATCH;
-    else if (sMode == "interactive")
-        return INTERACTIVE;
-    else if (sMode == "debug")
-        return DEBUG;
-    // unknown command
-    return UNKNOWN;
-}
 
 // print the usage/help text to stderr.
 static void printUsage(const char* exe) {

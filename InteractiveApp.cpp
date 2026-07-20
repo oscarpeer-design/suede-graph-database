@@ -289,83 +289,104 @@ namespace {
         SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
     }
 
-    // Core tokenizer/colourer. Scans `text` (the whole editor buffer) and applies
-    // colour ONLY to tokens that fall within [applyFrom, applyTo). Scanning the
-    // full buffer keeps token boundaries correct even when the range starts or
-    // ends mid-line; restricting where colour is *applied* is what makes a
-    // line-local recolour cheap. Colour is: keywords blue, numbers teal, quoted
-    // strings dark red, everything else default black.
+    // Fetch the text of ONE logical line (line index `line`) directly from the
+    // control via EM_GETLINE, and report where that line begins in the control's
+    // own character coordinates (EM_LINEINDEX). This is the crux of the rewrite:
+    // every colour position is computed as (control line-start) + (offset within
+    // this one line). Neither half involves counting newlines in a big buffer, so
+    // there is no scanned-vs-addressed offset mismatch to drift -- the previous
+    // approach scanned one giant getCtrlTextW string and fed those offsets to
+    // EM_SETSEL, whose newline accounting could differ, shifting every colour.
     //
-    // A token is applied if it overlaps the range at all, so a multi-line quoted
-    // string that reaches into the range still gets coloured. The caller has
-    // already reset [applyFrom, applyTo) to default, so untouched spans stay black.
-    void colourTokens(HWND edit, const std::wstring& text,
-        int applyFrom, int applyTo) {
-        const int n = (int)text.size();
+    // Returns the line text (without its line-break) and sets `lineStartOut` to
+    // the line's first-character index. Returns "" for an empty line.
+    std::wstring getLineText(HWND edit, int line, int& lineStartOut) {
+        lineStartOut = (int)SendMessageW(edit, EM_LINEINDEX, (WPARAM)line, 0);
+        if (lineStartOut < 0) { lineStartOut = 0; return L""; }
+        int len = (int)SendMessageW(edit, EM_LINELENGTH, (WPARAM)lineStartOut, 0);
+        if (len <= 0) return L"";
 
-        // Helper: colour [s,e) only if it overlaps the apply window.
-        auto applyIfInRange = [&](int s, int e, COLORREF colour) {
-            if (e > applyFrom && s < applyTo)
-                colorRange(edit, s, e, colour);
-            };
+        // EM_GETLINE requires the FIRST WORD of the buffer to hold its capacity in
+        // TCHARs, and does NOT null-terminate; it returns the count actually copied.
+        std::wstring buf(len + 1, L'\0');
+        *reinterpret_cast<WORD*>(&buf[0]) = (WORD)(len + 1);
+        int copied = (int)SendMessageW(edit, EM_GETLINE, (WPARAM)line, (LPARAM)&buf[0]);
+        buf.resize(copied < 0 ? 0 : copied);
+        return buf;
+    }
 
+    // Colour every token on a SINGLE line. `lineText` is that line's text and
+    // `lineStart` is where the line begins in the control. Each token is coloured
+    // at lineStart + (its position within lineText), so positions are exact. The
+    // caller has already reset [lineStart, lineStart+len) to default black.
+    // Quotes are naturally single-line here: lineText contains no newline, so an
+    // unterminated quote can at most reach the end of this line.
+    void colourLineTokens(HWND edit, const std::wstring& lineText, int lineStart) {
+        const int n = (int)lineText.size();
         int i = 0;
         while (i < n) {
-            wchar_t c = text[i];
+            wchar_t c = lineText[i];
 
             // quoted string '...'
             if (c == L'\'') {
                 int start = i++;
-                while (i < n && text[i] != L'\'') ++i;
-                if (i < n) ++i;                  // include closing quote
-                applyIfInRange(start, i, RGB(163, 21, 21));
+                while (i < n && lineText[i] != L'\'') ++i;
+                if (i < n && lineText[i] == L'\'') ++i;   // include closing quote
+                colorRange(edit, lineStart + start, lineStart + i, RGB(163, 21, 21));
                 continue;
             }
             // identifier / keyword
             if (isWordChar(c) && !iswdigit(c)) {
                 int start = i;
-                while (i < n && isWordChar(text[i])) ++i;
-                std::wstring word = text.substr(start, i - start);
+                while (i < n && isWordChar(lineText[i])) ++i;
+                std::wstring word = lineText.substr(start, i - start);
                 if (isKeyword(word))
-                    applyIfInRange(start, i, RGB(0, 0, 200));
+                    colorRange(edit, lineStart + start, lineStart + i, RGB(0, 0, 200));
                 continue;
             }
             // number
             if (iswdigit(c)) {
                 int start = i;
-                while (i < n && (iswdigit(text[i]) || text[i] == L'.')) ++i;
-                applyIfInRange(start, i, RGB(9, 134, 88));
+                while (i < n && (iswdigit(lineText[i]) || lineText[i] == L'.')) ++i;
+                colorRange(edit, lineStart + start, lineStart + i, RGB(9, 134, 88));
                 continue;
             }
             ++i;
         }
     }
 
-    // Full-document highlight. Used once on load (open file / starter template),
-    // where a single O(document) pass is fine. NOT called on every keystroke.
-    void highlightSyntax(InteractiveState* state) {
+    // Recolour a RANGE of logical lines [firstLine, lastLine], one line at a time
+    // in the control's own coordinates. This is the single highlighting engine:
+    // the full-document pass and the caret-line pass both call it, differing only
+    // in the line range. Redraw, undo-suspension, and caret restoration are done
+    // once around the whole range.
+    void highlightLineRange(InteractiveState* state, int firstLine, int lastLine) {
         if (state->highlighting) return;        // guard against EN_CHANGE recursion
         state->highlighting = true;
 
         HWND edit = state->commands;
 
-        // Save the caret/selection so recolouring doesn't move it.
+        // Save caret/selection so recolouring doesn't move it.
         DWORD selStart = 0, selEnd = 0;
         SendMessageW(edit, EM_GETSEL, (WPARAM)&selStart, (LPARAM)&selEnd);
 
-        // Suppress redraw + change notifications while we recolour.
         SendMessageW(edit, WM_SETREDRAW, FALSE, 0);
         DWORD savedMask = (DWORD)SendMessageW(edit, EM_SETEVENTMASK, 0, 0);
 
-        const std::wstring text = getCtrlTextW(edit);
-        const int n = (int)text.size();
-
         {
-            // Keep the full-document recolour off the undo stack too (matters when
-            // this runs after a paste/load, so Ctrl+Z still targets text edits).
+            // Keep all colour changes off the undo stack (so Ctrl+Z targets text).
             UndoSuspend noUndo(state->textDoc);
-            colorRange(edit, 0, n, RGB(0, 0, 0));   // reset whole doc to default
-            colourTokens(edit, text, 0, n);         // colour every token
+
+            for (int line = firstLine; line <= lastLine; ++line) {
+                int lineStart = 0;
+                std::wstring lineText = getLineText(edit, line, lineStart);
+                int len = (int)lineText.size();
+                // Reset this line to default, then colour its tokens. Reset and
+                // colour use the SAME per-line coordinates, so nothing drifts.
+                if (len > 0)
+                    colorRange(edit, lineStart, lineStart + len, RGB(0, 0, 0));
+                colourLineTokens(edit, lineText, lineStart);
+            }
         }
 
         // Restore caret/selection, notifications, and redraw.
@@ -377,53 +398,21 @@ namespace {
         state->highlighting = false;
     }
 
-    // Line-local highlight. Recolours ONLY the line containing the caret, which
-    // is all a single-character edit can affect (for a one-statement-per-line
-    // command language). This is O(line) work plus a small repaint, so typing in
-    // a large file stays smooth. Called on EN_CHANGE instead of highlightSyntax.
-    //
-    // Caveat by design: a quoted string spanning multiple lines won't fully
-    // recolour until each affected line is touched -- acceptable here because
-    // Suede commands are single-line and string literals are short.
+    // Full-document highlight. Used once on load (open file / starter template).
+    void highlightSyntax(InteractiveState* state) {
+        int lineCount = (int)SendMessageW(state->commands, EM_GETLINECOUNT, 0, 0);
+        if (lineCount <= 0) return;
+        highlightLineRange(state, 0, lineCount - 1);
+    }
+
+    // Line-local highlight. Recolours ONLY the caret's line -- all a single-char
+    // edit can affect -- so typing in a large file stays smooth. Called on
+    // EN_CHANGE instead of highlightSyntax.
     void highlightCaretLine(InteractiveState* state) {
-        if (state->highlighting) return;        // guard against EN_CHANGE recursion
-        state->highlighting = true;
-
-        HWND edit = state->commands;
-
         DWORD selStart = 0, selEnd = 0;
-        SendMessageW(edit, EM_GETSEL, (WPARAM)&selStart, (LPARAM)&selEnd);
-
-        // Character range of the caret's line: [lineStart, lineStart + lineLen).
-        int line = (int)SendMessageW(edit, EM_LINEFROMCHAR, (WPARAM)selStart, 0);
-        int lineStart = (int)SendMessageW(edit, EM_LINEINDEX, (WPARAM)line, 0);
-        int lineLen = (int)SendMessageW(edit, EM_LINELENGTH, (WPARAM)lineStart, 0);
-        int lineEnd = lineStart + lineLen;
-
-        SendMessageW(edit, WM_SETREDRAW, FALSE, 0);
-        DWORD savedMask = (DWORD)SendMessageW(edit, EM_SETEVENTMASK, 0, 0);
-
-        const std::wstring text = getCtrlTextW(edit);
-
-        {
-            // Suspend undo recording while we apply colour, so these formatting
-            // changes don't land on the undo stack (which broke Ctrl+Z). The
-            // guard resumes undo when this block exits, however it exits.
-            UndoSuspend noUndo(state->textDoc);
-
-            // Reset just this line to default, then colour tokens overlapping it.
-            colorRange(edit, lineStart, lineEnd, RGB(0, 0, 0));
-            colourTokens(edit, text, lineStart, lineEnd);
-        }
-
-        SendMessageW(edit, EM_SETSEL, (WPARAM)selStart, (LPARAM)selEnd);
-        SendMessageW(edit, EM_SETEVENTMASK, 0, (LPARAM)savedMask);
-        SendMessageW(edit, WM_SETREDRAW, TRUE, 0);
-        // Repaint only the editor (RichEdit invalidates the changed line region
-        // itself); no full-document InvalidateRect needed here.
-        InvalidateRect(edit, nullptr, FALSE);
-
-        state->highlighting = false;
+        SendMessageW(state->commands, EM_GETSEL, (WPARAM)&selStart, (LPARAM)&selEnd);
+        int line = (int)SendMessageW(state->commands, EM_LINEFROMCHAR, (WPARAM)selStart, 0);
+        highlightLineRange(state, line, line);
     }
 
     // --------------------------- line-number gutter ----------------------------

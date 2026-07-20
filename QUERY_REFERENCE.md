@@ -128,7 +128,9 @@ General rules that apply everywhere:
 - **String values** may be single- or double-quoted; the quotes are stripped.
   Unquoted bare words are also accepted as values.
 - **Numeric ids** must be non-negative integers.
-- **`WHERE` supports only `AND`** as a connective. `OR` is not supported.
+- **`WHERE` supports both `AND` and `OR`** as connectives, with **SQL precedence:
+  `AND` binds tighter than `OR`**, so `A AND B OR C` means `(A AND B) OR C`. There
+  is no parenthesised grouping. See §2.1 "AND / OR in WHERE".
 - Valid comparison operators are `=`, `!=`, `<`, `>`, `<=`, `>=`. Comparisons are
   **lexicographic** (string) comparisons, since all values are stored as strings.
 - A statement may end with an optional **execution-mode keyword**, `LIVE` (the
@@ -188,8 +190,62 @@ than bolting a relational-style scan onto the live graph.
 The one place an unfiltered scan **is** well-defined is a snapshot: a
 `CSR_Representation` has already materialised the whole point-in-time set as
 contiguous arrays, so `SELECT * FROM NODES SNAPSHOT` is a cheap, well-defined
-full scan. That is why the WHERE requirement is lifted for `SNAPSHOT` reads and
-nowhere else — it matches how the data is physically laid out. See §2.5.
+full scan. That is why the WHERE requirement is lifted for `SNAPSHOT` reads — it
+matches how the data is physically laid out. See §2.5.
+
+Two further cases lift the WHERE requirement, favouring "the command always
+works" over the strict index-only rule:
+
+- **`OR` queries** (§2.1 "AND / OR in WHERE"). When a WHERE contains `OR`, the
+  query cannot be served from a single index anchor, so it runs as a full scan
+  with per-row boolean evaluation. `WHERE LABEL = 'Person' OR age = '99'` — which
+  the old rule would have rejected — now simply works (and scans). Pure-`AND`
+  queries still take the fast index path.
+- **`COUNT`** (below). `SELECT COUNT * FROM NODES` with no WHERE counts the whole
+  graph, a natural aggregate over a full scan.
+
+#### COUNT
+
+`SELECT COUNT * FROM <NODES|EDGES> [WHERE ...]` returns **how many rows match**
+rather than the rows themselves. `COUNT` must be written as `COUNT *` (there is
+nothing to project when only counting). It composes with `WHERE` (including `OR`)
+exactly like a normal `SELECT`, and — unlike a plain live `SELECT` — may omit
+`WHERE` to count the whole graph.
+
+```sql
+SELECT COUNT * FROM NODES WHERE LABEL = 'Person'   -- Count: 15
+SELECT COUNT * FROM NODES                           -- Count: <all nodes>
+SELECT COUNT * FROM EDGES WHERE LABEL = 'KNOWS'     -- Count: 10
+SELECT COUNT * FROM NODES WHERE LABEL = 'Person' OR LABEL = 'City'
+```
+
+The result message is `Count: <n>`; no rows are returned in `nodes` / `edges`.
+`TOP` and `COUNT` are independent — use one or the other.
+
+#### AND / OR in WHERE
+
+`WHERE` combines conditions with `AND` and `OR`. Precedence follows SQL: **`AND`
+binds tighter than `OR`**, and there is no parenthesised grouping. So a WHERE is
+a sum-of-products — runs of `AND`-joined conditions form groups, and those groups
+are `OR`-ed together:
+
+```sql
+-- (LABEL = 'Person' AND age > '20') OR LABEL = 'City'
+SELECT * FROM NODES WHERE LABEL = 'Person' AND age > '20' OR LABEL = 'City'
+
+-- union of two label sets
+SELECT * FROM NODES WHERE LABEL = 'Person' OR LABEL = 'City'
+
+-- union of two ids
+SELECT * FROM NODES WHERE ID = 1 OR ID = 5
+```
+
+Performance note: a pure-`AND` query anchored on `ID`/`LABEL` uses the fast index
+path. A query containing `OR` falls back to a full scan, because its branches
+cannot all be resolved from a single index anchor. The query still returns the
+correct rows; it just does more work. This keeps `OR` a complete, always-valid
+part of the language rather than a form that is sometimes rejected. Edges support
+`OR` over `ID`/`LABEL` (edges have no properties).
 
 #### Projection (selective columns)
 
@@ -748,7 +804,8 @@ the executor reports the outcome). Below is the authoritative list.
 | `WHERE: expected operator.` | Property with no operator. |
 | `WHERE: invalid operator '<op>'.` | Operator not in the valid set. |
 | `WHERE: expected value.` | Operator with no right-hand value. |
-| `WHERE: unexpected token '<tok>' (only AND is supported).` | A connective other than `AND` (e.g. `OR`). |
+| `WHERE: unexpected token '<tok>' (expected AND or OR).` | A connective other than `AND` / `OR` (e.g. `XOR`). |
+| `SELECT COUNT: expected '*' after COUNT (e.g. SELECT COUNT * FROM NODES ...).` | `COUNT` not followed by `*`. |
 | `WHERE: no conditions found.` | `WHERE` with nothing after it. |
 
 ### 3.2 Execution messages
@@ -758,6 +815,7 @@ the executor reports the outcome). Below is the authoritative list.
 | `Found 1 row.` | Single-id lookup hit. | ✅ |
 | `Found 0 row(s).` | Single-id lookup missed. | ✅ |
 | `Found <n> row(s).` | Label / edge query result count. | ✅ |
+| `Count: <n>` | `SELECT COUNT * FROM ...` — number of matching rows (no rows returned). | ✅ |
 | `Inserted node.` / `Inserted edge.` | Insert succeeded. | ✅ |
 | `Deleted node.` / `Deleted edge.` | Delete succeeded. | ✅ |
 | `Updated <n> node(s).` | `UPDATE NODES` result count. | ✅ |

@@ -63,7 +63,7 @@ struct Condition {
     std::string property;   // left-hand-side property name (case-preserved)
     std::string op;         // operator token ("=", "!=", "<", ">", "<=", ">=")
     std::string value;      // right-hand-side value (quotes stripped)
-    std::string logicOp;    // connector following this condition (e.g. "AND") or empty
+    std::string logicOp;    // connector following this condition ("AND" / "OR") or empty
 };
 
 // Result structure returned by Query::execute / run
@@ -106,6 +106,11 @@ public:
     // meaningful for SELECT FROM NODES; property keys plus the reserved names
     // "id" and "label" are valid columns. Exposed for testing.
     const std::vector<std::string>& projection() const { return projection_; }
+
+    // True when the SELECT was a COUNT (SELECT COUNT * FROM ...). A COUNT returns
+    // the number of matching rows in the result message ("Count: <n>") rather
+    // than the rows themselves. Exposed for testing.
+    bool isCount() const { return isCount_; }
 
     // Row limit set by a leading TOP <n> (SELECT) / MATCH TOP <n>. hasLimit() is
     // false when no TOP was given; limit() is the cap when it is. Exposed for testing.
@@ -186,6 +191,15 @@ private:
     // The reserved columns "id"/"label" are structural and always retained.
     void projectNodes(std::vector<Node>& nodes) const;
 
+    // True if any parsed WHERE condition is joined by OR. A pure-AND WHERE can use
+    // the fast index paths (anchor on ID/LABEL, filter the rest); an OR forces the
+    // general boolean evaluation over a full scan (see conditionsMatch* below).
+    bool whereHasOr() const;
+
+    // Build the SELECT result message: "Count: <n>" for a COUNT, else the usual
+    // "Found <n> row(s)." / "Found 1 row." Keeps the two output shapes in one place.
+    std::string selectMessage(size_t rowCount) const;
+
     // Truncate a result vector to the TOP <n> limit, if one was given.
     template <typename T>
     void applyLimit(std::vector<T>& rows) const {
@@ -213,6 +227,10 @@ private:
     // SELECT projection: the requested columns. Empty means "*" (all columns).
     // For NODES these are property keys and/or the reserved names "id"/"label".
     std::vector<std::string> projection_;
+
+    // SELECT COUNT: when true the query reports the number of matching rows
+    // ("Count: <n>") instead of returning the rows. Set by "SELECT COUNT * FROM".
+    bool isCount_ = false;
 
     // Row limit from a leading TOP <n>. When hasLimit_ is true, at most limit_
     // rows are returned by SELECT / MATCH.

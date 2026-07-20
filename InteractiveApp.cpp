@@ -46,7 +46,9 @@
 #define _RICHEDIT_VER 0x0410
 #endif
 #include <richedit.h>
+#include <richole.h>          // IRichEditOle (EM_GETOLEINTERFACE)
 #include <commdlg.h>          // GetOpenFileName / GetSaveFileName
+#include <tom.h>              // ITextDocument: suspend undo while syntax-highlighting
 
 #include <memory>
 #include <string>
@@ -95,6 +97,31 @@ namespace {
         HFONT mono = nullptr;                 // shared fixed-width font
         std::wstring currentCmdFile;             // path of the open commands .txt ("" if none)
         bool highlighting = false;               // reentrancy guard for syntax highlight
+        // The command editor's Text Object Model document, fetched once. Used to
+        // suspend the undo recorder while the syntax highlighter writes character
+        // colours, so Ctrl+Z reverses real text edits -- not invisible colour
+        // changes. Null if the interface couldn't be obtained (undo still works,
+        // just with colour ops back on the stack, i.e. the old behaviour).
+        ITextDocument* textDoc = nullptr;
+    };
+
+    const int undoLimit = 100; // only 100 previous edits are saved
+
+    // RAII guard: suspends the RichEdit's undo recorder for its lifetime, then
+    // resumes it -- even if the scope is left early. This is what keeps the
+    // highlighter's EM_SETCHARFORMAT calls off the undo stack. Pairing suspend and
+    // resume in a destructor is important: a missed Resume would leave undo
+    // permanently OFF, so we never rely on reaching a manual resume call.
+    struct UndoSuspend {
+        ITextDocument* doc;
+        explicit UndoSuspend(ITextDocument* d) : doc(d) {
+            if (doc) doc->Undo(tomSuspend, nullptr);
+        }
+        ~UndoSuspend() {
+            if (doc) doc->Undo(tomResume, nullptr);
+        }
+        UndoSuspend(const UndoSuspend&) = delete;
+        UndoSuspend& operator=(const UndoSuspend&) = delete;
     };
 
     // ------------------------- string conversions ------------------------------
@@ -333,8 +360,13 @@ namespace {
         const std::wstring text = getCtrlTextW(edit);
         const int n = (int)text.size();
 
-        colorRange(edit, 0, n, RGB(0, 0, 0));   // reset whole doc to default
-        colourTokens(edit, text, 0, n);         // colour every token
+        {
+            // Keep the full-document recolour off the undo stack too (matters when
+            // this runs after a paste/load, so Ctrl+Z still targets text edits).
+            UndoSuspend noUndo(state->textDoc);
+            colorRange(edit, 0, n, RGB(0, 0, 0));   // reset whole doc to default
+            colourTokens(edit, text, 0, n);         // colour every token
+        }
 
         // Restore caret/selection, notifications, and redraw.
         SendMessageW(edit, EM_SETSEL, (WPARAM)selStart, (LPARAM)selEnd);
@@ -373,9 +405,16 @@ namespace {
 
         const std::wstring text = getCtrlTextW(edit);
 
-        // Reset just this line to default, then colour tokens overlapping it.
-        colorRange(edit, lineStart, lineEnd, RGB(0, 0, 0));
-        colourTokens(edit, text, lineStart, lineEnd);
+        {
+            // Suspend undo recording while we apply colour, so these formatting
+            // changes don't land on the undo stack (which broke Ctrl+Z). The
+            // guard resumes undo when this block exits, however it exits.
+            UndoSuspend noUndo(state->textDoc);
+
+            // Reset just this line to default, then colour tokens overlapping it.
+            colorRange(edit, lineStart, lineEnd, RGB(0, 0, 0));
+            colourTokens(edit, text, lineStart, lineEnd);
+        }
 
         SendMessageW(edit, EM_SETSEL, (WPARAM)selStart, (LPARAM)selEnd);
         SendMessageW(edit, EM_SETEVENTMASK, 0, (LPARAM)savedMask);
@@ -680,6 +719,28 @@ namespace {
         // wrapping, keeping one logical line == one display line.
         SendMessageW(state->commands, EM_SETTARGETDEVICE, 0, (LPARAM)0x30000);
 
+        // Enable undo with a BOUNDED stack. A fixed limit (100 operations) keeps
+        // Ctrl+Z working while capping how much edit history the control retains,
+        // so a very long editing session can't grow the undo buffer without limit
+        // -- the "overrun" guard. RichEdit's default already allows undo, but
+        // setting an explicit limit makes the behaviour deterministic.
+        SendMessageW(state->commands, EM_SETUNDOLIMIT, (WPARAM)undoLimit, 0);
+
+        // Fetch the Text Object Model document ONCE (not per-keystroke). We use it
+        // to suspend undo recording around syntax highlighting. EM_GETOLEINTERFACE
+        // returns an IRichEditOle*; we QueryInterface it for ITextDocument. If any
+        // step fails, textDoc stays null and the highlighter simply skips the
+        // suspend (undo then behaves as before -- colour ops back on the stack).
+        {
+            IRichEditOle* richOle = nullptr;
+            if (SendMessageW(state->commands, EM_GETOLEINTERFACE, 0,
+                (LPARAM)&richOle) && richOle) {
+                richOle->QueryInterface(__uuidof(ITextDocument),
+                    reinterpret_cast<void**>(&state->textDoc));
+                richOle->Release();   // we hold our own ref via textDoc now
+            }
+        }
+
         // Results console (bottom).
         state->results = CreateWindowExW(
             WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, L"",
@@ -897,6 +958,12 @@ int runInteractive(int /*argc*/, char* /*argv*/[]) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+
+    // Release the cached ITextDocument (COM ref) before the DLL is freed.
+    if (state.textDoc) {
+        state.textDoc->Release();
+        state.textDoc = nullptr;
     }
 
     DestroyAcceleratorTable(hAccel);

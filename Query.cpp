@@ -140,6 +140,7 @@ bool Query::parse() {
     target_ = QueryTarget::Unknown;              // reset target type
     executionMode_ = ExecutionMode::Live;        // reset to the default (live) view
     projection_.clear();                         // reset projection (empty == "*")
+    isCount_ = false;                            // reset COUNT flag (set only by SELECT COUNT)
     hasLimit_ = false;                           // reset row limit
     limit_ = 0;
 
@@ -260,6 +261,21 @@ bool Query::parseSelect(const std::vector<std::string>& tokens, size_t pos) {
         ++pos;                                    // consume the count
     }
 
+    // Optional COUNT: "SELECT COUNT * FROM ...". COUNT reports how many rows match
+    // instead of returning them, so it must be followed by '*' (there is nothing
+    // to project when you are only counting). COUNT composes with WHERE exactly
+    // like a normal SELECT; it just changes the result shape to a single number.
+    if (pos < tokens.size() && toUpper(tokens[pos]) == "COUNT") {
+        isCount_ = true;
+        ++pos;                                    // consume COUNT
+        if (pos >= tokens.size() || tokens[pos] != "*") {
+            setError("SELECT COUNT: expected '*' after COUNT (e.g. SELECT COUNT * FROM NODES ...).");
+            return false;
+        }
+        // Fall through: the '*' is consumed by the projection block below, which
+        // leaves projection_ empty (all columns) -- irrelevant for a count.
+    }
+
     // Projection: '*' or a comma-separated column list.
     if (pos >= tokens.size()) { setError("SELECT: expected '*' or a column list."); return false; }
     if (tokens[pos] == "*") {
@@ -306,12 +322,14 @@ bool Query::parseSelect(const std::vector<std::string>& tokens, size_t pos) {
         return parseWhereClause(tokens, pos + 1); // delegate WHERE parsing starting after 'WHERE'
     }
 
-    // A WHERE-less SELECT is a full scan. Against the live graph this is rejected
-    // (the live path is index-driven and needs an ID/LABEL predicate), but a
-    // SELECT ... SNAPSHOT materializes the whole point-in-time set, so an
-    // unfiltered snapshot scan is well-defined and permitted.
-    if (executionMode_ == ExecutionMode::Snapshot) {
-        return true;                              // no conditions: full snapshot scan
+    // A WHERE-less SELECT is a full scan. Against the live graph this is normally
+    // rejected (the live path is index-driven and needs an ID/LABEL predicate),
+    // but it is permitted in two cases:
+    //   - SELECT ... SNAPSHOT, which materializes the whole point-in-time set;
+    //   - SELECT COUNT * FROM ..., since counting the whole graph ("how many
+    //     nodes are there?") is a natural aggregate over a full scan.
+    if (executionMode_ == ExecutionMode::Snapshot || isCount_) {
+        return true;                              // no conditions: full scan (snapshot or count)
     }
 
     setError("SELECT: a WHERE clause is required (WHERE ID = ... or WHERE LABEL = ...)."); // require explicit WHERE
@@ -493,8 +511,11 @@ bool Query::parseWhereClause(const std::vector<std::string>& tokens, size_t pos)
 
         if (pos < tokens.size()) {                 // check for optional logic connector
             std::string next = toUpper(tokens[pos]); // read connector
-            if (next == "AND") { cond.logicOp = next; ++pos; } // accept only AND
-            else { setError("WHERE: unexpected token '" + tokens[pos] + "' (only AND is supported)."); return false; } // unexpected token
+            // AND and OR are both accepted. Precedence (AND binds tighter than OR)
+            // is applied at evaluation time, not here -- the parser just records
+            // which connector followed each condition in cond.logicOp.
+            if (next == "AND" || next == "OR") { cond.logicOp = next; ++pos; }
+            else { setError("WHERE: unexpected token '" + tokens[pos] + "' (expected AND or OR)."); return false; } // unexpected token
         }
 
         conditions_.push_back(cond);              // append parsed condition to conditions_ vector
@@ -624,6 +645,26 @@ static bool executeCondition(const Condition& e, const std::string& actual, bool
 // structural fields on the Node (not entries in the property map), so they are
 // always available and are simply skipped here; every other projected column is
 // looked up as a property key and kept when present.
+// whereHasOr: true if any condition is joined to the next by OR. Such a WHERE
+// cannot be served by the single-anchor index fast-paths (which assume every
+// condition must hold), so it is routed to a full scan with boolean evaluation.
+bool Query::whereHasOr() const {
+    for (const Condition& c : conditions_)
+        if (c.logicOp == "OR") return true;
+    return false;
+}
+
+// selectMessage: the result message for a SELECT. A COUNT reports the match
+// count ("Count: <n>"); a normal SELECT reports the returned-row count, using
+// the singular "Found 1 row." form when exactly one row came back.
+std::string Query::selectMessage(size_t rowCount) const {
+    if (isCount_)
+        return "Count: " + std::to_string(rowCount);
+    return (rowCount == 1)
+        ? "Found 1 row."
+        : "Found " + std::to_string(rowCount) + " row(s).";
+}
+
 void Query::projectNodes(std::vector<Node>& nodes) const {
     if (projection_.empty()) return;              // '*' -> keep all columns
 
@@ -648,9 +689,72 @@ void Query::projectNodes(std::vector<Node>& nodes) const {
 static bool nodeMatchesConditions(const Node& node, const std::vector<Condition>& conditions);
 static bool edgeMatchesConditions(const Edge& edge, const std::vector<Condition>& conditions);
 
+// evaluateConditions
+// Evaluate a WHERE condition list against one row, honouring SQL precedence:
+// AND binds tighter than OR. The list is a sum-of-products -- runs of AND-joined
+// conditions form product terms, and those terms are OR-ed together. Each
+// condition's logicOp names the connector to the NEXT condition, so:
+//   A AND B OR C  ==  (A AND B) OR C
+// `test` evaluates a single condition against the row (returns true if it holds).
+// Short-circuits: a satisfied OR-group returns true immediately; a failed
+// condition skips the rest of its AND-run.
+template <typename TestFn>
+static bool evaluateConditions(const std::vector<Condition>& conditions, TestFn test) {
+    if (conditions.empty())
+        return true;                              // no conditions -> match everything
+
+    bool anyGroupTrue = false;                    // OR accumulator across AND-groups
+    bool groupTrue = true;                        // AND accumulator within the current group
+
+    for (size_t i = 0; i < conditions.size(); ++i) {
+        // AND within the group: once a group has failed, we needn't test the rest
+        // of that group, but we must keep scanning to find the group boundary (OR).
+        if (groupTrue)
+            groupTrue = test(conditions[i]);
+
+        // The connector AFTER this condition decides whether the group continues.
+        const std::string& connector = conditions[i].logicOp;   // "AND" / "OR" / ""
+        const bool groupEnds = (connector != "AND");            // OR or end-of-list closes the group
+
+        if (groupEnds) {
+            anyGroupTrue = anyGroupTrue || groupTrue;
+            if (anyGroupTrue)
+                return true;                       // an OR-group succeeded: whole WHERE is true
+            groupTrue = true;                      // reset for the next AND-group
+        }
+    }
+    return anyGroupTrue;
+}
+
 // Execute a SELECT query targeting nodes.
 QueryResult Query::executeSelectNodes(Graph& graph) const {
     QueryResult result;                           // prepare result container
+
+    // Full-scan path. Taken when the WHERE contains an OR (which the single-anchor
+    // index fast-paths below cannot serve), when this is a Snapshot-mode read (a
+    // point-in-time full scan), or for a WHERE-less COUNT (count the whole graph).
+    // A live OR query deliberately falls back to a scan rather than being rejected
+    // -- the language favours "the command always works" over forbidding the
+    // un-indexable case. nodeMatchesConditions honours AND/OR precedence, so an
+    // empty WHERE keeps everything.
+    if (whereHasOr() || executionMode_ == ExecutionMode::Snapshot ||
+        (isCount_ && conditions_.empty())) {
+        std::vector<NodeId> ids;
+        graph.GetNodeIdOrder(ids);                // deterministic insertion order
+        for (NodeId id : ids) {
+            Node node;
+            if (!graph.GetNode(id, node)) continue;
+            if (!nodeMatchesConditions(node, conditions_)) continue;
+            result.nodes.push_back(node);
+        }
+        result.success = true;
+        projectNodes(result.nodes);               // trim to selected columns (no-op for '*')
+        applyLimit(result.nodes);                 // apply TOP <n> row cap
+        size_t n = result.nodes.size();
+        if (isCount_) result.nodes.clear();       // COUNT reports the number, not the rows
+        result.message = selectMessage(n);
+        return result;
+    }
 
     // Fast-path: WHERE ID = <id>
     for (const Condition& c : conditions_) {      // iterate conditions to find ID equality
@@ -664,9 +768,9 @@ QueryResult Query::executeSelectNodes(Graph& graph) const {
             result.success = true;               // an id lookup always succeeds (0 or 1 rows)
             projectNodes(result.nodes);          // trim to selected columns (no-op for '*')
             applyLimit(result.nodes);            // apply TOP <n> (only matters for TOP 0 here)
-            result.message = (result.nodes.size() == 1)
-                ? "Found 1 row."
-                : "Found " + std::to_string(result.nodes.size()) + " row(s).";
+            size_t n = result.nodes.size();
+            if (isCount_) result.nodes.clear();  // COUNT reports the number, not the rows
+            result.message = selectMessage(n);
             return result;                       // return early after ID lookup
         }
     }
@@ -709,37 +813,14 @@ QueryResult Query::executeSelectNodes(Graph& graph) const {
             result.success = true;
             projectNodes(result.nodes);              // trim to selected columns (no-op for '*')
             applyLimit(result.nodes);                // apply TOP <n> row cap
-            result.message = (result.nodes.size() == 1)
-                ? "Found 1 row."
-                : "Found " + std::to_string(result.nodes.size()) + " row(s).";
+            size_t n = result.nodes.size();
+            if (isCount_) result.nodes.clear();      // COUNT reports the number, not the rows
+            result.message = selectMessage(n);
             return result;                           // done processing LABEL-based SELECT
         }
     }
 
-    // No ID/LABEL predicate. A SELECT ... SNAPSHOT is defined as a full
-    // point-in-time scan and may omit WHERE, so when this query is in Snapshot
-    // mode we materialize the whole set here (honouring any property conditions
-    // that WERE supplied) instead of demanding a WHERE. This mirrors the
-    // dedicated snapshot executor and is the path taken when a trailing SNAPSHOT
-    // read falls back to the live graph (no CSR snapshot object supplied).
-    if (executionMode_ == ExecutionMode::Snapshot) {
-        std::vector<NodeId> ids;
-        graph.GetNodeIdOrder(ids);                // deterministic insertion order
-        for (NodeId id : ids) {
-            Node node;
-            if (!graph.GetNode(id, node)) continue;
-            // Apply any conditions present (empty conditions_ => keep everything).
-            if (!nodeMatchesConditions(node, conditions_)) continue;
-            result.nodes.push_back(node);
-        }
-        result.success = true;
-        projectNodes(result.nodes);               // trim to selected columns (no-op for '*')
-        applyLimit(result.nodes);                 // apply TOP <n> row cap
-        result.message = (result.nodes.size() == 1)
-            ? "Found 1 row."
-            : "Found " + std::to_string(result.nodes.size()) + " row(s).";
-        return result;
-    }
+    // (Snapshot-mode and OR full scans are handled at the top of this function.)
 
     // Live SELECT is index-driven and still requires an ID/LABEL predicate.
     result.success = false;
@@ -750,6 +831,29 @@ QueryResult Query::executeSelectNodes(Graph& graph) const {
 // Execute a SELECT query targeting edges.
 QueryResult Query::executeSelectEdges(Graph& graph) const {
     QueryResult result;                           // prepare result container
+
+    // Full-scan path (OR present, Snapshot-mode read, or WHERE-less COUNT). The
+    // index fast-paths below build a field map that assumes every condition is an
+    // AND-ed equality, which OR breaks -- so any OR routes here, evaluating AND/OR
+    // precedence per edge over a full scan. edgeMatchesConditions honours empty
+    // WHERE (match all), which also serves "SELECT COUNT * FROM EDGES".
+    if (whereHasOr() || executionMode_ == ExecutionMode::Snapshot ||
+        (isCount_ && conditions_.empty())) {
+        std::vector<EdgeId> ids;
+        graph.GetAllEdgeIds(ids);
+        for (EdgeId id : ids) {
+            Edge edge;
+            if (!graph.GetEdge(id, edge)) continue;
+            if (!edgeMatchesConditions(edge, conditions_)) continue;
+            result.edges.push_back(edge);
+        }
+        result.success = true;
+        applyLimit(result.edges);                 // apply TOP <n> row cap
+        size_t n = result.edges.size();
+        if (isCount_) result.edges.clear();       // COUNT reports the number, not the rows
+        result.message = selectMessage(n);
+        return result;
+    }
 
     std::unordered_map<std::string, std::string> field; // map stringified field names to values
     for (const Condition& c : conditions_) {      // collect only equality conditions into the map
@@ -769,9 +873,9 @@ QueryResult Query::executeSelectEdges(Graph& graph) const {
         }
         result.success = true;                   // an id lookup always succeeds (0 or 1 rows)
         applyLimit(result.edges);                // apply TOP <n> (only matters for TOP 0 here)
-        result.message = (result.edges.size() == 1)
-            ? "Found 1 row."
-            : "Found " + std::to_string(result.edges.size()) + " row(s).";
+        size_t n = result.edges.size();
+        if (isCount_) result.edges.clear();      // COUNT reports the number, not the rows
+        result.message = selectMessage(n);
         return result;                           // return after ID lookup
     }
 
@@ -819,7 +923,9 @@ QueryResult Query::executeSelectEdges(Graph& graph) const {
         result.edges = found;                     // set result edges
         result.success = true;
         applyLimit(result.edges);                 // apply TOP <n> row cap
-        result.message = "Found " + std::to_string(result.edges.size()) + " row(s).";
+        size_t n = result.edges.size();
+        if (isCount_) result.edges.clear();       // COUNT reports the number, not the rows
+        result.message = selectMessage(n);
         return result;                            // done with FROM-based SELECT
     }
 
@@ -834,31 +940,13 @@ QueryResult Query::executeSelectEdges(Graph& graph) const {
         result.edges = found;                     // set result edges
         result.success = true;
         applyLimit(result.edges);                 // apply TOP <n> row cap
-        result.message = "Found " + std::to_string(result.edges.size()) + " row(s).";
+        size_t n = result.edges.size();
+        if (isCount_) result.edges.clear();       // COUNT reports the number, not the rows
+        result.message = selectMessage(n);
         return result;
     }
 
-    // No supported WHERE form present. As with nodes, a SELECT ... SNAPSHOT is a
-    // full point-in-time scan and may omit WHERE: in Snapshot mode we enumerate
-    // every edge here (honouring any ID/LABEL conditions supplied) rather than
-    // demanding a WHERE. This is the live-fallback path for a trailing SNAPSHOT
-    // read when no CSR snapshot object was supplied.
-    if (executionMode_ == ExecutionMode::Snapshot) {
-        std::vector<EdgeId> ids;
-        graph.GetAllEdgeIds(ids);
-        for (EdgeId id : ids) {
-            Edge edge;
-            if (!graph.GetEdge(id, edge)) continue;
-            if (!edgeMatchesConditions(edge, conditions_)) continue;
-            result.edges.push_back(edge);
-        }
-        result.success = true;
-        applyLimit(result.edges);                 // apply TOP <n> row cap
-        result.message = (result.edges.size() == 1)
-            ? "Found 1 row."
-            : "Found " + std::to_string(result.edges.size()) + " row(s).";
-        return result;
-    }
+    // (Snapshot-mode and OR full scans are handled at the top of this function.)
 
     // If none of the supported WHERE forms were present return an error message.
     result.success = false;
@@ -881,6 +969,26 @@ QueryResult Query::executeSelectNodesSnapshot(Graph& graph, const CSR_Representa
     QueryResult result;
 
     const uint64_t snapshotVersion = snapshot.GetSnapshotVersion();
+
+    // OR full-scan path. The AND-partitioned fast path below cannot serve an OR
+    // WHERE, so route it through a full point-in-time scan: walk the snapshot's
+    // captured membership, fetch each node's payload at-version, and evaluate the
+    // AND/OR condition tree per node. Point-in-time semantics are preserved.
+    if (whereHasOr()) {
+        for (const NodeId id : snapshot.GetCSRNodeMapping()) {
+            Node node;
+            if (!graph.GetNodeAtVersion(id, snapshotVersion, node)) continue;
+            if (!nodeMatchesConditions(node, conditions_)) continue;
+            result.nodes.push_back(std::move(node));
+        }
+        result.success = true;
+        projectNodes(result.nodes);
+        applyLimit(result.nodes);
+        size_t n = result.nodes.size();
+        if (isCount_) result.nodes.clear();
+        result.message = selectMessage(n);
+        return result;
+    }
 
     // Partition conditions: an optional ID equality, an optional LABEL equality,
     // and any remaining property filters. This walks only the WHERE conditions,
@@ -911,7 +1019,7 @@ QueryResult Query::executeSelectNodesSnapshot(Graph& graph, const CSR_Representa
     // TOP 0 selects nothing; short-circuit before touching any node.
     if (hasLimit_ && limit_ == 0) {
         result.success = true;
-        result.message = "Found 0 row(s).";
+        result.message = selectMessage(0);
         return result;
     }
 
@@ -957,9 +1065,9 @@ QueryResult Query::executeSelectNodesSnapshot(Graph& graph, const CSR_Representa
 
     result.success = true;
     projectNodes(result.nodes);              // trim to selected columns (no-op for '*')
-    result.message = (result.nodes.size() == 1)
-        ? "Found 1 row."
-        : "Found " + std::to_string(result.nodes.size()) + " row(s).";
+    size_t n = result.nodes.size();
+    if (isCount_) result.nodes.clear();      // COUNT reports the number, not the rows
+    result.message = selectMessage(n);
     return result;
 }
 
@@ -978,6 +1086,20 @@ QueryResult Query::executeSelectEdgesSnapshot(Graph& graph, const CSR_Representa
     // Materialize edges visible at the snapshot version.
     std::vector<Edge> visible;
     graph.GetEdgesAtVersion(visible, snapshotVersion);
+
+    // OR full-scan path: evaluate the AND/OR condition tree over the visible set.
+    if (whereHasOr()) {
+        for (const Edge& e : visible) {
+            if (!edgeMatchesConditions(e, conditions_)) continue;
+            result.edges.push_back(e);
+        }
+        result.success = true;
+        applyLimit(result.edges);
+        size_t n = result.edges.size();
+        if (isCount_) result.edges.clear();
+        result.message = selectMessage(n);
+        return result;
+    }
 
     // Collect equality predicates into a field map (same shape as the live path).
     std::unordered_map<std::string, std::string> field;
@@ -1037,7 +1159,9 @@ QueryResult Query::executeSelectEdgesSnapshot(Graph& graph, const CSR_Representa
 
     result.success = true;
     applyLimit(result.edges);                // apply TOP <n> row cap
-    result.message = "Found " + std::to_string(result.edges.size()) + " row(s).";
+    size_t n = result.edges.size();
+    if (isCount_) result.edges.clear();      // COUNT reports the number, not the rows
+    result.message = selectMessage(n);
     return result;
 }
 
@@ -1374,23 +1498,23 @@ bool Query::parseSave(const std::vector<std::string>& tokens, size_t pos) {
 // coordinator that owns a StorageEngine -- the Query layer never touches disk.
 bool Query::parseImport(const std::vector<std::string>& tokens, size_t pos) {
     if (pos >= tokens.size() || toUpper(tokens[pos]) != "CSV") {
-        setError("IMPORT: expected CSV (syntax: IMPORT CSV '<path>')."); 
+        setError("IMPORT: expected CSV (syntax: IMPORT CSV '<path>').");
         return false;
     }
     ++pos;
-    if (pos >= tokens.size()) { 
-        setError("IMPORT CSV: expected a file path."); 
-    return false; 
+    if (pos >= tokens.size()) {
+        setError("IMPORT CSV: expected a file path.");
+        return false;
     }
     filePath_ = stripQuotes(tokens[pos]);
     ++pos;
-    if (filePath_.empty()) { 
-        setError("IMPORT CSV: file path cannot be empty."); 
-        return false; 
+    if (filePath_.empty()) {
+        setError("IMPORT CSV: file path cannot be empty.");
+        return false;
     }
-    if (pos != tokens.size()) { 
-        setError("IMPORT CSV: unexpected trailing tokens."); 
-        return false; 
+    if (pos != tokens.size()) {
+        setError("IMPORT CSV: unexpected trailing tokens.");
+        return false;
     }
     return true;
 }
@@ -1426,62 +1550,66 @@ static bool updateParseUInt(const std::string& token, uint64_t& out) {
     return true;
 }
 
-// nodeMatchesConditions: evaluate parsed WHERE conditions against one node.
-// Supports ID (=, !=), LABEL (=, !=), and property comparisons (all operators),
-// combined with AND.
-static bool nodeMatchesConditions(const Node& node, const std::vector<Condition>& conditions) {
-    for (const Condition& c : conditions) {
-        const std::string upper = updateUpper(c.property);
-        bool ok = false;
-        if (upper == "ID") {
-            uint64_t idVal = 0;
-            if (!updateParseUInt(c.value, idVal)) return false;
-            bool eq = (node.id == NodeId(idVal));
-            if (c.op == "=") ok = eq; else if (c.op == "!=") ok = !eq; else ok = false;
-        }
-        else if (upper == "LABEL") {
-            if (c.op == "=") ok = (node.label == c.value);
-            else if (c.op == "!=") ok = (node.label != c.value);
-            else ok = false;
-        }
-        else {
-            auto it = node.properties.find(c.property);
-            std::string actual = (it != node.properties.end()) ? it->second : "";
-            if (c.op == "=") ok = (actual == c.value);
-            else if (c.op == "!=") ok = (actual != c.value);
-            else if (c.op == "<") ok = (actual < c.value);
-            else if (c.op == ">") ok = (actual > c.value);
-            else if (c.op == "<=") ok = (actual <= c.value);
-            else if (c.op == ">=") ok = (actual >= c.value);
-            else ok = false;
-        }
-        if (!ok) return false;
+// testNodeCondition: does a single WHERE condition hold for this node?
+// Supports ID (=, !=), LABEL (=, !=), and property comparisons (all operators).
+static bool testNodeCondition(const Node& node, const Condition& c) {
+    const std::string upper = updateUpper(c.property);
+    if (upper == "ID") {
+        uint64_t idVal = 0;
+        if (!updateParseUInt(c.value, idVal)) return false;
+        bool eq = (node.id == NodeId(idVal));
+        if (c.op == "=") return eq;
+        if (c.op == "!=") return !eq;
+        return false;
     }
-    return true;
+    if (upper == "LABEL") {
+        if (c.op == "=") return (node.label == c.value);
+        if (c.op == "!=") return (node.label != c.value);
+        return false;
+    }
+    // property comparison (missing property is treated as the empty string)
+    auto it = node.properties.find(c.property);
+    std::string actual = (it != node.properties.end()) ? it->second : "";
+    if (c.op == "=") return (actual == c.value);
+    if (c.op == "!=") return (actual != c.value);
+    if (c.op == "<") return (actual < c.value);
+    if (c.op == ">") return (actual > c.value);
+    if (c.op == "<=") return (actual <= c.value);
+    if (c.op == ">=") return (actual >= c.value);
+    return false;
 }
 
-// edgeMatchesConditions: ID and LABEL (= / !=) for edges; properties never match.
-static bool edgeMatchesConditions(const Edge& edge, const std::vector<Condition>& conditions) {
-    for (const Condition& c : conditions) {
-        const std::string upper = updateUpper(c.property);
-        bool ok = false;
-        if (upper == "ID") {
-            uint64_t idVal = 0;
-            if (!updateParseUInt(c.value, idVal)) return false;
-            bool eq = (edge.id == EdgeId(idVal));
-            if (c.op == "=") ok = eq; else if (c.op == "!=") ok = !eq; else ok = false;
-        }
-        else if (upper == "LABEL") {
-            if (c.op == "=") ok = (edge.label == c.value);
-            else if (c.op == "!=") ok = (edge.label != c.value);
-            else ok = false;
-        }
-        else {
-            return false;
-        }
-        if (!ok) return false;
+// nodeMatchesConditions: evaluate parsed WHERE conditions against one node,
+// honouring AND/OR with SQL precedence (AND binds tighter than OR).
+static bool nodeMatchesConditions(const Node& node, const std::vector<Condition>& conditions) {
+    return evaluateConditions(conditions,
+        [&](const Condition& c) { return testNodeCondition(node, c); });
+}
+
+// testEdgeCondition: does a single WHERE condition hold for this edge?
+// Edges expose only ID and LABEL (= / !=); property conditions never match.
+static bool testEdgeCondition(const Edge& edge, const Condition& c) {
+    const std::string upper = updateUpper(c.property);
+    if (upper == "ID") {
+        uint64_t idVal = 0;
+        if (!updateParseUInt(c.value, idVal)) return false;
+        bool eq = (edge.id == EdgeId(idVal));
+        if (c.op == "=") return eq;
+        if (c.op == "!=") return !eq;
+        return false;
     }
-    return true;
+    if (upper == "LABEL") {
+        if (c.op == "=") return (edge.label == c.value);
+        if (c.op == "!=") return (edge.label != c.value);
+        return false;
+    }
+    return false;                                 // edges have no properties
+}
+
+// edgeMatchesConditions: AND/OR evaluation (SQL precedence) over edge conditions.
+static bool edgeMatchesConditions(const Edge& edge, const std::vector<Condition>& conditions) {
+    return evaluateConditions(conditions,
+        [&](const Condition& c) { return testEdgeCondition(edge, c); });
 }
 
 // executeUpdateNodes: apply SET assignments to every node matching WHERE.

@@ -189,6 +189,12 @@ static int test_query_layer_part1() {
         check("parse SELECT by id", q.parse("SELECT * FROM NODES WHERE ID = 1"));
         check("parse SELECT by label", q.parse("SELECT * FROM NODES WHERE LABEL = 'Person'"));
         check("parse SELECT with AND", q.parse("SELECT * FROM NODES WHERE LABEL = 'Person' AND age > 20"));
+        check("parse SELECT with OR", q.parse("SELECT * FROM NODES WHERE LABEL = 'Person' OR LABEL = 'City'"));
+        check("parse SELECT with AND + OR mix", q.parse("SELECT * FROM NODES WHERE LABEL = 'Person' AND age > '20' OR LABEL = 'City'"));
+        check("parse SELECT COUNT", q.parse("SELECT COUNT * FROM NODES WHERE LABEL = 'Person'") && q.isCount());
+        check("parse SELECT COUNT no WHERE", q.parse("SELECT COUNT * FROM NODES") && q.isCount());
+        check("parse SELECT (not count) reports isCount=false",
+            q.parse("SELECT * FROM NODES WHERE ID = 1") && !q.isCount());
         check("parse SELECT edges by from", q.parse("SELECT * FROM EDGES WHERE FROM = 1"));
         check("parse INSERT nodes", q.parse("INSERT INTO NODES (label, name) VALUES ('Person', 'Zed')"));
         check("parse INSERT edges", q.parse("INSERT INTO EDGES (from, to, label) VALUES (1, 2, 'KNOWS')"));
@@ -222,7 +228,12 @@ static int test_query_layer_part1() {
         check("reject MATCH KHOP without STEPS", !q.parse("MATCH KHOP FROM 1"));
         check("reject MATCH non-numeric source", !q.parse("MATCH REACHABLE FROM abc"));
         check("reject WHERE invalid operator", !q.parse("SELECT * FROM NODES WHERE ID ~ 1"));
-        check("reject WHERE OR (only AND)", !q.parse("SELECT * FROM NODES WHERE age > 20 OR age < 10"));
+        // OR is now supported, but an unknown connector (not AND/OR) is still rejected.
+        check("reject WHERE bad connector", !q.parse("SELECT * FROM NODES WHERE age > 20 XOR age < 10"));
+        // COUNT must be followed by '*'.
+        check("reject SELECT COUNT without star", !q.parse("SELECT COUNT name FROM NODES WHERE LABEL = 'Person'"));
+        // A WHERE-less non-count live SELECT is still rejected (index-driven path).
+        check("reject SELECT without WHERE (non-count)", !q.parse("SELECT * FROM NODES"));
         check("reject trailing tokens", !q.parse("MATCH REACHABLE FROM 1 EXTRA"));
     }
 
@@ -307,6 +318,95 @@ static int test_query_layer_part1() {
         r = q.run("SELECT * FROM EDGES WHERE FROM = 1 AND TO = 3", graph);
         check("select edges from + non-matching to: success", r.success);
         check("select edges from + non-matching to: 0 rows", r.edges.size() == 0);
+    }
+
+    // -----------------------------------------------------------------
+    // 2c. EXECUTION -- OR in WHERE
+    // -----------------------------------------------------------------
+    //
+    // OR routes to a full scan with boolean evaluation (SQL precedence: AND binds
+    // tighter than OR). Fixture: Alice (Person, age 30, id 1), Bob (Person, age
+    // 25, id 2), Sydney (City, id 3); edges KNOWS (id 1), LIVES_IN (id 2).
+    std::cout << "\n== Execute: OR in WHERE ==\n";
+    {
+        Graph graph;
+        buildQueryFixture(graph);
+        Query q;
+        QueryResult r;
+
+        // OR between two labels: Person (x2) OR City (x1) = all 3 nodes.
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' OR LABEL = 'City'", graph);
+        check("OR of two labels: success", r.success);
+        check("OR of two labels: 3 rows", r.nodes.size() == 3);
+
+        // OR between two ids: id 1 OR id 3 = Alice and Sydney.
+        r = q.run("SELECT * FROM NODES WHERE ID = 1 OR ID = 3", graph);
+        check("OR of two ids: 2 rows", r.success && r.nodes.size() == 2);
+
+        // OR reaching an un-anchored property: LABEL = 'City' (Sydney) OR age =
+        // '25' (Bob) = 2 rows. This is the case the old design forbade; it now
+        // works via the full-scan fallback.
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'City' OR age = '25'", graph);
+        check("OR label-or-property: success (full scan)", r.success);
+        check("OR label-or-property: 2 rows (Sydney, Bob)", r.nodes.size() == 2);
+
+        // SQL precedence: LABEL='Person' AND age='30' OR LABEL='City'
+        //   == (Person AND age30) OR City == Alice OR Sydney == 2 rows.
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND age = '30' OR LABEL = 'City'", graph);
+        check("precedence (A AND B) OR C: success", r.success);
+        check("precedence (A AND B) OR C: 2 rows (Alice, Sydney)", r.nodes.size() == 2);
+
+        // Contrast the same conditions with AND-only: Person AND age30 = just Alice.
+        r = q.run("SELECT * FROM NODES WHERE LABEL = 'Person' AND age = '30'", graph);
+        check("AND-only sanity: 1 row (Alice)", r.success && r.nodes.size() == 1);
+
+        // OR on edges: two edge labels = both edges.
+        r = q.run("SELECT * FROM EDGES WHERE LABEL = 'KNOWS' OR LABEL = 'LIVES_IN'", graph);
+        check("OR of two edge labels: 2 rows", r.success && r.edges.size() == 2);
+    }
+
+    // -----------------------------------------------------------------
+    // 2d. EXECUTION -- COUNT
+    // -----------------------------------------------------------------
+    //
+    // SELECT COUNT * reports the number of matching rows in the message
+    // ("Count: <n>") and returns NO rows in nodes/edges. Same fixture as above.
+    std::cout << "\n== Execute: SELECT COUNT ==\n";
+    {
+        Graph graph;
+        buildQueryFixture(graph);
+        Query q;
+        QueryResult r;
+
+        // COUNT with a label filter: 2 Person nodes.
+        r = q.run("SELECT COUNT * FROM NODES WHERE LABEL = 'Person'", graph);
+        check("count by label: success", r.success);
+        check("count by label: message 'Count: 2'", r.message == "Count: 2");
+        check("count by label: returns no rows", r.nodes.empty());
+
+        // COUNT with no WHERE: counts the whole graph (3 nodes).
+        r = q.run("SELECT COUNT * FROM NODES", graph);
+        check("count all nodes: 'Count: 3'", r.success && r.message == "Count: 3");
+
+        // COUNT with an OR filter: Person (2) OR City (1) = 3.
+        r = q.run("SELECT COUNT * FROM NODES WHERE LABEL = 'Person' OR LABEL = 'City'", graph);
+        check("count with OR: 'Count: 3'", r.success && r.message == "Count: 3");
+
+        // COUNT by single id: 1 match.
+        r = q.run("SELECT COUNT * FROM NODES WHERE ID = 1", graph);
+        check("count by id (hit): 'Count: 1'", r.success && r.message == "Count: 1");
+
+        // COUNT by a missing id: 0 matches, still a success.
+        r = q.run("SELECT COUNT * FROM NODES WHERE ID = 999", graph);
+        check("count by id (miss): 'Count: 0'", r.success && r.message == "Count: 0");
+
+        // COUNT edges by label: 1 KNOWS edge.
+        r = q.run("SELECT COUNT * FROM EDGES WHERE LABEL = 'KNOWS'", graph);
+        check("count edges by label: 'Count: 1'", r.success && r.message == "Count: 1");
+
+        // COUNT all edges: 2.
+        r = q.run("SELECT COUNT * FROM EDGES", graph);
+        check("count all edges: 'Count: 2'", r.success && r.message == "Count: 2");
     }
 
     // -----------------------------------------------------------------

@@ -11,6 +11,7 @@
 #include <sstream>
 #include <cstdio>
 #include <thread>
+#include <functional>
 #include <vector>
 #include <chrono>
 #include <atomic>
@@ -2123,7 +2124,479 @@ int test_graph_handler_concurrent() {
     return fail_count;
 }
 
-int run_tests() {
+// ============================================================================
+// test_graph_handler_robust_concurrency
+// ============================================================================
+// Turns the claim "GraphHandler is safe for multi-user concurrent access" into
+// evidence, rather than an assertion. It runs several stress scenarios against a
+// SINGLE shared handler -- each thread is a simulated user hammering the same
+// handler, which exercises the exact shared_mutex path a network server would.
+//
+// The scenarios, and what each proves:
+//   1. Disjoint-quota writers (data-corruption check). N threads each insert a
+//      fixed quota of nodes under a label unique to that thread. Afterwards the
+//      EXACT expected counts must hold -- any lost or torn write breaks the
+//      arithmetic. This is the corruption test; heavy oversubscription of threads
+//      maximises the odd interleavings where a locking bug would show.
+//   2. Concurrent readers during writes (torn-read check). While writers insert,
+//      readers query continuously and must never crash, never fail, and never see
+//      a malformed result.
+//   3. Snapshot lifecycle under contention (the most race-prone handler path).
+//      Threads create and release snapshots while writers mutate; every create
+//      must be released and the active count must return to zero.
+//   4. Multi-user session simulation (plausibility). A realistic number of
+//      threads each run a mixed read/write "session"; all must get valid results.
+//
+// Repetition matters: races are probabilistic, so the corruption scenario runs
+// many rounds. A single green run proves little; many green runs under heavy
+// oversubscription is real evidence. Build under a thread sanitizer to also catch
+// races that did not happen to manifest as a visible failure this run.
+// ============================================================================
+int test_graph_handler_robust_concurrency() {
+    std::cout << "\n== GraphHandler Robust Concurrency (stress) ==\n";
+
+    int pass_count = 0, fail_count = 0;
+    auto check = [&](const std::string& name, bool condition) {
+        std::cout << (condition ? "  [PASS] " : "  [FAIL] ") << name << "\n";
+        if (condition) ++pass_count; else ++fail_count;
+        };
+
+    // Scale thread counts to the machine. hardware_concurrency() may report 0 on
+    // some platforms, so fall back to a sane default.
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+
+    // ------------------------------------------------------------------------
+    // Scenario 1: disjoint-quota writers -> exact-count corruption check.
+    // Heavy oversubscription (many more threads than cores) to force contention.
+    // ------------------------------------------------------------------------
+    std::cout << "\n--- Scenario 1: Disjoint-quota concurrent writers (corruption) ---\n";
+    {
+        // Heavy oversubscription (writers >> cores) to force odd interleavings,
+        // repeated many rounds because races are probabilistic -- but bounded so
+        // total work stays reasonable on any machine. Tune up for a longer soak.
+        const int kRounds = 10;                 // repeat: races are probabilistic
+        const int kWriters = (int)hw * 8;       // heavy oversubscription
+        const int kQuota = 15;                  // nodes each writer inserts
+
+        bool allRoundsOk = true;
+        for (int round = 0; round < kRounds && allRoundsOk; ++round) {
+            // Fresh handler each round so the expected counts are exact.
+            auto handler = std::make_unique<GraphHandler>(std::make_unique<Graph>());
+
+            std::vector<std::thread> threads;
+            threads.reserve(kWriters);
+            for (int w = 0; w < kWriters; ++w) {
+                threads.emplace_back([&handler, w, kQuota]() {
+                    // Each writer uses a label only it uses: "W<w>". So the final
+                    // per-label counts are deterministic and independently checkable.
+                    const std::string label = "W" + std::to_string(w);
+                    for (int q = 0; q < kQuota; ++q) {
+                        handler->executeQueryLive(
+                            "INSERT INTO NODES (label, name) VALUES ('" + label +
+                            "', 'n" + std::to_string(q) + "')");
+                    }
+                    });
+            }
+            for (auto& t : threads) t.join();
+
+            // Total must be exactly writers * quota -- no lost/torn writes.
+            const size_t expectedTotal = (size_t)kWriters * kQuota;
+            if (handler->getNodeCount() != expectedTotal) {
+                allRoundsOk = false;
+                break;
+            }
+            // Every thread's label must have exactly its quota (spot-check a few,
+            // since checking all kWriters*rounds would dominate runtime). COUNT is
+            // the natural tool here.
+            for (int w = 0; w < kWriters; w += (kWriters / 8 + 1)) {
+                QueryResult r = handler->executeQueryLive(
+                    "SELECT COUNT * FROM NODES WHERE LABEL = 'W" + std::to_string(w) + "'");
+                if (!r.success || r.message != "Count: " + std::to_string(kQuota)) {
+                    allRoundsOk = false;
+                    break;
+                }
+            }
+        }
+        check("disjoint-quota writers: exact node totals over all rounds (no lost writes)",
+            allRoundsOk);
+    }
+
+    // ------------------------------------------------------------------------
+    // Scenario 2: concurrent readers during writes -> torn-read check.
+    // ------------------------------------------------------------------------
+    std::cout << "\n--- Scenario 2: Concurrent readers during writes (torn reads) ---\n";
+    {
+        auto handler = std::make_unique<GraphHandler>(std::make_unique<Graph>());
+        // Seed some data so readers have something to read.
+        for (int i = 0; i < 50; ++i) {
+            handler->executeQueryLive(
+                "INSERT INTO NODES (label, name) VALUES ('Seed', 'n" + std::to_string(i) + "')");
+        }
+
+        std::atomic<bool> stop(false);
+        std::atomic<bool> readerFault(false);   // set if a reader ever sees garbage
+        std::atomic<long> readCount(0);
+
+        const int kReaders = (int)hw * 4;
+        const int kWriters = (int)hw * 2;
+
+        std::vector<std::thread> threads;
+        // Readers: query continuously until told to stop; assert well-formedness.
+        // IMPORTANT: yield after each read. std::shared_mutex gives NO writer
+        // priority, so readers spinning with zero pause can starve the writers
+        // indefinitely -- especially when readers outnumber cores. A yield lets a
+        // waiting writer acquire the exclusive lock, so the finite writer work
+        // actually completes. (Writer starvation under unthrottled readers is a
+        // real shared_mutex property, not a handler bug; we simply don't let the
+        // test provoke a livelock.)
+        for (int i = 0; i < kReaders; ++i) {
+            threads.emplace_back([&]() {
+                while (!stop.load()) {
+                    QueryResult r =
+                        handler->executeQueryLive("SELECT * FROM NODES WHERE LABEL = 'Seed'");
+                    // A read must succeed and never return more Seed rows than exist
+                    // (50), nor a nonsense negative -- a torn read would violate this.
+                    if (!r.success || r.nodes.size() > 50) readerFault.store(true);
+                    readCount.fetch_add(1);
+                    std::this_thread::yield();   // give waiting writers a turn
+                }
+                });
+        }
+        // Writers: add non-Seed nodes (so the Seed count the readers check stays 50).
+        for (int i = 0; i < kWriters; ++i) {
+            threads.emplace_back([&, i]() {
+                for (int q = 0; q < 200; ++q) {
+                    handler->executeQueryLive(
+                        "INSERT INTO NODES (label, name) VALUES ('Other', 'w" +
+                        std::to_string(i) + "_" + std::to_string(q) + "')");
+                }
+                });
+        }
+        // Let writers finish, then stop readers.
+        // (Writers are the finite work; readers spin until stop.)
+        for (int i = kReaders; i < kReaders + kWriters; ++i) threads[i].join();
+        stop.store(true);
+        for (int i = 0; i < kReaders; ++i) threads[i].join();
+
+        check("readers never saw a torn/failed result during concurrent writes",
+            !readerFault.load());
+        check("readers actually ran (sanity: read count > 0)", readCount.load() > 0);
+    }
+
+    // ------------------------------------------------------------------------
+    // Scenario 3: snapshot lifecycle under contention.
+    // ------------------------------------------------------------------------
+    std::cout << "\n--- Scenario 3: Snapshot create/release under contention ---\n";
+    {
+        auto handler = std::make_unique<GraphHandler>(std::make_unique<Graph>());
+        for (int i = 0; i < 30; ++i) {
+            handler->executeQueryLive(
+                "INSERT INTO NODES (label, name) VALUES ('S', 'n" + std::to_string(i) + "')");
+        }
+
+        const int kSnapThreads = (int)hw * 4;
+        std::vector<std::thread> threads;
+        std::atomic<bool> fault(false);
+
+        // Each thread repeatedly creates then releases a snapshot. Every create is
+        // paired with its own release, so the active count must return to 0.
+        for (int i = 0; i < kSnapThreads; ++i) {
+            threads.emplace_back([&]() {
+                for (int r = 0; r < 20; ++r) {
+                    uint64_t id = handler->createSnapshot();
+                    if (id == 0) { fault.store(true); return; }
+                    // A snapshot read must not crash or fail.
+                    QueryResult q =
+                        handler->executeQuerySnapshot(id, "SELECT COUNT * FROM NODES SNAPSHOT");
+                    if (!q.success) fault.store(true);
+                    handler->releaseSnapshot(id);
+                }
+                });
+        }
+        // Meanwhile, a couple of writers mutate the live graph.
+        for (int i = 0; i < (int)hw; ++i) {
+            threads.emplace_back([&, i]() {
+                for (int q = 0; q < 50; ++q) {
+                    handler->executeQueryLive(
+                        "INSERT INTO NODES (label, name) VALUES ('S', 'x" +
+                        std::to_string(i) + "_" + std::to_string(q) + "')");
+                }
+                });
+        }
+        for (auto& t : threads) t.join();
+
+        check("snapshot create/release under contention: no fault", !fault.load());
+        check("all snapshots released, active count returned to 0",
+            handler->activeSnapshotCount() == 0);
+    }
+
+    // ------------------------------------------------------------------------
+    // Scenario 4: multi-user session plausibility.
+    // Moderate oversubscription; each thread is a "user" doing a mixed session.
+    // ------------------------------------------------------------------------
+    std::cout << "\n--- Scenario 4: Multi-user mixed sessions ---\n";
+    {
+        auto handler = std::make_unique<GraphHandler>(std::make_unique<Graph>());
+        const int kUsers = (int)hw * 3;         // realistic busy-team overlap
+        std::atomic<bool> sessionFault(false);
+
+        std::vector<std::thread> threads;
+        for (int u = 0; u < kUsers; ++u) {
+            threads.emplace_back([&, u]() {
+                const std::string label = "U" + std::to_string(u);
+                // A mixed session: a few inserts, a few reads, a count.
+                for (int i = 0; i < 10; ++i) {
+                    QueryResult ins = handler->executeQueryLive(
+                        "INSERT INTO NODES (label, name) VALUES ('" + label +
+                        "', 'n" + std::to_string(i) + "')");
+                    if (!ins.success) sessionFault.store(true);
+                }
+                QueryResult sel = handler->executeQueryLive(
+                    "SELECT * FROM NODES WHERE LABEL = '" + label + "'");
+                // Each user must see exactly its own 10 inserts (its label is unique).
+                if (!sel.success || sel.nodes.size() != 10) sessionFault.store(true);
+                QueryResult cnt = handler->executeQueryLive(
+                    "SELECT COUNT * FROM NODES WHERE LABEL = '" + label + "'");
+                if (!cnt.success || cnt.message != "Count: 10") sessionFault.store(true);
+                });
+        }
+        for (auto& t : threads) t.join();
+
+        check("every user session got correct, isolated results", !sessionFault.load());
+        check("total nodes == users * 10 (all sessions committed)",
+            handler->getNodeCount() == (size_t)kUsers * 10);
+    }
+
+    std::cout << "\n== Robust Concurrency Results ==\n";
+    std::cout << "Pass: " << pass_count << ", Fail: " << fail_count << "\n";
+    return fail_count;
+}
+
+// ============================================================================
+// test_graph_handler_performance
+// ============================================================================
+// Measures how GraphHandler performance SCALES WITH CPU CORES, separately for
+// reads, writes, and updates. Design choices that make the numbers trustworthy
+// on any machine (including a modest laptop):
+//
+//   * CORE-BOUNDED THREADS. Thread counts are swept 1..core-count and never past.
+//     Beyond core-count you measure the OS scheduler time-slicing threads onto
+//     cores that don't exist -- noise, not scaling. Every point at/below cores is
+//     a real parallelism measurement.
+//   * FIXED-TIME BUDGET (count ops done), not fixed op-count. Can never hang -- a
+//     slow config just completes fewer ops in the same window -- and it adapts to
+//     the hardware automatically.
+//   * SEPARATE PURE SWEEPS for READ / WRITE / UPDATE. Each op type is measured in
+//     isolation so its scaling curve is attributable to one lock path; a mixed
+//     workload would blur them.
+//   * SPEEDUP vs 1 thread is the headline metric (throughput_N / throughput_1).
+//     Dimensionless, so a slow laptop and a fast server compare directly: reads
+//     should scale toward the core count (shared locks run in parallel), writes
+//     and updates should stay ~1.0x (the exclusive lock serialises them -- flat
+//     is CORRECT and confirms the lock works). The 1-thread p50 is the
+//     uncontended per-op latency (raw cost of one operation).
+//   * STEADY STATE. Reads look up by id; write churn inserts+deletes; update edits
+//     in place -- graph size stays fixed, so work per op is constant no matter how
+//     long the run lasts. (An earlier version grew the graph via INSERT, which
+//     inflated later ops.)
+//
+// Parsing is INCLUDED in every measured op by design: executeQueryLive is the
+// real entry point, so this is END-TO-END COMMAND scaling. Parsing is lock-free
+// CPU that scales perfectly, so it lifts every curve somewhat toward linear -- a
+// flat-ish write curve reflects the exclusive lock under the parallel parse cost.
+//
+// Prints tables (a measurement, not pass/fail); gated behind test_performance,
+// returns 0.
+// ============================================================================
+int test_graph_handler_performance() {
+    std::cout << "\n== GraphHandler Performance (core scaling) ==\n";
+    // ------------------------------------------------------------------------
+    // Design (see also the block comment above):
+    //   * Threads swept 1..cores ONLY (past cores = scheduler noise, not scaling).
+    //   * Fixed-TIME budget per point (count ops done) -> never hangs, adapts to hw.
+    //   * SEPARATE pure sweeps for READ / WRITE / UPDATE so each lock path's curve
+    //     is attributable.
+    //   * SPEEDUP vs 1 thread is the headline: reads should climb toward core count
+    //     (shared lock, parallel), writes/updates should stay ~1.0x (exclusive lock
+    //     serialises -- flat is CORRECT). The 1-thread p50 is the uncontended cost.
+    //   * STEADY STATE: reads look up by id; the write churn inserts+deletes; update
+    //     edits in place -- graph size stays fixed so per-op work is constant.
+    //   * Parsing is included (executeQueryLive is the real entry point); it is
+    //     lock-free CPU, so it lifts every curve somewhat toward linear.
+    // ------------------------------------------------------------------------
+
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+
+    // Thread counts: 1, 2, 4, ... doubling, ALWAYS ending exactly at the core
+    // count. Never exceed cores.
+    std::vector<int> threadCounts;
+    for (int t = 1; t < (int)hw; t *= 2) threadCounts.push_back(t);
+    threadCounts.push_back((int)hw);
+
+    const double budgetSec = 1.5;              // timed window per point
+    const double warmupSec = 0.3;              // untimed warm-up per point
+    const int kSeed = 2000;                    // fixed benchmark graph size (ids 1..kSeed)
+
+    // Seed a fresh handler with kSeed labelled nodes and one pre-made snapshot.
+    auto makeSeededHandler = [&](uint64_t& snapIdOut) {
+        auto handler = std::make_unique<GraphHandler>(std::make_unique<Graph>());
+        for (int i = 0; i < kSeed; ++i) {
+            handler->executeQueryLive(
+                "INSERT INTO NODES (label, name, age) VALUES ('Bench', 'n" +
+                std::to_string(i) + "', '30')");
+        }
+        snapIdOut = handler->createSnapshot();  // snapshot reads target this id
+        return handler;
+        };
+
+    // Percentile helper (expects a sorted vector).
+    auto pct = [](std::vector<long>& sorted, double p) -> long {
+        if (sorted.empty()) return 0;
+        size_t idx = (size_t)(p * (sorted.size() - 1));
+        return sorted[idx];
+        };
+
+    // Run one op-type sweep. `doOp` performs exactly one operation of the type
+    // under test (parsing included). Prints a row per thread count with throughput,
+    // speedup-vs-1-thread, and latency percentiles.
+    auto sweepOpType = [&](const char* opName,
+        const std::function<void(GraphHandler&, uint64_t, int, long)>& doOp) {
+            std::cout << "\n--- " << opName << " ---\n";
+            std::cout << "  threads |    ops |  seconds |    ops/sec | speedup |  p50us |  p95us |  p99us\n";
+            std::cout << "  --------+--------+----------+------------+---------+--------+--------+-------\n";
+
+            double baseOpsPerSec = 0.0;         // 1-thread throughput, for speedup
+
+            for (int threads : threadCounts) {
+                uint64_t snapId = 0;
+                auto handler = makeSeededHandler(snapId);
+
+                std::atomic<bool> stop(false);
+                std::atomic<long> counter(0);   // unique op index across threads
+                std::atomic<long> completed(0);
+                std::vector<std::vector<long>> perThread(threads);
+
+                auto worker = [&](int tid) {
+                    std::vector<long>& lat = perThread[tid];
+                    long localDone = 0;
+                    while (!stop.load(std::memory_order_relaxed)) {
+                        long op = counter.fetch_add(1, std::memory_order_relaxed);
+                        auto t0 = std::chrono::steady_clock::now();
+                        doOp(*handler, snapId, tid, op);
+                        auto t1 = std::chrono::steady_clock::now();
+                        lat.push_back((long)std::chrono::duration_cast<
+                            std::chrono::microseconds>(t1 - t0).count());
+                        ++localDone;
+                    }
+                    completed.fetch_add(localDone, std::memory_order_relaxed);
+                    };
+
+                // Warm-up (untimed): let caches / allocations settle.
+                {
+                    std::vector<std::thread> wts;
+                    for (int t = 0; t < threads; ++t)
+                        wts.emplace_back([&]() {
+                        auto until = std::chrono::steady_clock::now() +
+                            std::chrono::duration<double>(warmupSec);
+                        long o = 0;
+                        while (std::chrono::steady_clock::now() < until)
+                            doOp(*handler, snapId, 0, o++);
+                            });
+                    for (auto& t : wts) t.join();
+                }
+
+                // Timed run: launch, sleep the budget, stop, join.
+                auto start = std::chrono::steady_clock::now();
+                std::vector<std::thread> ts;
+                for (int t = 0; t < threads; ++t) ts.emplace_back(worker, t);
+                std::this_thread::sleep_for(std::chrono::duration<double>(budgetSec));
+                stop.store(true, std::memory_order_relaxed);
+                for (auto& t : ts) t.join();
+                auto end = std::chrono::steady_clock::now();
+
+                double secs = std::chrono::duration<double>(end - start).count();
+                long ops = completed.load();
+                double opsPerSec = secs > 0 ? (double)ops / secs : 0.0;
+                if (threads == 1) baseOpsPerSec = opsPerSec;
+                double speedup = baseOpsPerSec > 0 ? opsPerSec / baseOpsPerSec : 0.0;
+
+                std::vector<long> lat;
+                for (auto& v : perThread) lat.insert(lat.end(), v.begin(), v.end());
+                std::sort(lat.begin(), lat.end());
+
+                std::printf("  %7d | %6ld | %8.3f | %10.0f | %6.2fx | %6ld | %6ld | %6ld\n",
+                    threads, ops, secs, opsPerSec, speedup,
+                    pct(lat, 0.50), pct(lat, 0.95), pct(lat, 0.99));
+            }
+        };
+
+    // READS -- shared lock; a deterministic variety by op index. Should scale.
+    sweepOpType("READ variety (shared lock -- should scale toward core count)",
+        [&](GraphHandler& h, uint64_t snapId, int, long op) {
+            int id = 1 + (int)(op % kSeed);
+            switch (op % 5) {
+            case 0:
+                h.executeQueryLive("SELECT * FROM NODES WHERE ID = " + std::to_string(id));
+                break;
+            case 1:
+                h.executeQueryLive("SELECT * FROM NODES WHERE LABEL = 'Bench'");
+                break;
+            case 2:
+                h.executeQueryLive("SELECT COUNT * FROM NODES WHERE LABEL = 'Bench'");
+                break;
+            case 3:
+                h.executeQueryLive("MATCH KHOP FROM " + std::to_string(id) + " STEPS 1");
+                break;
+            case 4:
+                h.executeQuerySnapshot(snapId,
+                    "SELECT * FROM NODES WHERE ID = " + std::to_string(id) + " SNAPSHOT");
+                break;
+            }
+        });
+
+    // WRITES -- INSERT then DELETE the same node by id, keeping the graph size
+    // constant (steady state) while exercising the exclusive-lock write path.
+    // Ids are sequential from 1, and the seed used ids 1..kSeed, so a fresh INSERT
+    // gets a new id; DELETE removes it right back. We recover that id from the
+    // handler's node count (which is kSeed while balanced, so the new node's id is
+    // the current max). To stay robust we delete by the name we just inserted via
+    // an id lookup is unavailable through the string API, so instead each op does
+    // an INSERT immediately followed by a DELETE of the highest id.
+    sweepOpType("WRITE: INSERT+DELETE churn (exclusive lock -- should stay ~1.0x)",
+        [&](GraphHandler& h, uint64_t, int tid, long op) {
+            std::string tag = "t" + std::to_string(tid) + "_" + std::to_string(op);
+            h.executeQueryLive(
+                "INSERT INTO NODES (label, name) VALUES ('Churn', '" + tag + "')");
+            // Delete by the current node count as id: ids are sequential from 1, so
+            // the just-inserted node has the largest id == current node count.
+            size_t topId = h.getNodeCount();
+            h.executeQueryLive("DELETE FROM NODES WHERE ID = " + std::to_string(topId));
+        });
+
+    // UPDATES -- edit an existing node in place by id. Exclusive lock, NO growth.
+    sweepOpType("UPDATE by id (exclusive lock, no growth -- should stay ~1.0x)",
+        [&](GraphHandler& h, uint64_t, int, long op) {
+            int id = 1 + (int)(op % kSeed);
+            h.executeQueryLive(
+                "UPDATE NODES WHERE ID = " + std::to_string(id) +
+                " SET age = '" + std::to_string(op % 100) + "'");
+        });
+
+    std::cout << "\nReading the results:\n"
+        << "  * READ speedup should climb toward the core count -- shared locks let\n"
+        << "    reads run in parallel. Flat reads would mean reads are serialised.\n"
+        << "  * WRITE and UPDATE speedup should stay near 1.0x -- the exclusive lock\n"
+        << "    serialises them, so more cores don't help. Flat here is CORRECT and\n"
+        << "    confirms the write lock works. (Lock-free parsing lifts these a little\n"
+        << "    above 1.0x -- that is the parallel parse cost, not the graph.)\n"
+        << "  * The 1-thread p50 is the uncontended per-op latency (raw op cost).\n";
+
+    return 0;   // a measurement, not a pass/fail
+}
+
+int run_tests(bool test_robustness = false, bool test_performance = false) {
     // test graph suite
     int fail = test_graph();
     if (fail != 0)
@@ -2143,6 +2616,20 @@ int run_tests() {
     fail = test_graph_handler_concurrent();
     if (fail != 0)
         return fail;
+
+    // test robustness (opt-in: heavy oversubscribed stress, several seconds)
+    if (test_robustness) {
+        fail = test_graph_handler_robust_concurrency();
+        if (fail != 0)
+            return fail;
+    }
+
+    // test performance (opt-in: throughput sweep; prints a table, returns 0)
+    if (test_performance) {
+        fail = test_graph_handler_performance();
+        if (fail != 0)
+            return fail;
+    }
 
     return fail;
 }

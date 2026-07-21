@@ -17,4 +17,10 @@ int test_storage_engine();
 // shared_mutex, snapshot isolation, and consistent concurrent reads.
 int test_graph_handler_concurrent();
 
-int run_tests();
+// Exercises GraphHandler to prove robust concurrency
+int test_graph_handler_robust_concurrency();
+
+// Exercises performnce testing on GraphHandler
+int test_graph_handler_performance();
+
+int run_tests(bool test_robustness, bool test_performance);

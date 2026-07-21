@@ -124,12 +124,6 @@ static int runCommandsFile(const CommandMode mode, const std::string& commandsFi
     return 0;
 }
 
-// testing purposes
-//int main() {
-//    int iErr = run_tests();
-//    return iErr;
-//}
-
 // print the usage/help text to stderr.
 static void printUsage(const char* exe) {
     std::cerr
@@ -142,6 +136,12 @@ static void printUsage(const char* exe) {
         << "  " << exe << " interactive\n"
         << "        Launch the desktop editor (Windows).\n";
 }
+
+// testing purposes
+//int main() {
+//    int iErr = run_tests(true, true);
+//    return iErr;
+//}
 
 int main(int argc, char* argv[]) {
     // Need at least a mode word.

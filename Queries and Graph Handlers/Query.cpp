@@ -5,10 +5,10 @@
 // statement does to make the control flow and data transformations easy to
 // understand.
 
-#include "Query.h"
-#include "BFS_Searcher.h"                      // Live MATCH traversals (LIVE mode)
-#include "CSR_Representation.h"                 // Point-in-time CSR snapshot type
-#include "CSR_Searcher.h"                       // Snapshot MATCH traversals (SNAPSHOT mode)
+#include "../Queries and Graph Handlers/Query.h"
+#include "../Graph and Searchers/BFS_Searcher.h"                      // Live MATCH traversals (LIVE mode)
+#include "../Graph and Searchers/CSR_Representation.h"                 // Point-in-time CSR snapshot type
+#include "../Graph and Searchers/CSR_Searcher.h"                       // Snapshot MATCH traversals (SNAPSHOT mode)
 
 #include <algorithm>                            // std::transform, std::find
 #include <cctype>                               // std::toupper, std::isspace, std::isdigit

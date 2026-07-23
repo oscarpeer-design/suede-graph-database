@@ -5,9 +5,9 @@
 #include <unordered_map>
 #include <cstdint>
 
-#include "Graph.h"         // Node, Edge, propertiesMap, Graph API
-#include "Types.h"         // NodeId, EdgeId, EdgeDirection, CSR_Mode
-#include "ErrorCodes.h"    // operationSuccessful
+#include "../Graph and Searchers/Graph.h"         // Node, Edge, propertiesMap, Graph API
+#include "../Graph and Searchers/Types.h"         // NodeId, EdgeId, EdgeDirection, CSR_Mode
+#include "../Graph and Searchers/ErrorCodes.h"    // operationSuccessful
 
 // Forward declaration: the CSR snapshot type used to back SNAPSHOT-mode MATCH
 // traversals. Only a reference/pointer is needed here, so the full definition

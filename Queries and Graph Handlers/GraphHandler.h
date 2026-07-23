@@ -6,10 +6,10 @@
 #include <unordered_map>
 #include <cstdint>
 
-#include "Graph.h"
-#include "CSR_Representation.h"
-#include "StorageEngine.h"
-#include "Query.h"
+#include "../Graph and Searchers/Graph.h"
+#include "../Graph and Searchers/CSR_Representation.h"
+#include "../Storage/StorageEngine.h"
+#include "../Queries and Graph Handlers/Query.h"
 
 // commandType 
 // This is separate from query type because queries handle execution and this matches parsing strategy

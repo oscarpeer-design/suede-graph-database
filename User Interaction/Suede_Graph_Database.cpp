@@ -11,19 +11,19 @@
 #include <cctype>     // std::tolower
 
 // Included header files
-#include "Types.h"
-#include "ErrorCodes.h"
-#include "Graph.h"
-#include "BFS_Searcher.h"
-#include "CSR_Representation.h"
-#include "CSR_Searcher.h"
-#include "Query.h"
-#include "GraphHandler.h"
-#include "FileHandling.h"
-#include "InteractiveApp.h"   // runInteractive() : the entire GUI behind one call
+#include "../Graph and Searchers/Types.h"
+#include "../Graph and Searchers/ErrorCodes.h"
+#include "../Graph and Searchers/Graph.h"
+#include "../Graph and Searchers/BFS_Searcher.h"
+#include "../Graph and Searchers/CSR_Representation.h"
+#include "../Graph and Searchers/CSR_Searcher.h"
+#include "../Queries and Graph Handlers/Query.h"
+#include "../Queries and Graph Handlers/GraphHandler.h"
+#include "../Storage/FileHandling.h"
+#include "../User Interaction/InteractiveApp.h"   // runInteractive() : the entire GUI behind one call
 
 // test file
-#include "test_graph_suite.h"
+#include "../Tests/test_graph_suite.h"
 
 // command modes
 enum CommandMode {

@@ -1,10 +1,10 @@
 #include "test_graph_suite.h"
 
-#include "Graph.h"
-#include "Query.h"
-#include "StorageEngine.h"
-#include "CSR_Representation.h"
-#include "GraphHandler.h"
+#include "../Graph and Searchers/Graph.h"
+#include "../Queries and Graph Handlers/Query.h"
+#include "../Storage/StorageEngine.h"
+#include "../Graph and Searchers/CSR_Representation.h"
+#include "../Queries and Graph Handlers/GraphHandler.h"
 #include <iostream>
 #include <cassert>
 #include <fstream>

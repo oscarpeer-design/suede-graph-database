@@ -27,47 +27,129 @@ bool StorageEngine::ValidateGraph(const Graph& graph)
     return true;
 }
 
-// Load Graph into memory
+// Load Graph into memory.
+//
+// The load funnel, cheapest gate first, so a corrupt file dies early and cheap:
+//   1. magic + version           (ReadHeader)          -- is this even our format?
+//   2. streaming bounds-checks   (ReadNodes/ReadEdges) -- every length/index sane?
+//   3. CRC32 trailer             (verified below)      -- bytes intact since save?
+//   4. count match               (ValidateGraph)       -- reconstructed == header?
+//
+// CRITICAL: we reconstruct into a TEMPORARY graph and only swap it into the
+// caller's `graph` if EVERY gate passes. A rejected load therefore leaves the
+// caller's existing in-memory graph completely untouched -- a bad file can never
+// wipe good data. (The old code reconstructed directly into `graph`, so a load
+// that failed halfway left it half-built.)
 bool StorageEngine::Load(Graph& graph)
 {
     // open graph file for reading
     if (!OpenInputFile())
         return false;
 
-    // From here the file is OPEN: every exit path must close it. Previously only
-    // the success path called CloseInputFile(), so a failed load (e.g. a bad or
-    // wrong-format header) left the shared graphFile stream open with its error
-    // bits set -- and a subsequent Save could not re-open it, making the file
-    // permanently un-writable for the rest of the session. `ok` + a single close
-    // at the end guarantees the handle is always released.
-    bool ok = ReadHeader()      // verify file header
-        && ReadNodes(graph)     // reconstruct nodes
-        && ReadEdges(graph)     // reconstruct edges
-        && ValidateGraph(graph); // verify graph integrity
+    // Set up the payload byte budget: total file size, minus the header, minus
+    // the 4-byte CRC trailer. Every read is bounds-checked against this so a
+    // corrupt length can't over-read or over-allocate.
+    graphFile.seekg(0, std::ios::end);
+    std::streamoff fileSize = graphFile.tellg();
+    graphFile.seekg(0, std::ios::beg);
+    const std::streamoff overhead =
+        (std::streamoff)sizeof(FileHeader) + (std::streamoff)sizeof(uint32_t);
+    if (fileSize < overhead) { CloseInputFile(); return false; }  // too small to be valid
+    payloadRemaining = (uint64_t)(fileSize - overhead);
 
-    // Always close, whether we succeeded or failed.
+    // Fresh CRC accumulator for this read pass.
+    crc = 0xFFFFFFFFu;
+
+    // Reconstruct into a TEMP graph; the caller's graph is untouched until success.
+    Graph temp;
+    bool ok = ReadHeader()          // gate 1: magic + version (raw, not CRC'd)
+        && ReadNodes(temp)          // gate 2a: nodes, bounds-checked, CRC folded
+        && ReadEdges(temp);         // gate 2b: edges, bounds-checked, CRC folded
+
+    // gate 3: after the payload, the remaining bytes must be exactly the 4-byte
+    // trailer, and our recomputed CRC must equal it. `payloadRemaining` should be
+    // 0 here (we consumed exactly the payload); anything else means a size mismatch.
+    if (ok) {
+        if (payloadRemaining != 0) {           // payload didn't line up with the file
+            ok = false;
+        }
+        else {
+            uint32_t storedCrc = 0;
+            graphFile.read(reinterpret_cast<char*>(&storedCrc), sizeof(storedCrc));
+            uint32_t computed = crc ^ 0xFFFFFFFFu;   // finalise
+            if (!graphFile.good() || computed != storedCrc)
+                ok = false;                     // truncated trailer or CRC mismatch
+        }
+    }
+
+    // gate 4: reconstructed counts match the header's promise.
+    if (ok) 
+        ok = ValidateGraph(temp);
+
+    // Always close the input, whether we succeeded or failed.
     CloseInputFile();
 
+    // Only on FULL success do we hand the reconstructed graph to the caller.
+    if (ok) 
+        graph = std::move(temp);
     return ok;
 }
 
-// save Graph
+// save Graph -- ATOMIC. Never overwrites the target file in place; instead it
+// writes the whole thing to a sibling temp file, and only once that has fully
+// succeeded (data + CRC trailer flushed) does it RENAME the temp over the target.
+// The rename is atomic on the filesystem, so at every instant the target file is
+// either the complete OLD graph or the complete NEW graph -- never a half-written
+// mixture. If anything fails before the rename, the target is left UNTOUCHED and
+// the temp is discarded, so a failed flush can never destroy existing good data.
 bool StorageEngine::Save(const Graph& graph)
 {
-    // open graph file for writing
-    if (!OpenOutputFile())
-        return false;
+    const std::string finalPath = graphFilePath;
+    const std::string tempPath = TempPath();
 
-    // As with Load: the file is open now, so close on EVERY exit path. A failed
-    // write otherwise leaked the handle and blocked all later saves/loads.
-    bool ok = WriteHeader(graph)  // write file header
-        && WriteNodes(graph)      // write every node
-        && WriteEdges(graph);     // write every edge
+    // Write to the TEMP path (retarget the Open helpers by swapping graphFilePath).
+    graphFilePath = tempPath;
 
-    // Always flush and close, whether we succeeded or failed.
+    if (!OpenOutputFile()) { graphFilePath = finalPath; return false; }
+
+    // Fresh CRC accumulator for the payload (header is not part of the CRC).
+    crc = 0xFFFFFFFFu;
+
+    bool ok = WriteHeader(graph)    // header (raw, outside the CRC)
+        && WriteNodes(graph)        // nodes (CRC folded via crcWrite)
+        && WriteEdges(graph);       // edges (CRC folded via crcWrite)
+
+    // Append the 4-byte CRC trailer over the payload just written.
+    if (ok) {
+        uint32_t finalCrc = crc ^ 0xFFFFFFFFu;   // finalise
+        graphFile.write(reinterpret_cast<const char*>(&finalCrc), sizeof(finalCrc));
+        ok = graphFile.good();
+    }
+
+    // Flush + close the temp file so the bytes are committed before the rename.
     CloseOutputFile();
 
-    return ok;
+    // Restore the engine's real target path regardless of outcome.
+    graphFilePath = finalPath;
+
+    if (!ok) {
+        // Writing the temp failed: discard it and leave the target untouched.
+        std::remove(tempPath.c_str());
+        return false;
+    }
+
+    // Atomic swap: temp -> target. std::rename replaces the destination on POSIX;
+    // on Windows, replacing an existing file needs a remove-then-rename (std::rename
+    // fails if the destination exists). We try the direct rename first and fall back.
+    if (std::rename(tempPath.c_str(), finalPath.c_str()) != 0) {
+        // Windows / destination-exists path: remove the old target, then rename.
+        std::remove(finalPath.c_str());
+        if (std::rename(tempPath.c_str(), finalPath.c_str()) != 0) {
+            std::remove(tempPath.c_str());   // give up cleanly; temp not left behind
+            return false;
+        }
+    }
+    return true;
 }
 
 // Load the live graph from an explicit runtime-chosen path.

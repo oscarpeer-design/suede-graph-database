@@ -4,15 +4,22 @@
 #include <fstream>
 #include <cstring>
 #include <sstream>
+#include <cstdio>       // std::remove / std::rename for the atomic temp swap
 
-#include "ErrorCodes.h"
-#include "Types.h"
-#include "Graph.h"
-#include "CSR_Representation.h"
+#include "../Graph and Searchers/ErrorCodes.h"
+#include "../Graph and Searchers/Types.h"
+#include "../Graph and Searchers/Graph.h"
+#include "../Graph and Searchers/CSR_Representation.h"
+#include "../Storage/Crc32.h"      // integrity checksum for corruption detection
 
-// constant expressions for File header and version
+// constant expressions for File header and version.
+// FILE_VERSION is bumped to 2: the format now ends with a CRC32 TRAILER over the
+// whole payload (everything written after the header). A version-1 file has no
+// trailer; Load rejects it (there is no forward-compat requirement here -- old
+// files are re-savable). If you must read old files, special-case version 1 to
+// skip the CRC check.
 static constexpr char FILE_MAGIC[8] = "GRAPHDB";
-static constexpr uint32_t FILE_VERSION = 1;
+static constexpr uint32_t FILE_VERSION = 2;
 
 // File Header Format
 struct FileHeader
@@ -50,6 +57,42 @@ private:
 
 	// lookup NodeId to index
 	std::unordered_map<NodeId, size_t> nodeIndex;
+
+	// ---- integrity (CRC) + safe-write state -----------------------------
+	// Running CRC over the payload. On SAVE it is folded as each payload byte is
+	// written; on LOAD it is folded as each payload byte is read, then compared
+	// against the trailer. Initialised to 0xFFFFFFFF at the start of each pass.
+	uint32_t crc = 0xFFFFFFFFu;
+
+	// Bytes of PAYLOAD remaining to be read on load (total file size minus the
+	// header minus the 4-byte trailer). Every read helper decrements this and,
+	// before trusting an on-disk length/count, checks it against this bound so a
+	// corrupt length can never trigger a huge allocation or read past end-of-file.
+	uint64_t payloadRemaining = 0;
+
+	// The temp path we write to before the atomic rename (graphFilePath + ".tmp").
+	std::string TempPath() const { return graphFilePath + ".tmp"; }
+
+	// crcRead / crcWrite: a stream read/write that ALSO folds the bytes into `crc`
+	// and (on read) decrements payloadRemaining. Using these instead of raw
+	// graphFile.read/write keeps the running checksum correct without a separate
+	// pass, and gives every read a single choke point for the bounds check.
+	bool crcWrite(const void* data, size_t len) {
+		graphFile.write(reinterpret_cast<const char*>(data), len);
+		if (!graphFile.good()) return false;
+		crc = crc32Update(crc, data, len);
+		return true;
+	}
+	// Read `len` bytes into `data`, folding them into the CRC. Fails if fewer than
+	// `len` payload bytes remain (bounds check) or the stream read fails.
+	bool crcRead(void* data, size_t len) {
+		if (len > payloadRemaining) return false;   // would read past the payload
+		graphFile.read(reinterpret_cast<char*>(data), len);
+		if (!graphFile.good()) return false;
+		crc = crc32Update(crc, data, len);
+		payloadRemaining -= len;
+		return true;
+	}
 
 	// N.B. Production Graph Databases hold nodes and edges in two CSV Files when exporting to CSV format
 
@@ -178,7 +221,8 @@ private:
 	}
 
 	// WriteNodes
-	// writes every node in insertion order
+	// writes every node in insertion order. All writes go through crcWrite so the
+	// running payload CRC is accumulated as we stream (no separate pass needed).
 	bool WriteNodes(const Graph& graph)
 	{
 		// get node insertion order
@@ -191,42 +235,55 @@ private:
 			Node node;
 			if (!graph.GetNode(nodeId, node))
 				return false;
-			// write label length
+			// write label length + label
 			uint64_t labelLength = node.label.size();
-			graphFile.write(reinterpret_cast<const char*>(&labelLength),
-				sizeof(labelLength));
-			// write label
-			graphFile.write(node.label.data(),
-				labelLength);
+			if (!crcWrite(&labelLength, sizeof(labelLength))) return false;
+			if (!crcWrite(node.label.data(), labelLength)) return false;
 			// write property count
 			uint64_t propertyCount = node.properties.size();
-			graphFile.write(reinterpret_cast<const char*>(&propertyCount),
-				sizeof(propertyCount));
-			// write every property
+			if (!crcWrite(&propertyCount, sizeof(propertyCount))) return false;
+			// write every property (key length + key, value length + value)
 			for (const auto& property : node.properties)
 			{
-				// key
 				uint64_t keyLength = property.first.size();
-				graphFile.write(reinterpret_cast<const char*>(&keyLength),
-					sizeof(keyLength));
-				graphFile.write(property.first.data(),
-					keyLength);
-				// value
+				if (!crcWrite(&keyLength, sizeof(keyLength))) return false;
+				if (!crcWrite(property.first.data(), keyLength)) return false;
 				uint64_t valueLength = property.second.size();
-
-				graphFile.write(reinterpret_cast<const char*>(&valueLength),
-					sizeof(valueLength));
-
-				graphFile.write(property.second.data(),
-					valueLength);
+				if (!crcWrite(&valueLength, sizeof(valueLength))) return false;
+				if (!crcWrite(property.second.data(), valueLength)) return false;
 			}
 		}
 
 		return graphFile.good();
 	}
 
+	// ReadString
+	// Read a length-prefixed string: an 8-byte length, then that many bytes. The
+	// length is bounds-checked against payloadRemaining BEFORE allocating, so a
+	// corrupt length (e.g. 4 billion) can never trigger a huge allocation or a read
+	// past end-of-file -- it just fails the load cleanly. crcRead folds every byte
+	// into the running CRC and decrements payloadRemaining.
+	bool ReadString(std::string& out)
+	{
+		// read 8-byte string to check for corruption
+		uint64_t len;
+		// reads + bounds-checks the 8 bytes
+		if (!crcRead(&len, sizeof(len))) 
+			return false;  
+		// string can't fit in what's left
+		if (len > payloadRemaining) 
+			return false;   
+		// check we can actually read the bits
+		out.assign((size_t)len, '\0');
+		if (len > 0 && !crcRead(&out[0], (size_t)len)) 
+			return false;
+		return true;
+	}
+
 	// ReadNodes
-	// reconstruct all nodes from disk
+	// reconstruct all nodes from disk. All reads go through crcRead / ReadString,
+	// which fold bytes into the CRC and reject implausible lengths before they can
+	// cause a huge allocation.
 	bool ReadNodes(Graph& graph)
 	{
 		// clear previous lookup
@@ -235,44 +292,31 @@ private:
 		// read every node
 		for (size_t i = 0; i < nodeCount; ++i)
 		{
-			// read label
-			uint64_t labelLength;
+			// read label (length-prefixed, bounds-checked)
+			std::string label;
+			if (!ReadString(label)) return false;
 
-			graphFile.read(reinterpret_cast<char*>(&labelLength),
-				sizeof(labelLength));
-
-			std::string label(labelLength, '\0');
-
-			graphFile.read(&label[0], labelLength);
-
-			// read properties
+			// read property count, then bounds-check it: each property needs at
+			// least 16 bytes (two 8-byte length prefixes), so a propertyCount larger
+			// than payloadRemaining/16 is impossible and rejected before we loop.
 			uint64_t propertyCount;
-
-			graphFile.read(reinterpret_cast<char*>(&propertyCount), sizeof(propertyCount));
+			if (!crcRead(&propertyCount, sizeof(propertyCount))) return false;
+			if (propertyCount > payloadRemaining / 16) return false;
 
 			propertiesMap properties;
-
-			for (size_t j = 0; j < propertyCount; ++j)
+			for (uint64_t j = 0; j < propertyCount; ++j)
 			{
-				uint64_t keyLength;
-				graphFile.read(reinterpret_cast<char*>(&keyLength), sizeof(keyLength));
-
-				std::string key(keyLength, '\0');
-				graphFile.read(&key[0], keyLength);
-
-				uint64_t valueLength;
-				graphFile.read(reinterpret_cast<char*>(&valueLength),
-					sizeof(valueLength));
-
-				std::string value(valueLength, '\0');
-				graphFile.read(&value[0], valueLength);
-
+				std::string key, value;
+				// validate properties
+				if (!ReadString(key)) 
+					return false;
+				if (!ReadString(value)) 
+					return false;
 				properties[key] = value;
 			}
 
 			// create node
-			NodeId id = graph.CreateNode(label,
-				std::move(properties));
+			NodeId id = graph.CreateNode(label, std::move(properties));
 
 			// remember generated id
 			loadedNodes.push_back(id);
@@ -282,7 +326,9 @@ private:
 	}
 
 	// ReadEdges
-	// reconstruct every edge from the graph file
+	// reconstruct every edge from the graph file. Reads via crcRead / ReadString
+	// (CRC + bounds-checked); the endpoint indices are additionally checked against
+	// the number of nodes actually loaded, exactly as before.
 	bool ReadEdges(Graph& graph)
 	{
 		// warning from Graph operations
@@ -291,26 +337,16 @@ private:
 		// reconstruct every edge
 		for (size_t i = 0; i < edgeCount; i++)
 		{
-			// read source node index
-			size_t fromIndex;
-			graphFile.read(reinterpret_cast<char*>(&fromIndex),
-				sizeof(fromIndex));
+			// read source + destination node indices (CRC + bounds-checked reads)
+			size_t fromIndex, toIndex;
+			if (!crcRead(&fromIndex, sizeof(fromIndex))) return false;
+			if (!crcRead(&toIndex, sizeof(toIndex))) return false;
 
-			// read destination node index
-			size_t toIndex;
-			graphFile.read(reinterpret_cast<char*>(&toIndex),
-				sizeof(toIndex));
+			// read edge label (length-prefixed, bounds-checked before allocation)
+			std::string label;
+			if (!ReadString(label)) return false;
 
-			// read edge label length
-			uint64_t labelLength;
-			graphFile.read(reinterpret_cast<char*>(&labelLength),
-				sizeof(labelLength));
-
-			// read edge label
-			std::string label(labelLength, '\0');
-			graphFile.read(&label[0], labelLength);
-
-			// ensure indices are valid
+			// ensure indices reference nodes that were actually loaded
 			if (fromIndex >= loadedNodes.size() ||
 				toIndex >= loadedNodes.size())
 			{
@@ -355,7 +391,7 @@ private:
 		std::vector<EdgeId> edgeIds;
 		graph.GetAllEdgeIds(edgeIds);
 
-		// write every edge
+		// write every edge (all through crcWrite to fold into the payload CRC)
 		for (EdgeId edgeId : edgeIds)
 		{
 			Edge edge;
@@ -369,20 +405,13 @@ private:
 			size_t toIndex = nodeIndex.at(edge.to);
 
 			// write indices
-			graphFile.write(reinterpret_cast<const char*>(&fromIndex),
-				sizeof(fromIndex));
-
-			graphFile.write(reinterpret_cast<const char*>(&toIndex),
-				sizeof(toIndex));
+			if (!crcWrite(&fromIndex, sizeof(fromIndex))) return false;
+			if (!crcWrite(&toIndex, sizeof(toIndex))) return false;
 
 			// write label length + label contents
 			uint64_t labelLength = edge.label.size();
-
-			graphFile.write(reinterpret_cast<const char*>(&labelLength),
-				sizeof(labelLength));
-
-			graphFile.write(edge.label.data(),
-				labelLength);
+			if (!crcWrite(&labelLength, sizeof(labelLength))) return false;
+			if (!crcWrite(edge.label.data(), labelLength)) return false;
 		}
 
 		return graphFile.good();

@@ -58,9 +58,9 @@
 #include <utility>
 #include <cstring>            // std::memcmp for the graph-magic file check
 
-#include "Graph.h"
-#include "GraphHandler.h"
-#include "StorageEngine.h"
+#include "../Graph and Searchers/Graph.h"
+#include "../Queries and Graph Handlers/GraphHandler.h"
+#include "../Storage/StorageEngine.h"
 
 // ---------------------------------------------------------------------------
 // Identifiers and layout constants

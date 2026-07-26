@@ -21,6 +21,7 @@
 #include "../Queries and Graph Handlers/GraphHandler.h"
 #include "../Storage/FileHandling.h"
 #include "../User Interaction/InteractiveApp.h"   // runInteractive() : the entire GUI behind one call
+#include "../Server/UseServer.h"
 
 // test file
 #include "../Tests/test_graph_suite.h"
@@ -30,10 +31,11 @@ enum CommandMode {
     DEBUG,
     INTERACTIVE,
     BATCH,
+    SERVER,
     UNKNOWN
 };
 
-const std::unordered_map<std::string, CommandMode> modes = { {"batch", BATCH}, {"interactive", INTERACTIVE}, {"debug", DEBUG}};
+const std::unordered_map<std::string, CommandMode> modes = { {"batch", BATCH}, {"interactive", INTERACTIVE}, {"debug", DEBUG}, {"server", SERVER}};
 
 // get commands mode
 static CommandMode getMode(std::string sMode) {
@@ -134,7 +136,9 @@ static void printUsage(const char* exe) {
         << "  " << exe << " debug\n"
         << "        Interactive console: prompts for a commands file, then runs it.\n"
         << "  " << exe << " interactive\n"
-        << "        Launch the desktop editor (Windows).\n";
+        << "        Launch the desktop editor (Windows).\n"
+        << "  " << exe << " server\n"
+        << "        Launch the REST server on localhost:8080.\n";
 }
 
 // testing purposes
@@ -182,6 +186,18 @@ int main(int argc, char* argv[]) {
         // Launch the desktop UI -- the entire GUI (handler, window, event
         // loop) lives behind this one call.
         return runInteractive(argc, argv);
+    case SERVER: 
+    {
+        // Launch the REST server. Localhost-only on port 8080 by default; the
+        // locals are scoped to this case since no other mode uses them.
+        int port = 8080;
+        bool use_public = false;   // true = bind 0.0.0.0 (reachable on the network)
+        std::string err;
+        int rc = runSuedeServer(port, err, use_public);
+        if (!err.empty())
+            std::cerr << "Server error: " << err << "\n";
+        return rc;
+    }
     default:
         // unknown mode called
         std::cerr << "Unknown mode: " << sMode << "\n\n";

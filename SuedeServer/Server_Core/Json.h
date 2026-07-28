@@ -2,10 +2,10 @@
 
 // Vendored single-header JSON library (nlohmann). If your local filename differs,
 // adjust this include only - nothing else references the library directly.
-#include "../Server/nlohmann_json.hpp"
-#include "../Server/http_simple.h"
-#include "../Queries and Graph Handlers/Query.h"
-#include "../Graph and Searchers/Graph.h"
+#include "nlohmann_json.hpp"
+#include "http_simple.h"
+#include "../../Queries and Graph Handlers/GraphHandler.h"
+#include "../../Graph and Searchers/Graph.h"
 
 #include <string>
 

@@ -2,10 +2,10 @@
 // This is the ONLY translation unit that sees all three layers.
 
 #include "UseServer.h"
-#include "../Server/http_simple.h"
-#include "../Server/Json.h"
-#include "../Queries and Graph Handlers/GraphHandler.h"
-#include "../Graph and Searchers/Graph.h"
+#include "http_simple.h"
+#include "Json.h"
+#include "../../Queries and Graph Handlers/GraphHandler.h"
+#include "../../Graph and Searchers/Graph.h"
 
 #include <memory>
 #include <functional>   // std::bind, std::ref, std::placeholders

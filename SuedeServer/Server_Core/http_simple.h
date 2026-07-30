@@ -8,10 +8,80 @@
 #include <thread>
 #include <sstream>   // for stringstream
 #include <cctype>    // for std::tolower
-#include <winsock2.h>
-#include <ws2tcpip.h>   // for inet_pton, getaddrinfo, and the newer address helpers
+#include <cstring>   // for std::strerror
+#include <cstdint>
 
+// ---------------------------------------------------------------------------
+// Cross-platform socket compatibility shim.
+//
+// Everything below this block is plain sockets logic that is identical on every
+// platform. The ONLY thing that actually differs between Windows (Winsock) and
+// POSIX (Linux/macOS/BSD) is a handful of primitives: the socket handle type,
+// the "invalid"/"error" sentinels, how you close a socket, how you start/stop
+// the networking subsystem, and the type of a byte count returned by recv/send.
+// We paper over exactly those here so the rest of the file compiles unchanged on
+// both. No functional change on Windows -- the _WIN32 branch maps straight back
+// onto the original Winsock calls (winsock2.h, ws2_32.lib, closesocket, WSA*).
+// ---------------------------------------------------------------------------
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>   // inet_pton, getaddrinfo, and the newer address helpers
 #pragma comment(lib, "ws2_32.lib")   // link the Winsock library (MSVC)
+
+// On Windows a socket is an opaque SOCKET (unsigned); the sentinels are macros.
+using socket_t = SOCKET;
+using sockopt_len_t = int;                 // setsockopt/getsockopt length type
+using recv_len_t = int;                    // recv/send return an int here
+// INVALID_SOCKET / SOCKET_ERROR come from <winsock2.h> as-is.
+
+// Close a socket handle.
+inline int closeSocket(socket_t s) { return closesocket(s); }
+
+// setsockopt on Windows wants (const char*); POSIX wants (const void*). This
+// wrapper hides the cast so call sites are identical on both platforms.
+inline int setSocketOption(socket_t s, int level, int name,
+    const void* val, sockopt_len_t len) {
+    return setsockopt(s, level, name, reinterpret_cast<const char*>(val), len);
+}
+
+// Last socket error, as a human-readable string (for `err` messages).
+inline std::string socketErrorString() {
+    return "winsock error " + std::to_string(WSAGetLastError());
+}
+#else
+    // POSIX headers for sockets, address helpers, close(), and errno.
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>   // inet_pton, htons/htonl
+#include <netdb.h>       // getaddrinfo
+#include <unistd.h>      // close()
+#include <cerrno>
+
+// On POSIX a socket is just an int fd; there are no INVALID_SOCKET /
+// SOCKET_ERROR macros, so we define our own with the standard POSIX values
+// (a failed socket()/accept() returns -1; a failed syscall returns -1).
+using socket_t = int;
+using sockopt_len_t = socklen_t;
+using recv_len_t = ssize_t;                // recv/send return ssize_t here
+
+#ifndef INVALID_SOCKET
+#define INVALID_SOCKET (-1)
+#endif
+#ifndef SOCKET_ERROR
+#define SOCKET_ERROR   (-1)
+#endif
+
+inline int closeSocket(socket_t s) { return ::close(s); }
+
+inline int setSocketOption(socket_t s, int level, int name,
+    const void* val, sockopt_len_t len) {
+    return setsockopt(s, level, name, val, len);
+}
+
+inline std::string socketErrorString() {
+    return std::strerror(errno);
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // HTTP status codes.
@@ -76,8 +146,14 @@ inline std::string statusText(const int code) {
 }
 
 // ---------------------------------------------------------------------------
-// Winsock lifecycle
+// Networking lifecycle
+//
+// Windows requires WSAStartup/WSACleanup to bring the Winsock subsystem up and
+// down; POSIX needs no such global init. netInit/netCleanup keep the same call
+// contract on both so runSuedeServer's start/stop code is platform-agnostic --
+// on POSIX they are simply no-ops that always succeed.
 // ---------------------------------------------------------------------------
+#ifdef _WIN32
 const int windows_version = 2; // use version 2.2
 
 // WSAStartup - call once at program start. Returns false if networking could
@@ -92,22 +168,28 @@ inline bool netInit() {
 inline void netCleanup() {
     WSACleanup();
 }
+#else
+// POSIX has no networking subsystem to start; these succeed trivially so the
+// caller can treat init/cleanup identically on every platform.
+inline bool netInit() { return true; }
+inline void netCleanup() {}
+#endif
 
 // ---------------------------------------------------------------------------
 // makeListener: create + bind + listen. Returns a socket bound to
 // 127.0.0.1:port (or 0.0.0.0:port if use_public) and listening, or
 // INVALID_SOCKET with err filled on failure.
 // ---------------------------------------------------------------------------
-inline SOCKET makeListener(const int port, std::string& err, bool use_public = false) {
+inline socket_t makeListener(const int port, std::string& err, bool use_public = false) {
     // first, create the socket
-    SOCKET listenFd = socket(AF_INET, SOCK_STREAM, 0);
+    socket_t listenFd = socket(AF_INET, SOCK_STREAM, 0);
     if (listenFd == INVALID_SOCKET) {
-        err = "socket() failed";
+        err = "socket() failed: " + socketErrorString();
         return INVALID_SOCKET;
     }
     // second, allow immediate reuse of the port on restart
     int yes = 1;
-    setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+    setSocketOption(listenFd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
     // bind to host
     sockaddr_in addr{};
@@ -121,14 +203,15 @@ inline SOCKET makeListener(const int port, std::string& err, bool use_public = f
     addr.sin_port = htons((u_short)port);                // network byte order
 
     if (bind(listenFd, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        err = "bind() failed - is port " + std::to_string(port) + " already in use?";
-        closesocket(listenFd);
+        err = "bind() failed - is port " + std::to_string(port) + " already in use? ("
+            + socketErrorString() + ")";
+        closeSocket(listenFd);
         return INVALID_SOCKET;
     }
 
     if (listen(listenFd, SOMAXCONN) == SOCKET_ERROR) {
-        err = "listen() failed";
-        closesocket(listenFd);
+        err = "listen() failed: " + socketErrorString();
+        closeSocket(listenFd);
         return INVALID_SOCKET;
     }
 
@@ -212,7 +295,7 @@ static inline bool parseHead(const std::string& headerBlock, HttpRequest& out, s
 // Returns true on a complete request; false with err set on malformed input,
 // timeout, oversize, or disconnect.
 // ---------------------------------------------------------------------------
-inline bool readRequest(SOCKET conn, HttpRequest& out, std::string& err) {
+inline bool readRequest(socket_t conn, HttpRequest& out, std::string& err) {
     size_t headerEnd = std::string::npos;
     bool headerEndFound = false;
     std::string buffer;                 // accumulates raw bytes as they arrive
@@ -220,7 +303,7 @@ inline bool readRequest(SOCKET conn, HttpRequest& out, std::string& err) {
 
     // STEP 1: read until we have the full header block (up to \r\n\r\n)
     while (!headerEndFound) {
-        int n = recv(conn, chunk, sizeof(chunk), 0);
+        recv_len_t n = recv(conn, chunk, sizeof(chunk), 0);
         if (n == 0) {
             err = "client closed connection before sending a request";
             return false;
@@ -274,7 +357,7 @@ inline bool readRequest(SOCKET conn, HttpRequest& out, std::string& err) {
 
     // STEP 5: keep reading until body has exactly contentLength bytes
     while (body.size() < contentLength) {
-        int n = recv(conn, chunk, sizeof(chunk), 0);
+        recv_len_t n = recv(conn, chunk, sizeof(chunk), 0);
         if (n == 0) {
             err = "client closed connection mid-body";
             return false;
@@ -299,7 +382,7 @@ inline bool readRequest(SOCKET conn, HttpRequest& out, std::string& err) {
 // of them. Content-Length is always resp.body.size(). Returns false if the
 // socket write fails (e.g. the client already disconnected).
 // ---------------------------------------------------------------------------
-inline bool writeResponse(SOCKET conn, const HttpResponse& resp) {
+inline bool writeResponse(socket_t conn, const HttpResponse& resp) {
     if (conn == INVALID_SOCKET)
         return false;
 
@@ -319,7 +402,8 @@ inline bool writeResponse(SOCKET conn, const HttpResponse& resp) {
     // send-all loop: send() may take only part of the buffer, so loop until done
     size_t totalSent = 0;
     while (totalSent < response.size()) {
-        int n = send(conn, response.data() + totalSent, (int)(response.size() - totalSent), 0);
+        recv_len_t n = send(conn, response.data() + totalSent,
+            (recv_len_t)(response.size() - totalSent), 0);
         if (n == SOCKET_ERROR || n == 0)
             return false;
         totalSent += (size_t)n;
@@ -332,11 +416,21 @@ inline bool writeResponse(SOCKET conn, const HttpResponse& resp) {
 // per-client failure so that nothing a client does can escape to the accept
 // loop or crash a thread.
 // ---------------------------------------------------------------------------
-inline void handleConnection(SOCKET conn,
+inline void handleConnection(socket_t conn,
     const std::function<HttpResponse(const HttpRequest&)>& handler) {
-    // (1) read timeout so a silent client can't park this thread forever
-    DWORD timeoutMs = 10000;   // 10 seconds
-    setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
+    // (1) read timeout so a silent client can't park this thread forever.
+    // SO_RCVTIMEO takes a raw millisecond DWORD on Windows but a `struct timeval`
+    // on POSIX -- the one genuinely different call shape, so it is branched here.
+    const int timeoutMs = 10000;   // 10 seconds
+#ifdef _WIN32
+    DWORD winTimeout = (DWORD)timeoutMs;
+    setSocketOption(conn, SOL_SOCKET, SO_RCVTIMEO, &winTimeout, sizeof(winTimeout));
+#else
+    struct timeval tv;
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    setSocketOption(conn, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
 
     try {
         // (2) read one request
@@ -348,7 +442,7 @@ inline void handleConnection(SOCKET conn,
             bad.status = Http::BadRequest;
             bad.body = R"({"error":"bad request"})";
             writeResponse(conn, bad);
-            closesocket(conn);
+            closeSocket(conn);
             return;
         }
 
@@ -367,7 +461,7 @@ inline void handleConnection(SOCKET conn,
     }
 
     // (6) always close - every path ends here
-    closesocket(conn);
+    closeSocket(conn);
 }
 
 // ---------------------------------------------------------------------------
@@ -379,13 +473,13 @@ inline void runServer(const int port,
     std::string& err,
     const bool use_public = false) {
     // first, create the listening socket (the only early-return path)
-    SOCKET listener = makeListener(port, err, use_public);
+    socket_t listener = makeListener(port, err, use_public);
     if (listener == INVALID_SOCKET)
         return;
 
     // second, accept connections forever
     while (true) {
-        SOCKET conn = accept(listener, nullptr, nullptr);   // blocks until a client connects
+        socket_t conn = accept(listener, nullptr, nullptr);   // blocks until a client connects
         if (conn == INVALID_SOCKET)
             continue;   // transient accept error - don't kill the loop
         // hand this one client to a detached thread, then loop back to accept the next
@@ -398,5 +492,5 @@ inline void runServer(const int port,
     // NOTE: detached handleConnection threads may still be running and referencing
     // `handler`/`gh`; real graceful shutdown must drain them before `gh` is
     // destroyed. That logic belongs with whatever introduces the break.
-    closesocket(listener);
+    closeSocket(listener);
 }

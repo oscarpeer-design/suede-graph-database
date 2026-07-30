@@ -1,0 +1,6 @@
+Person,name=Alicia,age=31,status=active
+Person,name=Bob,age=25,status=active
+Person,name=Carol,status=active
+
+0,1,FRIENDS
+1,2,KNOWS

@@ -178,8 +178,11 @@ private:
 		if (std::strncmp(header.magic, "GRAPHDB", 7) != 0)
 			return false;
 
-		// verify file version is supported
-		if (header.version != 1)
+		// verify file version is supported. The current on-disk format is
+		// FILE_VERSION (2): the payload is followed by a CRC32 trailer. Version-1
+		// files predate the trailer and are rejected (see the FILE_VERSION note
+		// at the top of this header).
+		if (header.version != FILE_VERSION)
 			return false;
 
 		// store node and edge counts for later loading
@@ -200,8 +203,11 @@ private:
 		// write graph file identifier
 		std::memcpy(header.magic, "GRAPHDB", 8);
 
-		// write current file version
-		header.version = 1;
+		// write current file version. Must match what ReadHeader accepts; using
+		// the FILE_VERSION constant keeps the written stamp and the accepted
+		// version in lock-step so the header can never again drift from the
+		// actual (CRC-trailer) on-disk format.
+		header.version = FILE_VERSION;
 
 		// determine number of nodes
 		std::vector<NodeId> nodeIds;
@@ -268,14 +274,14 @@ private:
 		// read 8-byte string to check for corruption
 		uint64_t len;
 		// reads + bounds-checks the 8 bytes
-		if (!crcRead(&len, sizeof(len))) 
-			return false;  
+		if (!crcRead(&len, sizeof(len)))
+			return false;
 		// string can't fit in what's left
-		if (len > payloadRemaining) 
-			return false;   
+		if (len > payloadRemaining)
+			return false;
 		// check we can actually read the bits
 		out.assign((size_t)len, '\0');
-		if (len > 0 && !crcRead(&out[0], (size_t)len)) 
+		if (len > 0 && !crcRead(&out[0], (size_t)len))
 			return false;
 		return true;
 	}
@@ -308,9 +314,9 @@ private:
 			{
 				std::string key, value;
 				// validate properties
-				if (!ReadString(key)) 
+				if (!ReadString(key))
 					return false;
-				if (!ReadString(value)) 
+				if (!ReadString(value))
 					return false;
 				properties[key] = value;
 			}

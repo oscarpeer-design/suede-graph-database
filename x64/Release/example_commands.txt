@@ -1,0 +1,268 @@
+# =====================================================================
+# Suede Graph Database - example command file
+#
+# Run in batch mode. Blank lines and lines starting with '#' are
+# ignored. Every command executes and its result is written to a
+# matching .results file; a failing command does not halt the batch.
+#
+# Node ids are sequential from 1 in creation order, so the four nodes
+# below are ids 1, 2, 3, 4. Edges reference nodes by those NUMERIC ids.
+#
+# Some sections (8b, 9b) contain lines that are MEANT to fail, to show
+# the parser/executor rejecting bad input and the batch continuing past
+# errors. Each such line is commented as expected-to-fail.
+# =====================================================================
+
+
+# ---------------------------------------------------------------------
+# 1. Inserting nodes
+#    INSERT INTO NODES (col1, col2, ...) ('value1', 'value2', 'value3')
+#    A 'label' column is required; any other columns become properties.
+# ---------------------------------------------------------------------
+INSERT INTO NODES (label, name, age) VALUES ('Person', 'Alice', '30')
+INSERT INTO NODES (label, name, age) VALUES ('Person', 'Bob', '25')
+INSERT INTO NODES (label, name) VALUES ('Person', 'Carol')
+
+# ---------------------------------------------------------------------
+# 2. Inserting edges
+#    INSERT INTO EDGES (from, to, label) VALUES (<fromId>, <toId>, '<label>')
+#    from/to must be NUMERIC ids of nodes that already exist.
+#    Alice=1, Bob=2, Carol=3, London=4.
+# ---------------------------------------------------------------------
+INSERT INTO EDGES (from, to, label) VALUES (1, 2, 'KNOWS')
+INSERT INTO EDGES (from, to, label) VALUES (2, 3, 'KNOWS')
+
+# ---------------------------------------------------------------------
+# 3. Counting
+# ---------------------------------------------------------------------
+NODE COUNT
+EDGE COUNT
+
+# ---------------------------------------------------------------------
+# 4. Selecting nodes (live SELECT needs WHERE: ID or LABEL)
+# ---------------------------------------------------------------------
+SELECT * FROM NODES WHERE ID = 1
+SELECT * FROM NODES WHERE LABEL = 'Person'
+SELECT * FROM NODES WHERE LABEL = 'Person' AND age > '20'
+# projection: only the named property column(s) come back (NODES only)
+SELECT name, age FROM NODES WHERE LABEL = 'Person'
+# TOP caps the number of rows
+SELECT TOP 2 * FROM NODES WHERE LABEL = 'Person'
+# TOP 0 is a valid success returning zero rows
+SELECT TOP 0 * FROM NODES WHERE LABEL = 'Person'
+# an id that does not exist -> SUCCESS with 0 rows (not an error)
+SELECT * FROM NODES WHERE ID = 999
+# multiple property filters combined with AND
+SELECT * FROM NODES WHERE LABEL = 'Person' AND age = '25' AND name = 'Bob'
+# a label no node has -> this is a FAILURE ("No nodes found with that label.")
+
+# ---------------------------------------------------------------------
+# 4b. OR in WHERE (AND binds tighter than OR, SQL precedence)
+#     OR queries run as a full scan, so they always work even without an
+#     index anchor. `A AND B OR C` means `(A AND B) OR C`.
+# ---------------------------------------------------------------------
+# union of two labels: all Person nodes plus all City nodes
+SELECT * FROM NODES WHERE LABEL = 'Person' OR LABEL = 'City'
+# union of two ids
+SELECT * FROM NODES WHERE ID = 1 OR ID = 3
+# OR reaching an un-anchored property (allowed; runs as a full scan)
+SELECT * FROM NODES WHERE LABEL = 'City' OR age = '25'
+# precedence: (Person AND age 30) OR City
+SELECT * FROM NODES WHERE LABEL = 'Person' AND age = '30' OR LABEL = 'City'
+
+# ---------------------------------------------------------------------
+# 4c. COUNT (SELECT COUNT * -> reports "Count: <n>", returns no rows)
+#     COUNT composes with WHERE (incl. OR) and may omit WHERE to count all.
+# ---------------------------------------------------------------------
+# count all Person nodes
+SELECT COUNT * FROM NODES WHERE LABEL = 'Person'
+# count the whole graph (no WHERE needed for a count)
+SELECT COUNT * FROM NODES
+# count with an OR filter
+SELECT COUNT * FROM NODES WHERE LABEL = 'Person' OR LABEL = 'City'
+# count edges by label
+SELECT COUNT * FROM EDGES WHERE LABEL = 'KNOWS'
+# count all edges
+SELECT COUNT * FROM EDGES
+
+# ---------------------------------------------------------------------
+# 5. Selecting edges (use '*'; projection is NODES-only)
+# ---------------------------------------------------------------------
+SELECT * FROM EDGES WHERE ID = 1
+SELECT * FROM EDGES WHERE LABEL = 'KNOWS'
+# outgoing edges from node 1 (default direction)
+SELECT * FROM EDGES WHERE FROM = 1
+# incoming edges to node 2
+SELECT * FROM EDGES WHERE FROM = 2 AND DIRECTION = 'INCOMING'
+# every edge touching node 2, either direction
+SELECT * FROM EDGES WHERE FROM = 2 AND DIRECTION = 'BOTH'
+# outgoing KNOWS edges from node 1 only
+SELECT * FROM EDGES WHERE FROM = 1 AND LABEL = 'KNOWS'
+# does an edge from 1 reach node 2?
+SELECT * FROM EDGES WHERE FROM = 1 AND TO = 2
+# an edge id that does not exist -> SUCCESS with 0 rows
+SELECT * FROM EDGES WHERE ID = 999
+# a label no edge has -> FAILURE ("No edges found with that label.")
+#SELECT * FROM EDGES WHERE LABEL = 'NOPE'
+
+
+# ---------------------------------------------------------------------
+# 6. Traversals (MATCH is undirected: REACHABLE / SHORTEST_PATH / KHOP)
+# ---------------------------------------------------------------------
+MATCH REACHABLE FROM 1
+MATCH TOP 2 REACHABLE FROM 1
+MATCH SHORTEST_PATH FROM 1 TO 3
+MATCH KHOP FROM 1 STEPS 2
+# KHOP with 0 steps returns just the source node itself
+MATCH KHOP FROM 1 STEPS 0
+# shortest path to an unreachable/non-existent node -> SUCCESS, empty path
+MATCH SHORTEST_PATH FROM 1 TO 999
+# a source node that does not exist -> FAILURE
+#MATCH REACHABLE FROM 999
+
+# ---------------------------------------------------------------------
+# 7. Updating (requires both WHERE and SET)
+# ---------------------------------------------------------------------
+UPDATE NODES WHERE ID = 1 SET name = Alicia, age = 31
+UPDATE NODES WHERE LABEL = 'Person' SET status = active
+UPDATE EDGES WHERE ID = 1 SET label = FRIENDS
+
+
+# ---------------------------------------------------------------------
+# 8. Snapshots
+#    SNAPSHOT CREATE     -> returns an ID
+#    SNAPSHOT RELEASE <id>
+#
+#    The trailing SNAPSHOT keyword also marks a read as point-in-time.
+# ---------------------------------------------------------------------
+SNAPSHOT CREATE
+SELECT * FROM NODES WHERE LABEL = 'Person' SNAPSHOT
+SELECT * FROM NODES WHERE ID = 1 SNAPSHOT
+MATCH REACHABLE FROM 1 SNAPSHOT
+MATCH SHORTEST_PATH FROM 1 TO 3 SNAPSHOT
+MATCH KHOP FROM 1 STEPS 2 SNAPSHOT
+SNAPSHOT RELEASE 1
+
+
+# ---------------------------------------------------------------------
+# 8b. WHERE-less SELECT ... SNAPSHOT (full point-in-time scan)
+#     A SELECT ... SNAPSHOT is a full scan and may OMIT WHERE. Even
+#     through the batch route (which supplies no CSR snapshot object and
+#     falls back to the live executor) these now succeed as full scans,
+#     honouring TOP, projection, and any property filter given.
+#
+#     Contrast: the SAME queries WITHOUT the trailing SNAPSHOT are
+#     rejected (a live SELECT is index-driven and needs WHERE ID/LABEL) -
+#     the two commented lines at the end show that rejection on purpose.
+# ---------------------------------------------------------------------
+# unfiltered full scans
+SELECT * FROM NODES SNAPSHOT
+SELECT * FROM EDGES SNAPSHOT
+# TOP composes with a WHERE-less scan
+SELECT TOP 2 * FROM NODES SNAPSHOT
+# projection composes: only 'name' comes back on each row
+SELECT name FROM NODES SNAPSHOT
+# a property filter with NO ID/LABEL predicate is allowed on a snapshot scan
+SELECT * FROM NODES WHERE age > '20' SNAPSHOT
+# these two are EXPECTED to error (WHERE-less live SELECT is rejected):
+#SELECT * FROM NODES
+#SELECT * FROM EDGES
+
+
+# ---------------------------------------------------------------------
+# 9. Deleting (only WHERE ID = <n> is supported)
+#    Deleting a node also removes its incident edges.
+# ---------------------------------------------------------------------
+#DELETE FROM EDGES WHERE ID = 3
+#DELETE FROM NODES WHERE ID = 3
+NODE COUNT
+EDGE COUNT
+
+
+# ---------------------------------------------------------------------
+# 9b. Expected-failure / edge cases
+#     These lines are MEANT to fail. Because the batch does not halt on
+#     error, each one prints its error and the run continues - handy for
+#     eyeballing that the parser/executor reject the right things.
+# ---------------------------------------------------------------------
+# edge endpoints that don't exist -> execution failure
+#INSERT INTO EDGES (from, to, label) VALUES (1, 999, 'BROKEN')
+# non-numeric edge endpoints -> failure
+#INSERT INTO EDGES (from, to, label) VALUES (1, 'Bob', 'BROKEN')
+# node insert with no 'label' column -> parse failure
+#INSERT INTO NODES (name) VALUES ('NoLabel')
+# INSERT column/value count mismatch -> parse failure
+#INSERT INTO NODES (label, name) VALUES ('Person')
+# DELETE with a non-id filter -> parse failure (only WHERE ID is allowed)
+#DELETE FROM NODES WHERE LABEL = 'Person'
+# deleting an id that doesn't exist -> execution failure
+#DELETE FROM NODES WHERE ID = 999
+# UPDATE with no WHERE -> parse failure
+#UPDATE NODES SET name = 'X'
+# UPDATE EDGES may only set 'label' -> failure
+#UPDATE EDGES WHERE ID = 1 SET weight = '5'
+# WHERE with an unknown connector (only AND / OR allowed) -> parse failure
+#SELECT * FROM NODES WHERE LABEL = 'Person' XOR age = '30'
+# COUNT not followed by '*' -> parse failure
+#SELECT COUNT name FROM NODES WHERE LABEL = 'Person'
+# unknown command keyword -> failure
+#FROBNICATE THE NODES
+
+
+# ---------------------------------------------------------------------
+# 10. Persistence  (LAST, on purpose)
+#     FLUSH <path> writes the current in-memory graph to a .bin file,
+#     creating storage on demand (no engine needed up front).
+#
+#     LOAD reconstructs a graph and validates that the reconstructed
+#     node/edge counts match the file header. Loading INTO the graph we
+#     just built would double the totals and fail that validation, so we
+#     do NOT LOAD here. To verify the round-trip, run LOAD graph.bin as
+#     the only command in a FRESH (empty) session -- see the commented
+#     block at the very bottom of this file.
+# ---------------------------------------------------------------------
+FLUSH graph.bin
+NODE COUNT
+EDGE COUNT
+
+
+# ---------------------------------------------------------------------
+# 11. CSV import / export  (SQL statements: IMPORT CSV / EXPORT CSV)
+#     These are first-class query-language statements, distinct from the
+#     binary FLUSH/LOAD above. The path is quoted, like LOAD FILE/SAVE FILE.
+#
+#       EXPORT CSV '<path>'   writes the live graph to a human-readable CSV
+#       IMPORT CSV '<path>'   reads a CSV description into the live graph
+#
+#     CSV layout is one node per line (Label,key=value,...), a blank line,
+#     then one edge per line (fromIndex,toIndex,label). Storage is created
+#     on demand, so no engine needs to be set up first.
+# ---------------------------------------------------------------------
+# write the current graph out to CSV (round-trips cleanly in one session)
+EXPORT CSV 'graph.csv'
+# NOTE: like binary LOAD, IMPORT CSV builds nodes/edges into the CURRENT
+# graph. Importing into the already-populated graph here would duplicate
+# rows, so run IMPORT CSV in a FRESH session (see the block at the bottom).
+# malformed forms below are EXPECTED to fail (parser rejects them):
+EXPORT CSV 'graph.csv'
+IMPORT CSV 'graph.csv'
+#EXPORT CSV ''
+
+
+# ---------------------------------------------------------------------
+# To test loading/importing, put ONLY the relevant lines in their own
+# commands file and run it in a FRESH session (an empty graph makes the
+# binary count check pass and avoids duplicate CSV rows):
+#
+#   Binary round-trip:
+LOAD graph.bin
+#     NODE COUNT
+#     EDGE COUNT
+#     SELECT * FROM NODES WHERE LABEL = 'Person'
+#
+#   CSV round-trip:
+#     IMPORT CSV 'graph.csv'
+#     NODE COUNT
+#     EDGE COUNT
+#     SELECT * FROM NODES WHERE LABEL = 'Person'
+# ---------------------------------------------------------------------

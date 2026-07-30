@@ -1,0 +1,62 @@
+[22] INSERT INTO NODES (label, name, age) VALUES ('Person', 'Alice', '30') -> Inserted node.
+[23] INSERT INTO NODES (label, name, age) VALUES ('Person', 'Bob', '25') -> Inserted node.
+[24] INSERT INTO NODES (label, name) VALUES ('Person', 'Carol') -> Inserted node.
+[32] INSERT INTO EDGES (from, to, label) VALUES (1, 2, 'KNOWS') -> Inserted edge.
+[33] INSERT INTO EDGES (from, to, label) VALUES (2, 3, 'KNOWS') -> Inserted edge.
+[38] NODE COUNT -> Node count: 3
+[39] EDGE COUNT -> Edge count: 2
+[44] SELECT * FROM NODES WHERE ID = 1 -> Found 1 row.
+[45] SELECT * FROM NODES WHERE LABEL = 'Person' -> Found 3 row(s).
+[46] SELECT * FROM NODES WHERE LABEL = 'Person' AND age > '20' -> Found 2 row(s).
+[48] SELECT name, age FROM NODES WHERE LABEL = 'Person' -> Found 3 row(s).
+[50] SELECT TOP 2 * FROM NODES WHERE LABEL = 'Person' -> Found 2 row(s).
+[52] SELECT TOP 0 * FROM NODES WHERE LABEL = 'Person' -> Found 0 row(s).
+[54] SELECT * FROM NODES WHERE ID = 999 -> Found 0 row(s).
+[56] SELECT * FROM NODES WHERE LABEL = 'Person' AND age = '25' AND name = 'Bob' -> Found 1 row.
+[65] SELECT * FROM NODES WHERE LABEL = 'Person' OR LABEL = 'City' -> Found 3 row(s).
+[67] SELECT * FROM NODES WHERE ID = 1 OR ID = 3 -> Found 2 row(s).
+[69] SELECT * FROM NODES WHERE LABEL = 'City' OR age = '25' -> Found 1 row.
+[71] SELECT * FROM NODES WHERE LABEL = 'Person' AND age = '30' OR LABEL = 'City' -> Found 1 row.
+[78] SELECT COUNT * FROM NODES WHERE LABEL = 'Person' -> Count: 3
+[80] SELECT COUNT * FROM NODES -> Count: 3
+[82] SELECT COUNT * FROM NODES WHERE LABEL = 'Person' OR LABEL = 'City' -> Count: 3
+[84] SELECT COUNT * FROM EDGES WHERE LABEL = 'KNOWS' -> Count: 2
+[86] SELECT COUNT * FROM EDGES -> Count: 2
+[91] SELECT * FROM EDGES WHERE ID = 1 -> Found 1 row.
+[92] SELECT * FROM EDGES WHERE LABEL = 'KNOWS' -> Found 2 row(s).
+[94] SELECT * FROM EDGES WHERE FROM = 1 -> Found 1 row.
+[96] SELECT * FROM EDGES WHERE FROM = 2 AND DIRECTION = 'INCOMING' -> Found 1 row.
+[98] SELECT * FROM EDGES WHERE FROM = 2 AND DIRECTION = 'BOTH' -> Found 2 row(s).
+[100] SELECT * FROM EDGES WHERE FROM = 1 AND LABEL = 'KNOWS' -> Found 1 row.
+[102] SELECT * FROM EDGES WHERE FROM = 1 AND TO = 2 -> Found 1 row.
+[104] SELECT * FROM EDGES WHERE ID = 999 -> Found 0 row(s).
+[112] MATCH REACHABLE FROM 1 -> Found 3 reachable node(s).
+[113] MATCH TOP 2 REACHABLE FROM 1 -> Found 2 reachable node(s).
+[114] MATCH SHORTEST_PATH FROM 1 TO 3 -> Path found with 3 node(s).
+[115] MATCH KHOP FROM 1 STEPS 2 -> Found 3 node(s) within 2 hop(s).
+[117] MATCH KHOP FROM 1 STEPS 0 -> Found 1 node(s) within 0 hop(s).
+[119] MATCH SHORTEST_PATH FROM 1 TO 999 -> No path found between the given nodes.
+[126] UPDATE NODES WHERE ID = 1 SET name = Alicia, age = 31 -> Updated 1 node(s).
+[127] UPDATE NODES WHERE LABEL = 'Person' SET status = active -> Updated 3 node(s).
+[128] UPDATE EDGES WHERE ID = 1 SET label = FRIENDS -> Updated 1 edge(s).
+[138] SNAPSHOT CREATE -> Snapshot created with ID: 1
+[139] SELECT * FROM NODES WHERE LABEL = 'Person' SNAPSHOT -> Found 3 row(s).
+[140] SELECT * FROM NODES WHERE ID = 1 SNAPSHOT -> Found 1 row.
+[141] MATCH REACHABLE FROM 1 SNAPSHOT -> Found 3 reachable node(s).
+[142] MATCH SHORTEST_PATH FROM 1 TO 3 SNAPSHOT -> Path found with 3 node(s).
+[143] MATCH KHOP FROM 1 STEPS 2 SNAPSHOT -> Found 3 node(s) within 2 hop(s).
+[144] SNAPSHOT RELEASE 1 -> Snapshot 1 released
+[159] SELECT * FROM NODES SNAPSHOT -> Found 3 row(s).
+[160] SELECT * FROM EDGES SNAPSHOT -> Found 2 row(s).
+[162] SELECT TOP 2 * FROM NODES SNAPSHOT -> Found 2 row(s).
+[164] SELECT name FROM NODES SNAPSHOT -> Found 3 row(s).
+[166] SELECT * FROM NODES WHERE age > '20' SNAPSHOT -> Found 2 row(s).
+[178] NODE COUNT -> Node count: 3
+[179] EDGE COUNT -> Edge count: 2
+[224] FLUSH graph.bin -> Graph flushed to storage: graph.bin
+[225] NODE COUNT -> Node count: 3
+[226] EDGE COUNT -> Edge count: 2
+[242] EXPORT CSV 'graph.csv' -> EXPORT CSV succeeded: graph.csv
+[247] EXPORT CSV 'graph.csv' -> EXPORT CSV succeeded: graph.csv
+[248] IMPORT CSV 'graph.csv' -> IMPORT CSV succeeded: graph.csv
+[258] LOAD graph.bin -> Graph loaded from storage: graph.bin

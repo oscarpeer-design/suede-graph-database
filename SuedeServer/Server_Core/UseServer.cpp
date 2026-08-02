@@ -4,61 +4,11 @@
 #include "UseServer.h"
 #include "http_simple.h"
 #include "Json.h"
+#include "Auth.h"
 #include "../../Queries and Graph Handlers/GraphHandler.h"
 #include "../../Graph and Searchers/Graph.h"
 
-#include <memory>
-#include <functional>   // std::bind, std::ref, std::placeholders
-#include <fstream>
 #include <string>
-#include <cstdint>
-#include <cstdio>       // std::rename / std::remove for the atomic temp swap
-
-// ---------------------------------------------------------------------------
-// Server counter (auth revocation state) -- persistence.
-//
-// The counter is a single uint64_t whose *changes* (not its absolute value)
-// carry meaning: it is the revocation state the auth layer folds into token
-// signing, so flipping it invalidates outstanding tokens. Because a revoked
-// user must STAY revoked across a restart, the value lives in a small text
-// file that is loaded once at startup and rewritten every time it changes.
-//
-// Design notes that fix the earlier draft:
-//   * The write must happen AT THE MOMENT THE COUNTER CHANGES (a revoke),
-//     synchronously -- NOT only at shutdown. The accept loop runs forever and
-//     the process normally dies by being killed/crashing, so a shutdown-only
-//     write would silently lose every revocation made during the run (the
-//     "revoked user comes back after reboot" bug). persistServerCounter()
-//     below is what the revoke path calls.
-//   * The write is crash-safe: it writes a sibling ".tmp" file, flushes, then
-//     atomically renames it over the target -- the same temp-swap the
-//     StorageEngine already uses. A crash mid-write can therefore never leave a
-//     truncated/empty counter file that would read back as corrupt or 0 and
-//     mass-un-revoke everyone.
-//   * The path is anchored explicitly (see counterFilePath()) rather than a
-//     bare relative name, so it does not silently resolve against whatever
-//     directory the server happened to be launched from.
-//
-// The file itself is an anonymous integer -- it carries no identities, so it is
-// safe to keep in the repo/deployment and leaks nothing useful if read.
-// ---------------------------------------------------------------------------
-
-// Base filename for the persisted counter. counterFilePath() turns this into an
-// explicit path (see below) so the lookup does not depend on the process's
-// current working directory.
-static const std::string COUNTER_FILE_NAME = "server_counter.txt";
-
-// Resolve the counter file's path. Kept as a single function so there is ONE
-// definition of "where the counter lives" for both read and write.
-//
-// NOTE: this returns the bare filename by default. If you want it anchored to a
-// fixed location (recommended for a deployed server), set the path here -- e.g.
-// from an environment variable read at startup, or a compile-time constant --
-// rather than relying on the launch directory. Left as the filename for now to
-// preserve current behaviour; change in ONE place when you pick a home for it.
-static std::string counterFilePath() {
-    return COUNTER_FILE_NAME;
-}
 
 // ---------------------------------------------------------------------------
 // routeRequest: the query router.
@@ -122,140 +72,6 @@ static HttpResponse routeRequest(const HttpRequest& req, GraphHandler& gh) {
 }
 
 // ---------------------------------------------------------------------------
-// readServerCounter: load the persistent server counter from disk.
-//
-// Reads a uint64_t from the counter file (see counterFilePath()), parsing the
-// first line as a decimal number. Behaviour by case:
-//   * file MISSING        -> serverCounter = 0, returns true  (first-run default)
-//   * file empty/corrupt  -> returns false with `err` set     (refuse to start)
-//   * valid integer       -> serverCounter = value, returns true
-// The missing/corrupt split is deliberate: a fresh install should boot at 0,
-// but an empty or garbage file (the shape a crash mid-write would leave) must
-// NOT be silently treated as 0, or it would mass-un-revoke everyone.
-//
-// Parameters:
-//   serverCounter [out] : receives the parsed counter value on success
-//   err           [out] : receives an error description on failure
-//
-// Returns:
-//   true  if the counter was successfully read and parsed
-//   false if the file could not be opened or the data is invalid/corrupted
-// ---------------------------------------------------------------------------
-static bool readServerCounter(uint64_t& serverCounter, std::string& err) {
-    const std::string path = counterFilePath();
-
-    // open text file
-    std::ifstream in(path);
-    // A MISSING file is not an error: on first ever run there is no counter yet,
-    // so treat "not found" as "start from 0". (An existing-but-unreadable or
-    // corrupt file IS an error and is handled below.) This lets a fresh install
-    // boot with no manual setup while still catching real corruption.
-    if (!in) {
-        serverCounter = 0;
-        return true;
-    }
-
-    // read the first line
-    std::string sCounter;
-    std::getline(in, sCounter);
-
-    // Trim surrounding whitespace / stray CR (e.g. a file saved with Windows
-    // line endings or a trailing newline) so an otherwise-valid value isn't
-    // rejected. std::stoull already skips leading whitespace, but a trailing
-    // '\r' would slip through the "no trailing junk" check below.
-    const std::string ws = " \t\r\n";
-    size_t first = sCounter.find_first_not_of(ws);
-    size_t last = sCounter.find_last_not_of(ws);
-    if (first == std::string::npos) {
-        // File exists but is empty / all whitespace. This is exactly the shape a
-        // crash mid-write (without the temp-swap) would leave, so treat it as
-        // corruption rather than silently reading 0 and un-revoking everyone.
-        err = "The counter file '" + path +
-            "' is empty; refusing to start server.";
-        return false;
-    }
-    sCounter = sCounter.substr(first, last - first + 1);
-
-    // convert it to uint64_t
-    try {
-        size_t consumed = 0;
-        unsigned long long value = std::stoull(sCounter, &consumed);
-        // Reject trailing junk (e.g. "12abc"): stoull would happily parse "12"
-        // and ignore the rest, which would mask a corrupt file.
-        if (consumed != sCounter.size()) {
-            err = "The counter file '" + path +
-                "' contains non-numeric trailing data; could not initialise the server counter.";
-            return false;
-        }
-        serverCounter = static_cast<uint64_t>(value);
-    }
-    // stoull throws std::invalid_argument (no digits) or std::out_of_range
-    // (too big for unsigned long long) -- both mean the file is unusable.
-    catch (...) {
-        err = "The counter file '" + path +
-            "' is corrupted (not a valid unsigned integer); could not initialise the server counter.";
-        return false;
-    }
-
-    // everything happened successfully
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// persistServerCounter: crash-safely write the counter to disk.
-//
-// Renamed from writeServerCounter to make the call site read as an intent
-// ("persist this now"), and hardened so a crash can never corrupt the file:
-//   1. write the value to a sibling "<path>.tmp",
-//   2. flush + close it (bytes committed to the OS),
-//   3. atomically rename the temp over the real file.
-// std::rename replaces the destination on POSIX; on Windows it fails if the
-// destination exists, so we fall back to remove-then-rename there -- the same
-// approach StorageEngine::Save uses.
-//
-// CALL THIS SYNCHRONOUSLY WHENEVER THE COUNTER CHANGES (i.e. at revoke time),
-// while holding whatever lock guards the counter -- NOT only at shutdown.
-// ---------------------------------------------------------------------------
-static bool persistServerCounter(uint64_t serverCounter, std::string& err) {
-    const std::string path = counterFilePath();
-    const std::string tempPath = path + ".tmp";
-
-    // (1) write the new value to the TEMP file (truncating any stale temp).
-    {
-        std::ofstream out(tempPath, std::ios::trunc);
-        if (!out) {
-            err = "Failed to open temp counter file '" + tempPath +
-                "' for writing. Check directory permissions / path.";
-            return false;
-        }
-        out << serverCounter << "\n";
-        // (2) flush + close so the bytes are on the OS before we rename.
-        out.flush();
-        out.close();
-        if (!out) {
-            // Any stream error during write/flush/close: don't rename a bad temp
-            // over the good file. Best-effort clean up the temp and fail.
-            std::remove(tempPath.c_str());
-            err = "Failed while writing the temp counter file '" + tempPath + "'.";
-            return false;
-        }
-    }
-
-    // (3) atomic swap: temp -> target.
-    if (std::rename(tempPath.c_str(), path.c_str()) != 0) {
-        // Windows / destination-exists path: remove the old target, then rename.
-        std::remove(path.c_str());
-        if (std::rename(tempPath.c_str(), path.c_str()) != 0) {
-            std::remove(tempPath.c_str());   // give up cleanly; no temp left behind
-            err = "Failed to atomically replace the counter file '" + path + "'.";
-            return false;
-        }
-    }
-
-    return true;
-}
-
-// ---------------------------------------------------------------------------
 // runSuedeServer: the one public entry point (declared in UseServer.h).
 // Owns the single shared GraphHandler via unique_ptr, binds it into the static
 // routeRequest to satisfy runServer's callback signature, and runs the accept
@@ -270,17 +86,26 @@ int runSuedeServer(const int port, std::string& err, bool use_public) {
     // Load the persisted revocation counter ONCE at startup. A missing file
     // means "first run" and yields 0; a present-but-corrupt file is a hard error
     // (we refuse to start rather than silently reset revocation state).
-    uint64_t serverCounter = 0;
-    if (!readServerCounter(serverCounter, err)) {
+    AuthState authState;
+    if (!authState.readAuthState(err)) {
         netCleanup();
         return 1;
     }
-    // NOTE: `serverCounter` is the in-memory source of truth for this run. When
-    // the auth layer lands, it must live somewhere the router can reach (e.g.
-    // owned alongside the GraphHandler, guarded by a mutex), be READ on every
-    // token verify/issue, and be persisted via persistServerCounter() at the
-    // moment it changes (a revoke). It is intentionally NOT written at shutdown
-    // -- see the persistence notes at the top of this file.
+    // `authState` is the in-memory source of truth for the revocation generation
+    // this run. It is loaded once above. STILL TO DO when the auth layer lands:
+    //   * pass `authState` by reference into routeRequest (alongside `gh`, via the
+    //     std::bind below) so token verification can READ the generation on every
+    //     request -- authState.getCounter().
+    //   * choose a revoke TRIGGER that calls authState.revokeAll() (e.g. a signal
+    //     handler that trips a flag the accept loop checks, mirroring the shutdown
+    //     handler). revokeAll() already increments + persists atomically.
+    // The shutdown flush below is a SUPPLEMENT to revoke-time persistence, not a
+    // replacement -- see the persistence notes at the top of this file.
+
+    // Install SIGINT/SIGTERM handlers so Ctrl+C or `kill` stops the accept loop
+    // gracefully (runServer returns) instead of hard-killing the process. This is
+    // what makes the shutdown counter-flush below actually reachable.
+    installShutdownSignalHandlers();
 
     // ONE graph + handler for the whole server lifetime, owned by a unique_ptr.
     // It outlives every detached connection thread because runServer blocks
@@ -299,14 +124,37 @@ int runSuedeServer(const int port, std::string& err, bool use_public) {
     // Run the accept loop. Blocks. On failure to start, err is set by makeListener.
     runServer(port, httpHandler, err, use_public);
 
-    // Reached only if the accept loop ever exits.
+    // Reached when the accept loop exits gracefully -- i.e. requestServerShutdown()
+    // was called (SIGINT/SIGTERM via the handlers installed above, or a test
+    // harness calling it directly). A hard kill (SIGKILL) or crash still skips
+    // this tail, which is exactly why revoke-time persistence -- not this flush --
+    // is the durability guarantee.
     netCleanup();
 
-    // NOTE: the counter is deliberately NOT written here. Persistence happens
-    // synchronously at revoke time via persistServerCounter(), so revocations
-    // survive a kill/crash. A shutdown-only write would be worse than useless:
-    // it would lose every revocation whenever the process didn't exit cleanly,
-    // reintroducing the "revoked user returns after reboot" bug.
+    // Belt-and-suspenders flush of the counter on CLEAN shutdown.
+    //
+    // IMPORTANT: this is a SUPPLEMENT, not the durability mechanism. The counter
+    // MUST already have been persisted synchronously at the moment it changed
+    // (inside the revoke path, via persistServerCounter) -- because the accept
+    // loop can be killed or crash and never reach this line. If this were the
+    // ONLY write, every revocation from this run would be lost on a non-clean
+    // exit, reintroducing the "revoked user returns after reboot" bug. Given
+    // revoke-time persistence, this final write is normally a no-op re-write of
+    // the already-saved value; it just guarantees the on-disk file matches the
+    // in-memory counter after an orderly stop. A failure here does not lose data
+    // (the revoke-time writes already happened), so we record it in `err` but do
+    // not treat it as fatal beyond the exit code.
+    // NOTE: this is persistCurrent(), NOT revokeAll(). The flush must re-write the
+    // counter unchanged; calling revokeAll() here would increment the generation
+    // on every clean shutdown and silently revoke everyone each time the server
+    // stops.
+    std::string flushErr;
+    if (!authState.persistCurrent(flushErr)) {
+        // A failed flush loses no data (revoke-time writes already happened), so
+        // only surface it if nothing more relevant already failed.
+        if (err.empty())
+            err = "Warning: final counter flush on shutdown failed: " + flushErr;
+    }
 
     // exit code: clean exit / no error -> 0, error -> 1
     int iErr = err.empty() ? 0 : 1;

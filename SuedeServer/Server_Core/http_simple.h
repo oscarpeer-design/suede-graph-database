@@ -6,6 +6,8 @@
 #include <string>
 #include <functional>
 #include <thread>
+#include <atomic>    // std::atomic for the shutdown flag
+#include <csignal>   // std::signal / SIGINT / SIGTERM for graceful shutdown
 #include <sstream>   // for stringstream
 #include <cctype>    // for std::tolower
 #include <cstring>   // for std::strerror
@@ -465,8 +467,70 @@ inline void handleConnection(socket_t conn,
 }
 
 // ---------------------------------------------------------------------------
-// runServer: open the listener, then accept forever - spawning one detached
-// thread per connection. Returns early only if the listener cannot be created.
+// Graceful-shutdown control.
+//
+// accept() BLOCKS. A plain "while (!stop)" flag is therefore not enough on its
+// own: once the loop is parked inside accept() waiting for the next connection,
+// setting a flag from another thread (or a signal handler) never gets re-checked
+// until a connection happens to arrive. The portable way to unblock a waiting
+// accept() is to CLOSE THE LISTENING SOCKET from the shutdown path -- that makes
+// the blocked accept() return an error immediately, at which point the loop sees
+// the flag and exits cleanly.
+//
+// So shutdown needs two pieces of shared state:
+//   * g_shutdownRequested -- an atomic flag distinguishing "we asked to stop"
+//     from an ordinary transient accept() error (which must NOT stop the server).
+//   * g_listenerSocket    -- the listener handle, published so the shutdown path
+//     can close it to break accept(). Stored as an atomic of the widest socket
+//     type so a signal handler can read/close it without a lock.
+//
+// requestServerShutdown() is async-signal-safe enough for our use: it only sets
+// an atomic flag and calls closeSocket() (close()/closesocket()), which is the
+// standard "close the listener to wake accept()" idiom.
+// ---------------------------------------------------------------------------
+
+inline std::atomic<bool>& shutdownRequested() {
+    static std::atomic<bool> flag{ false };
+    return flag;
+}
+
+// -1 is a sentinel "no listener yet"; matches INVALID_SOCKET's value on POSIX and
+// is never a valid handle on Windows either.
+inline std::atomic<long long>& listenerSocket() {
+    static std::atomic<long long> sock{ -1 };
+    return sock;
+}
+
+// Request a graceful shutdown of the running server: set the flag, then close the
+// listening socket so a blocked accept() returns and the loop can exit. Safe to
+// call from a signal handler or another thread; idempotent.
+inline void requestServerShutdown() {
+    shutdownRequested().store(true);
+    // Swap the listener out to -1 so we only close it once even if called twice.
+    long long s = listenerSocket().exchange(-1);
+    if (s != -1)
+        closeSocket(static_cast<socket_t>(s));
+}
+
+// Signal handler: translate SIGINT (Ctrl+C) / SIGTERM into a graceful shutdown
+// request. Must do as little as possible -- just trip the shutdown path.
+inline void serverSignalHandler(int /*signum*/) {
+    requestServerShutdown();
+}
+
+// Install SIGINT/SIGTERM handlers so Ctrl+C (or `kill`) stops the server cleanly
+// instead of hard-killing the process. Call once before runServer if you want
+// signal-driven shutdown; runServer works without it too (e.g. a test harness can
+// call requestServerShutdown() directly).
+inline void installShutdownSignalHandlers() {
+    std::signal(SIGINT, serverSignalHandler);
+    std::signal(SIGTERM, serverSignalHandler);
+}
+
+// ---------------------------------------------------------------------------
+// runServer: open the listener, then accept until a graceful shutdown is
+// requested - spawning one detached thread per connection. Returns when the
+// listener cannot be created OR when requestServerShutdown() is called.
 // ---------------------------------------------------------------------------
 inline void runServer(const int port,
     std::function<HttpResponse(const HttpRequest&)> handler,
@@ -477,20 +541,39 @@ inline void runServer(const int port,
     if (listener == INVALID_SOCKET)
         return;
 
-    // second, accept connections forever
-    while (true) {
+    // publish the listener so requestServerShutdown() can close it to wake accept()
+    listenerSocket().store(static_cast<long long>(listener));
+
+    // second, accept connections until shutdown is requested
+    while (!shutdownRequested().load()) {
         socket_t conn = accept(listener, nullptr, nullptr);   // blocks until a client connects
-        if (conn == INVALID_SOCKET)
-            continue;   // transient accept error - don't kill the loop
+        if (conn == INVALID_SOCKET) {
+            // Distinguish the two ways accept() can fail:
+            //   * shutdown requested -> the listener was closed on purpose to wake
+            //     us; break out of the loop and exit cleanly.
+            //   * otherwise -> a transient accept() error; do NOT kill the server,
+            //     just loop back and try again (original behaviour).
+            if (shutdownRequested().load())
+                break;
+            continue;
+        }
         // hand this one client to a detached thread, then loop back to accept the next
         std::thread(handleConnection, conn, handler).detach();
     }
 
-    // The loop above runs until the process is killed. If a future change adds a
-    // break (graceful shutdown / test harness), execution lands here and we
-    // release the one resource this function owns: the listening socket.
+    // Graceful exit path. requestServerShutdown() may already have closed and
+    // cleared the listener (that's what woke accept()); guard against a double
+    // close by only closing if it's still published to us.
+    long long still = listenerSocket().exchange(-1);
+    if (still != -1)
+        closeSocket(static_cast<socket_t>(still));
+
     // NOTE: detached handleConnection threads may still be running and referencing
-    // `handler`/`gh`; real graceful shutdown must drain them before `gh` is
-    // destroyed. That logic belongs with whatever introduces the break.
-    closeSocket(listener);
+    // `handler` / the GraphHandler behind it. This function returning does NOT
+    // wait for them. For a single-user/small-team server the practical shutdown
+    // sequence is: stop accepting (here), persist the counter (caller does this),
+    // then let the process exit -- in-flight requests finish or are dropped by the
+    // OS on exit. If you later need a hard guarantee that no request is mid-flight
+    // when the GraphHandler is destroyed, add a live-connection counter and join
+    // on it here before returning.
 }

@@ -108,6 +108,8 @@ struct HttpRequest {
     std::string path;     // "/query"
     std::string body;     // raw body bytes (JSON text, but http_simple doesn't care)
     std::map<std::string, std::string> headers;  // lowercased keys
+    std::string clientIp; // source IP of the connection (filled in by the accept
+    // loop), used by the auth layer's IP-binding check.
 };
 
 // define HttpResponse
@@ -419,6 +421,7 @@ inline bool writeResponse(socket_t conn, const HttpResponse& resp) {
 // loop or crash a thread.
 // ---------------------------------------------------------------------------
 inline void handleConnection(socket_t conn,
+    std::string clientIp,
     const std::function<HttpResponse(const HttpRequest&)>& handler) {
     // (1) read timeout so a silent client can't park this thread forever.
     // SO_RCVTIMEO takes a raw millisecond DWORD on Windows but a `struct timeval`
@@ -447,6 +450,10 @@ inline void handleConnection(socket_t conn,
             closeSocket(conn);
             return;
         }
+
+        // stamp the source IP (captured by the accept loop) onto the request so
+        // the auth layer can check it against the token's bound IP.
+        req.clientIp = clientIp;
 
         // (3) hand the request to the routing lambda -> get a response
         HttpResponse resp = handler(req);   // where GraphHandler eventually runs
@@ -546,7 +553,10 @@ inline void runServer(const int port,
 
     // second, accept connections until shutdown is requested
     while (!shutdownRequested().load()) {
-        socket_t conn = accept(listener, nullptr, nullptr);   // blocks until a client connects
+        // capture the peer address so we can record the client's source IP.
+        sockaddr_in peerAddr{};
+        sockopt_len_t peerLen = (sockopt_len_t)sizeof(peerAddr);
+        socket_t conn = accept(listener, (sockaddr*)&peerAddr, &peerLen);   // blocks until a client connects
         if (conn == INVALID_SOCKET) {
             // Distinguish the two ways accept() can fail:
             //   * shutdown requested -> the listener was closed on purpose to wake
@@ -557,8 +567,18 @@ inline void runServer(const int port,
                 break;
             continue;
         }
+
+        // convert the peer's IPv4 address to a dotted string (e.g. "10.0.0.5").
+        // inet_ntop is available on both Winsock (ws2tcpip.h) and POSIX. On any
+        // failure we leave the IP empty; the auth layer treats an empty IP as a
+        // non-match, so a token can never verify against a missing IP.
+        char ipText[INET_ADDRSTRLEN] = { 0 };
+        std::string clientIp;
+        if (inet_ntop(AF_INET, &peerAddr.sin_addr, ipText, sizeof(ipText)) != nullptr)
+            clientIp = ipText;
+
         // hand this one client to a detached thread, then loop back to accept the next
-        std::thread(handleConnection, conn, handler).detach();
+        std::thread(handleConnection, conn, clientIp, handler).detach();
     }
 
     // Graceful exit path. requestServerShutdown() may already have closed and

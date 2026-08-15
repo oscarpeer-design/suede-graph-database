@@ -16,8 +16,12 @@ const uint32_t INITIAL_HASH_VALUES[8] = {
     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
 };
 
-// all 64 SHA-256 round constants
-const uint32_t round[64] = {
+// all 64 SHA-256 round constants.
+// NOTE: named ROUND_CONSTANTS, not `round`, because a bare `round` collides with
+// std::round from <cmath> -- when any translation unit that includes this header
+// also pulls in <cmath> (directly or transitively), `round[r]` would resolve to
+// the math function instead of this array and fail to compile.
+const uint32_t ROUND_CONSTANTS[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
     0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
@@ -179,9 +183,9 @@ static void sha256(const uint8_t* data, size_t len, uint8_t out[32]) {
         uint32_t v6 = state[6];   // spec: g
         uint32_t v7 = state[7];   // spec: h  (falls off the bottom each round)
 
-        for (int r = 0; r < 64; ++r) {
+        for (int round = 0; round < BLOCK_SIZE_BYTES; ++round) {
             // the word entering at the top: bottom var + mixing of v4 + this round's constant/schedule
-            uint32_t mixed_in = v7 + big_sigma1(v4) + choose(v4, v5, v6) + round[r] + schedule[r];
+            uint32_t mixed_in = v7 + big_sigma1(v4) + choose(v4, v5, v6) + ROUND_CONSTANTS[round] + schedule[round];
             // the extra stirring folded into the very top variable
             uint32_t top_stir = big_sigma0(v0) + majority(v0, v1, v2);
 
@@ -285,6 +289,65 @@ static std::string to_hex(const uint8_t* bytes, size_t len) {
         s += digits[bytes[i] & 0x0F];
     }
     return s;
+}
+
+// number of hex characters that encode one byte, and the bit width of one
+// hex digit (a "nibble" is 4 bits, so the high digit is shifted left by this).
+const size_t HEX_CHARS_PER_BYTE = 2;
+const int NIBBLE_BIT_WIDTH = 4;
+// sentinel returned by hex_digit_value for a character that is not a hex digit.
+const int NOT_A_HEX_DIGIT = -1;
+
+// ---------------------------------------------------------------------------
+// hex_digit_value: map a single hex character to its numeric value 0..15,
+// or NOT_A_HEX_DIGIT if the character is not a valid hex digit.
+//
+// The parameter is taken as `unsigned char` on purpose. Plain `char` has
+// implementation-defined signedness, and on a signed char any byte >= 0x80 is
+// NEGATIVE. That would make range comparisons like (character >= '0') behave
+// unpredictably on high bytes -- a classic char-signedness bug and a real
+// source of security vulnerabilities in parsers. Comparing as unsigned char
+// makes every input an unambiguous 0..255 so the ranges mean what they say.
+// ---------------------------------------------------------------------------
+static int hex_digit_value(unsigned char character) {
+    if (character >= '0' && character <= '9')
+        return character - '0';
+    if (character >= 'a' && character <= 'f')
+        return character - 'a' + 10;
+    if (character >= 'A' && character <= 'F')
+        return character - 'A' + 10;
+    return NOT_A_HEX_DIGIT;
+}
+
+// ---------------------------------------------------------------------------
+// from_hex: decode a hex string into raw bytes (the mirror of to_hex).
+//
+// Returns true and fills `decoded_bytes` on success. Returns false (leaving
+// `decoded_bytes` cleared) if the string has an odd length or contains any
+// non-hex character -- callers use that to fail closed on a malformed key.
+// Accepts upper- or lower-case hex digits.
+// ---------------------------------------------------------------------------
+static bool from_hex(const std::string& hex_string, std::vector<uint8_t>& decoded_bytes) {
+    // a hex string must have an even number of characters (HEX_CHARS_PER_BYTE each)
+    if (hex_string.size() % HEX_CHARS_PER_BYTE != 0)
+        return false;
+
+    decoded_bytes.clear();
+    decoded_bytes.reserve(hex_string.size() / HEX_CHARS_PER_BYTE);
+
+    for (size_t position = 0; position < hex_string.size(); position += HEX_CHARS_PER_BYTE) {
+        // each byte is two hex digits: a high nibble then a low nibble.
+        // cast to unsigned char before classifying (see hex_digit_value note).
+        int high_nibble = hex_digit_value((unsigned char)hex_string[position]);
+        int low_nibble = hex_digit_value((unsigned char)hex_string[position + 1]);
+
+        // any non-hex character rejects the whole string
+        if (high_nibble == NOT_A_HEX_DIGIT || low_nibble == NOT_A_HEX_DIGIT)
+            return false;
+
+        decoded_bytes.push_back((uint8_t)((high_nibble << NIBBLE_BIT_WIDTH) | low_nibble));
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------

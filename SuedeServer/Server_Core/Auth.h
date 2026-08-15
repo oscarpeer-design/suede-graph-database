@@ -1,9 +1,59 @@
 #pragma once
 
+// Silence MSVC's C4996 "getenv is unsafe -- use _dupenv_s" error. std::getenv is
+// perfectly standard C++; _dupenv_s is a Microsoft-only extension that would break
+// the Linux/other builds. Defining this (MSVC-only; harmless elsewhere) keeps ONE
+// portable code path. Must come before any header that pulls in <cstdlib>.
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
+#include "HMAC.h" //include hashing
+
 #include <string>
+#include <vector>
+#include <array>         // std::array for the fixed-size secret key
 #include <mutex>         // std::mutex / std::lock_guard (C++11 -- no C++17 needed)
 #include <functional>   // std::bind, std::ref, std::placeholders
 #include <fstream>
+#include <sstream>       // std::istringstream for splitting the token fields
+#include <cstdlib>       // std::getenv for the secret-key environment variable
+#include <cstdint>       // uint64_t / uint8_t
+
+// ---------------------------------------------------------------------------
+// Token format (the "sealed letter").
+//
+//   SD-<ip>|<counter>|<expiry>|<tag>
+//
+//   * "SD-"     : a fixed marker (like OpenAI's "sk-"). A token missing it is
+//                 rejected outright.
+//   * <ip>      : the client IP the token was issued to (Problem 2: are you
+//                 coming from where you should be).
+//   * <counter> : the revocation generation the token was signed under. If the
+//                 server's current counter differs, the token is stale (revoked).
+//   * <expiry>  : Unix time (seconds) after which the token is refused.
+//   * <tag>     : HMAC-SHA256 of the signed message, as 64 hex chars. The "wax
+//                 seal" -- only the holder of the secret key could produce it.
+//
+// The SIGNED MESSAGE (what HMAC covers) is exactly:  <ip>|<counter>|<expiry>
+// i.e. the token minus the "SD-" prefix and minus the trailing "|<tag>".
+// Verify recomputes the tag over the RECEIVED message bytes and constant-time
+// compares -- it never trusts a field until the seal checks out.
+// ---------------------------------------------------------------------------
+static const std::string TOKEN_PREFIX = "SD-";
+static const char TOKEN_FIELD_SEPARATOR = '|';
+// a valid token has exactly these 4 fields after the prefix: ip, counter, expiry, tag
+static const size_t TOKEN_FIELD_COUNT = 4;
+static const size_t TAG_BYTES = 32;               // HMAC-SHA256 output size
+static const size_t TAG_HEX_CHARS = TAG_BYTES * 2;
+
+// Name of the environment variable holding the HMAC secret key, as 128 hex
+// characters (= 64 bytes). The operator sets this per-deployment; it is NEVER
+// committed to the repo. Generate one with:  openssl rand -hex 64
+static const char* SECRET_KEY_ENV_VAR = "SUEDE_SECRET_KEY";
+// The key is exactly 64 raw bytes (SHA-256 block size) = 128 hex characters.
+static const size_t SECRET_KEY_BYTES = 64;
+static const size_t SECRET_KEY_HEX_CHARS = SECRET_KEY_BYTES * 2;
 
 // ---------------------------------------------------------------------------
 // Server counter (auth revocation state) -- persistence.
@@ -200,8 +250,125 @@ private:
     uint64_t serverCounter = 0;
     mutable std::mutex mtx;   // mutable so getCounter() can be const and still lock
 
+    // The 64-byte HMAC secret key, loaded once from the environment at startup.
+    // Held for the process lifetime; never persisted, never logged, never in the
+    // repo. Using a fixed std::array (not a vector) makes the size a compile-time
+    // guarantee: it CANNOT be the wrong length, so the "always 64 bytes" invariant
+    // is enforced by the type rather than by a runtime check. `keyLoaded` still
+    // guards against using the array before it has been populated (fail closed).
+    std::array<uint8_t, SECRET_KEY_BYTES> secretKey{};   // value-initialised to zeros
+    bool keyLoaded = false;
+
+    // Build the exact bytes that get signed: "<ip>|<counter>|<expiry>".
+    // Used identically by mint and verify so the signed and verified bytes match.
+    static std::string buildSignedMessage(const std::string& ip,
+        uint64_t counter, uint64_t expiry) {
+        return ip + TOKEN_FIELD_SEPARATOR + std::to_string(counter)
+            + TOKEN_FIELD_SEPARATOR + std::to_string(expiry);
+    }
+
+    // Compute the HMAC tag over `message` using the loaded key. MUST be called
+    // with `mtx` already held (it reads secretKey directly). This is the single
+    // place hmac_sha256 is invoked -- the one "press the ring into the wax" call.
+    void computeTagLocked(const std::string& message, uint8_t tag[TAG_BYTES]) const {
+        hmac_sha256(secretKey.data(), secretKey.size(),
+            reinterpret_cast<const uint8_t*>(message.data()), message.size(),
+            tag);
+    }
+
 public:
     AuthState() {}
+
+    // Outcome of verifyToken -- tells the caller WHY a token was rejected, which
+    // is useful for returning the right HTTP status and for logging. Only Ok
+    // means the token is authentic, current, unexpired, and from the right IP.
+    // Declared INSIDE the class and as `enum class` so callers refer to it as
+    // AuthState::VerifyResult::Ok (scoped, no clashes with other symbols).
+    enum class VerifyResult {
+        Ok,          // authentic, current generation, not expired, IP matches
+        NoKey,       // server has no secret key loaded (fail-closed startup should prevent this)
+        Malformed,   // missing prefix, wrong field count, non-numeric fields, bad tag length
+        BadTag,      // the seal doesn't match -- forged or tampered payload
+        WrongIp,     // authentic, but issued to a different IP than this request
+        Revoked,     // authentic, but signed under an old generation (counter bumped)
+        Expired      // authentic, but past its expiry time
+    };
+
+    // ---------------------------------------------------------------------
+    // loadSecretKey: read the HMAC key from the SUEDE_SECRET_KEY environment
+    // variable, validate it, and store the 64 decoded bytes. Call once at
+    // startup, alongside readAuthState(). FAILS CLOSED -- returns false with
+    // `err` set (and leaves keyLoaded == false) on any problem, so the caller
+    // refuses to start rather than run with a missing/weak/default key.
+    //
+    // Rejects, in order:
+    //   * variable not set                 -> no key provided
+    //   * not exactly 128 hex characters   -> wrong length (must be 64 bytes)
+    //   * any non-hex character            -> malformed
+    // There is deliberately NO fallback/default key: a server with no valid key
+    // must not run, because a known default key would make every token forgeable.
+    // ---------------------------------------------------------------------
+    bool loadSecretKey(std::string& err) {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        // read the environment variable
+        const char* raw = std::getenv(SECRET_KEY_ENV_VAR);
+        if (raw == nullptr) {
+            err = std::string("Environment variable ") + SECRET_KEY_ENV_VAR +
+                " is not set. Generate a key with 'openssl rand -hex 64' and set it. "
+                "Refusing to start without a secret key.";
+            keyLoaded = false;
+            return false;
+        }
+
+        std::string hexKey(raw);
+
+        // must be exactly 128 hex chars (= 64 bytes)
+        if (hexKey.size() != SECRET_KEY_HEX_CHARS) {
+            err = std::string("Environment variable ") + SECRET_KEY_ENV_VAR +
+                " must be exactly " + std::to_string(SECRET_KEY_HEX_CHARS) +
+                " hex characters (" + std::to_string(SECRET_KEY_BYTES) +
+                " bytes); got " + std::to_string(hexKey.size()) + ". Refusing to start.";
+            keyLoaded = false;
+            return false;
+        }
+
+        // decode into a temporary vector (from_hex is general / variable-length),
+        // then copy the fixed 64 bytes into the array member. from_hex rejects any
+        // non-hex character; the size check is belt-and-suspenders (the 128-char
+        // length check above already implies 64 decoded bytes).
+        std::vector<uint8_t> decoded;
+        if (!from_hex(hexKey, decoded) || decoded.size() != SECRET_KEY_BYTES) {
+            err = std::string("Environment variable ") + SECRET_KEY_ENV_VAR +
+                " contains non-hex characters. Refusing to start.";
+            keyLoaded = false;
+            return false;
+        }
+
+        std::copy(decoded.begin(), decoded.end(), secretKey.begin());
+        keyLoaded = true;
+        return true;
+    }
+
+    // True once a valid key has been loaded. Verification/minting must refuse to
+    // operate if this is false.
+    bool hasKey() const {
+        std::lock_guard<std::mutex> lock(mtx);
+        return keyLoaded;
+    }
+
+    // Copy the 64-byte key out for use by the HMAC. Returns false if no key is
+    // loaded (fail closed). The out-parameter is a fixed 64-byte std::array, so
+    // the size is guaranteed by the type -- callers pass array.data()/size() to
+    // hmac_sha256. Handing back a copy keeps the member encapsulated; the caller
+    // uses it transiently to compute/verify a tag and lets it drop.
+    bool getSecretKey(std::array<uint8_t, SECRET_KEY_BYTES>& out) const {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!keyLoaded)
+            return false;
+        out = secretKey;
+        return true;
+    }
 
     // Load the counter from the state file (call once at startup). On success the
     // in-memory counter is set to the on-disk value; on failure it is left at 0
@@ -248,5 +415,136 @@ public:
     uint64_t getCounter() const {
         std::lock_guard<std::mutex> lock(mtx);
         return serverCounter;
+    }
+
+public:
+    // -----------------------------------------------------------------------
+    // mintToken: issue a sealed token for `ip`, valid until `expiry` (Unix secs),
+    // bound to the CURRENT revocation generation. Returns false (empty token) if
+    // no key is loaded, or if `ip` contains the field separator (which would make
+    // the token ambiguous to parse back).
+    //
+    // This is an OPERATOR/server action -- it needs the secret key, so it can only
+    // run where the key is loaded. It must NEVER be exposed as an unauthenticated
+    // endpoint, or anyone could mint valid tokens.
+    // -----------------------------------------------------------------------
+    bool mintToken(const std::string& ip, uint64_t expiry,
+        std::string& tokenOut, std::string& err) {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        if (!keyLoaded) {
+            err = "Cannot mint a token: no secret key is loaded.";
+            return false;
+        }
+        // the ip must not contain the separator, or the token couldn't be split
+        // back into fields unambiguously.
+        if (ip.find(TOKEN_FIELD_SEPARATOR) != std::string::npos) {
+            err = "Cannot mint a token: ip contains the reserved separator character.";
+            return false;
+        }
+
+        // read the current generation DIRECTLY (we hold the lock; do NOT call
+        // getCounter() here -- std::mutex is not recursive, that would deadlock).
+        const uint64_t counter = serverCounter;
+
+        const std::string message = buildSignedMessage(ip, counter, expiry);
+        uint8_t tag[TAG_BYTES];
+        computeTagLocked(message, tag);
+
+        // token = "SD-" + signed message + "|" + hex tag
+        tokenOut = TOKEN_PREFIX + message + TOKEN_FIELD_SEPARATOR + to_hex(tag, TAG_BYTES);
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // verifyToken: check a token is authentic, current, unexpired, and from the
+    // expected IP. `requestIp` is the actual source IP of the incoming request;
+    // `now` is the current Unix time (passed in so this stays testable and the
+    // caller controls the clock source). Returns a VerifyResult explaining the
+    // outcome. FAILS CLOSED: anything unexpected -> a reject result.
+    //
+    // Order of checks matters for security:
+    //   1. structural parse (prefix, field count, numeric fields, tag length)
+    //   2. recompute the tag over the RECEIVED message and constant-time compare
+    //      -- we do NOT trust any field until the seal is verified
+    //   3. only AFTER the seal is good do we check IP / generation / expiry
+    // -----------------------------------------------------------------------
+    VerifyResult verifyToken(const std::string& token,
+        const std::string& requestIp,
+        uint64_t now) const {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        if (!keyLoaded)
+            return VerifyResult::NoKey;
+
+        // --- (1) structural parse -----------------------------------------
+        // must start with the "SD-" prefix
+        if (token.size() < TOKEN_PREFIX.size() ||
+            token.compare(0, TOKEN_PREFIX.size(), TOKEN_PREFIX) != 0)
+            return VerifyResult::Malformed;
+
+        // strip the prefix, then split the remainder on '|' into fields
+        std::string body = token.substr(TOKEN_PREFIX.size());
+        std::vector<std::string> fields;
+        {
+            std::string field;
+            std::istringstream stream(body);
+            while (std::getline(stream, field, TOKEN_FIELD_SEPARATOR))
+                fields.push_back(field);
+        }
+        // exactly ip, counter, expiry, tag
+        if (fields.size() != TOKEN_FIELD_COUNT)
+            return VerifyResult::Malformed;
+
+        const std::string& ipField = fields[0];
+        const std::string& counterField = fields[1];
+        const std::string& expiryField = fields[2];
+        const std::string& tagField = fields[3];
+
+        // the tag must be exactly 64 hex chars
+        if (tagField.size() != TAG_HEX_CHARS)
+            return VerifyResult::Malformed;
+
+        // parse counter and expiry as unsigned integers, rejecting junk
+        uint64_t tokenCounter = 0;
+        uint64_t tokenExpiry = 0;
+        try {
+            size_t consumedC = 0, consumedE = 0;
+            tokenCounter = std::stoull(counterField, &consumedC);
+            tokenExpiry = std::stoull(expiryField, &consumedE);
+            if (consumedC != counterField.size() || consumedE != expiryField.size())
+                return VerifyResult::Malformed;   // trailing non-numeric junk
+        }
+        catch (...) {
+            return VerifyResult::Malformed;       // not a number / out of range
+        }
+
+        // decode the provided tag hex into bytes
+        std::vector<uint8_t> providedTag;
+        if (!from_hex(tagField, providedTag) || providedTag.size() != TAG_BYTES)
+            return VerifyResult::Malformed;
+
+        // --- (2) verify the seal over the RECEIVED message ----------------
+        // Rebuild the signed message from the RECEIVED fields (not from what we
+        // wish they were) and recompute the tag. This is the "does the seal match
+        // the letter" step -- do it before trusting ip/counter/expiry.
+        const std::string message = buildSignedMessage(ipField, tokenCounter, tokenExpiry);
+        uint8_t expectedTag[TAG_BYTES];
+        computeTagLocked(message, expectedTag);
+        if (!constant_time_equal(expectedTag, providedTag.data(), TAG_BYTES))
+            return VerifyResult::BadTag;          // forged or tampered
+
+        // --- (3) seal is genuine: now the fields are trustworthy ----------
+        // generation check (revocation): stale if not the current counter
+        if (tokenCounter != serverCounter)
+            return VerifyResult::Revoked;
+        // expiry check
+        if (now > tokenExpiry)
+            return VerifyResult::Expired;
+        // IP check (Problem 2)
+        if (ipField != requestIp)
+            return VerifyResult::WrongIp;
+
+        return VerifyResult::Ok;
     }
 };

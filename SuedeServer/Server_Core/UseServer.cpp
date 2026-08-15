@@ -9,6 +9,58 @@
 #include "../../Graph and Searchers/Graph.h"
 
 #include <string>
+#include <ctime>        // std::time for token-expiry checks
+
+// ---------------------------------------------------------------------------
+// authenticate: run the request's bearer token through the auth layer.
+//
+// Pulls the token from the "Authorization: Bearer <token>" header, verifies it
+// against `auth` using the request's source IP and the current time, and turns
+// the VerifyResult into an HTTP status. Returns true if the request is
+// authorised (caller proceeds); otherwise fills `res` with an error and returns
+// false (caller returns immediately).
+//
+// We deliberately do NOT tell the client WHICH check failed (forged vs expired
+// vs wrong-IP vs revoked): disclosing that helps an attacker probe. Every
+// token failure collapses to one generic rejection. A MISSING server key is
+// our misconfiguration, not the client's, so that maps to 500.
+// ---------------------------------------------------------------------------
+static bool authenticate(const HttpRequest& req, AuthState& auth, HttpResponse& res) {
+    // find the Authorization header (http_simple lowercases header keys)
+    auto it = req.headers.find("authorization");
+    if (it == req.headers.end()) {
+        replyError(res, Http::BadRequest, "missing Authorization header");
+        return false;
+    }
+
+    // expect the form "Bearer <token>"
+    const std::string& headerValue = it->second;
+    const std::string bearerPrefix = "Bearer ";
+    if (headerValue.size() <= bearerPrefix.size() ||
+        headerValue.compare(0, bearerPrefix.size(), bearerPrefix) != 0) {
+        replyError(res, Http::BadRequest, "Authorization header must be 'Bearer <token>'");
+        return false;
+    }
+    const std::string token = headerValue.substr(bearerPrefix.size());
+
+    // verify against the auth state, using this request's source IP and now().
+    const uint64_t now = (uint64_t)std::time(nullptr);
+    AuthState::VerifyResult result = auth.verifyToken(token, req.clientIp, now);
+
+    if (result == AuthState::VerifyResult::Ok)
+        return true;
+
+    // a missing server key is OUR fault, not the client's -> 500.
+    if (result == AuthState::VerifyResult::NoKey) {
+        replyError(res, Http::ServerError, "server has no auth key configured");
+        return false;
+    }
+
+    // every other failure (Malformed / BadTag / WrongIp / Revoked / Expired) is
+    // a single generic rejection -- we don't disclose which check failed.
+    replyError(res, Http::Unprocessable, "invalid or unauthorised token");
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // routeRequest: the query router.
@@ -31,11 +83,15 @@
 // shared state of its own, so it needs no locks - the only shared thing it
 // touches is `gh`, which is internally synchronised.
 // ---------------------------------------------------------------------------
-static HttpResponse routeRequest(const HttpRequest& req, GraphHandler& gh) {
+static HttpResponse routeRequest(const HttpRequest& req, GraphHandler& gh, AuthState& auth) {
     HttpResponse res;
 
     // ---- POST /query : run a Query-SQL command ----
     if (req.method == "POST" && req.path == "/query") {
+        // (1.5) AUTH: both routes require a valid bearer token. Reject before
+        // touching the engine if the token is missing/invalid/unauthorised.
+        if (!authenticate(req, auth, res))
+            return res;
         // (2) parse body
         ParseResult parsed = parseBody(req.body);
         if (!parsed.ok) {
@@ -58,6 +114,9 @@ static HttpResponse routeRequest(const HttpRequest& req, GraphHandler& gh) {
 
     // ---- GET /stats : node / edge counts ----
     if (req.method == "GET" && req.path == "/stats") {
+        // AUTH: /stats is protected too (per config -- nothing readable without a token).
+        if (!authenticate(req, auth, res))
+            return res;
         json body;
         body["nodes"] = gh.getNodeCount();
         body["edges"] = gh.getEdgeCount();
@@ -91,14 +150,19 @@ int runSuedeServer(const int port, std::string& err, bool use_public) {
         netCleanup();
         return 1;
     }
-    // `authState` is the in-memory source of truth for the revocation generation
-    // this run. It is loaded once above. STILL TO DO when the auth layer lands:
-    //   * pass `authState` by reference into routeRequest (alongside `gh`, via the
-    //     std::bind below) so token verification can READ the generation on every
-    //     request -- authState.getCounter().
-    //   * choose a revoke TRIGGER that calls authState.revokeAll() (e.g. a signal
-    //     handler that trips a flag the accept loop checks, mirroring the shutdown
-    //     handler). revokeAll() already increments + persists atomically.
+
+    // Load the HMAC secret key from the SUEDE_SECRET_KEY environment variable.
+    // FAIL CLOSED: no valid key -> refuse to start. Running without a key (or
+    // with a default one) would make every token forgeable, so this is fatal.
+    if (!authState.loadSecretKey(err)) {
+        netCleanup();
+        return 1;
+    }
+    // `authState` now holds both the revocation counter and the secret key, and
+    // is bound into routeRequest below so every request is token-checked. STILL
+    // TO DO: choose a revoke TRIGGER that calls authState.revokeAll() (e.g. a
+    // signal handler that trips a flag the accept loop checks, mirroring the
+    // shutdown handler). revokeAll() already increments + persists atomically.
     // The shutdown flush below is a SUPPLEMENT to revoke-time persistence, not a
     // replacement -- see the persistence notes at the top of this file.
 
@@ -119,7 +183,8 @@ int runSuedeServer(const int port, std::string& err, bool use_public) {
     // reference through the bind (not a copy); it stays valid because the
     // unique_ptr outlives the runServer call below.
     std::function<HttpResponse(const HttpRequest&)> httpHandler =
-        std::bind(routeRequest, std::placeholders::_1, std::ref(*graphHandler));
+        std::bind(routeRequest, std::placeholders::_1,
+            std::ref(*graphHandler), std::ref(authState));
 
     // Run the accept loop. Blocks. On failure to start, err is set by makeListener.
     runServer(port, httpHandler, err, use_public);

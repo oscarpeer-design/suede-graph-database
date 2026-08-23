@@ -21,10 +21,9 @@
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
-    <ProjectGuid>{926644bf-28af-4ce5-9b29-37af32784f63}</ProjectGuid>
-    <RootNamespace>GraphDatabaseOscar</RootNamespace>
+    <ProjectGuid>{69585df2-be3d-4bce-92c7-230be29134ab}</ProjectGuid>
+    <RootNamespace>SuedeServer</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
-    <ProjectName>Suede Graph Database</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
@@ -75,8 +74,9 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\$(ProjectDir)Server_Core\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -89,8 +89,9 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\$(ProjectDir)Server_Core\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -101,8 +102,9 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\$(ProjectDir)Server_Core\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -115,8 +117,9 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\$(ProjectDir)Server_Core\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -124,34 +127,34 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="Graph and Searchers\BFS_Searcher.h" />
-    <ClInclude Include="Graph and Searchers\CSR_Representation.h" />
-    <ClInclude Include="Graph and Searchers\CSR_Searcher.h" />
-    <ClInclude Include="Graph and Searchers\ErrorCodes.h" />
-    <ClInclude Include="Graph and Searchers\Graph.h" />
-    <ClInclude Include="Graph and Searchers\Types.h" />
-    <ClInclude Include="Queries and Graph Handlers\GraphHandler.h" />
-    <ClInclude Include="Queries and Graph Handlers\Query.h" />
-    <ClInclude Include="Storage\Crc32.h" />
-    <ClInclude Include="Storage\FileHandling.h" />
-    <ClInclude Include="Storage\StorageEngine.h" />
-    <ClInclude Include="Tests\test_graph_suite.h" />
-    <ClInclude Include="User Interaction\InteractiveApp.h" />
+    <ClCompile Include="..\Graph and Searchers\BFS_Searcher.cpp" />
+    <ClCompile Include="..\Graph and Searchers\CSR_Representation.cpp" />
+    <ClCompile Include="..\Graph and Searchers\CSR_Searcher.cpp" />
+    <ClCompile Include="..\Graph and Searchers\Graph.cpp" />
+    <ClCompile Include="..\Queries and Graph Handlers\GraphHandler.cpp" />
+    <ClCompile Include="..\Queries and Graph Handlers\Query.cpp" />
+    <ClCompile Include="..\Storage\StorageEngine.cpp" />
+    <ClCompile Include="Server_Core\UseServer.cpp" />
+    <ClCompile Include="SuedeServer.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="QUERY_REFERENCE.md" />
-  </ItemGroup>
-  <ItemGroup>
-    <ClCompile Include="Graph and Searchers\BFS_Searcher.cpp" />
-    <ClCompile Include="Graph and Searchers\CSR_Representation.cpp" />
-    <ClCompile Include="Graph and Searchers\CSR_Searcher.cpp" />
-    <ClCompile Include="Graph and Searchers\Graph.cpp" />
-    <ClCompile Include="Queries and Graph Handlers\GraphHandler.cpp" />
-    <ClCompile Include="Queries and Graph Handlers\Query.cpp" />
-    <ClCompile Include="Storage\StorageEngine.cpp" />
-    <ClCompile Include="Tests\test_graph_suite.cpp" />
-    <ClCompile Include="User Interaction\InteractiveApp.cpp" />
-    <ClCompile Include="User Interaction\Suede_Graph_Database.cpp" />
+    <ClInclude Include="..\Graph and Searchers\BFS_Searcher.h" />
+    <ClInclude Include="..\Graph and Searchers\CSR_Representation.h" />
+    <ClInclude Include="..\Graph and Searchers\CSR_Searcher.h" />
+    <ClInclude Include="..\Graph and Searchers\ErrorCodes.h" />
+    <ClInclude Include="..\Graph and Searchers\Graph.h" />
+    <ClInclude Include="..\Graph and Searchers\Types.h" />
+    <ClInclude Include="..\Queries and Graph Handlers\GraphHandler.h" />
+    <ClInclude Include="..\Queries and Graph Handlers\Query.h" />
+    <ClInclude Include="..\Storage\Crc32.h" />
+    <ClInclude Include="..\Storage\FileHandling.h" />
+    <ClInclude Include="..\Storage\StorageEngine.h" />
+    <ClInclude Include="Server_Core\Auth.h" />
+    <ClInclude Include="Server_Core\HMAC.h" />
+    <ClInclude Include="Server_Core\http_simple.h" />
+    <ClInclude Include="Server_Core\Json.h" />
+    <ClInclude Include="Server_Core\nlohmann_json.hpp" />
+    <ClInclude Include="Server_Core\UseServer.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

@@ -2,14 +2,6 @@
 // This is the ONLY translation unit that sees all three layers.
 
 #include "UseServer.h"
-#include "http_simple.h"
-#include "Json.h"
-#include "Auth.h"
-#include "../../Queries and Graph Handlers/GraphHandler.h"
-#include "../../Graph and Searchers/Graph.h"
-
-#include <string>
-#include <ctime>        // std::time for token-expiry checks
 
 // ---------------------------------------------------------------------------
 // authenticate: run the request's bearer token through the auth layer.
@@ -136,7 +128,7 @@ static HttpResponse routeRequest(const HttpRequest& req, GraphHandler& gh, AuthS
 // routeRequest to satisfy runServer's callback signature, and runs the accept
 // loop. Blocks until the loop exits (currently: forever). No lambdas.
 // ---------------------------------------------------------------------------
-int runSuedeServer(const int port, std::string& err, bool use_public) {
+int runSuedeServer(const uint64_t port, std::string& err, bool use_public) {
     // start Server
     if (!netInit()) {
         err = "Server initialisation failed";

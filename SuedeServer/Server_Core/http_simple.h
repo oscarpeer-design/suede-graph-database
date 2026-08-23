@@ -184,7 +184,7 @@ inline void netCleanup() {}
 // 127.0.0.1:port (or 0.0.0.0:port if use_public) and listening, or
 // INVALID_SOCKET with err filled on failure.
 // ---------------------------------------------------------------------------
-inline socket_t makeListener(const int port, std::string& err, bool use_public = false) {
+inline socket_t makeListener(const uint64_t port, std::string& err, bool use_public = false) {
     // first, create the socket
     socket_t listenFd = socket(AF_INET, SOCK_STREAM, 0);
     if (listenFd == INVALID_SOCKET) {
@@ -539,7 +539,7 @@ inline void installShutdownSignalHandlers() {
 // requested - spawning one detached thread per connection. Returns when the
 // listener cannot be created OR when requestServerShutdown() is called.
 // ---------------------------------------------------------------------------
-inline void runServer(const int port,
+inline void runServer(const uint64_t port,
     std::function<HttpResponse(const HttpRequest&)> handler,
     std::string& err,
     const bool use_public = false) {

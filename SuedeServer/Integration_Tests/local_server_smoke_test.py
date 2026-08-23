@@ -1,41 +1,39 @@
 #!/usr/bin/env python3
 """
-local_server_smoke_test.py - integration / smoke / load test for SuedeServer.
+local_server_smoke_test.py - self-driving integration / smoke / load test for
+SuedeServer.
 
-This is NOT a unit test. It does not link or compile any Suede C++ code. It is an
-EXTERNAL CLIENT that talks to a *running* SuedeServer over HTTP, exactly the way a
-real client (curl, another service, a web front-end) would. It therefore requires
-the server to already be running, AND -- since the server now requires
-authentication -- a valid bearer token to talk to it.
+This is NOT a unit test. It exercises a REAL SuedeServer process over HTTP,
+exactly the way a real client would. By default it is fully self-driving:
 
-    Terminal 1:  set SUEDE_SECRET_KEY=<128 hex chars>   (the server's key)
-                 SuedeServer.exe                          (listens on :8080)
-    Terminal 2:  set SUEDE_TEST_TOKEN=<a valid token>     (minted for THIS client's IP)
-                 python local_server_smoke_test.py
+    python local_server_smoke_test.py
 
-Getting the token: the test cannot mint its own token (it has neither the secret
-key nor the C++ code -- it is a pure external client). The operator mints a token
-with the minting tool, bound to the IP this test connects FROM (e.g. 127.0.0.1),
-and passes it to the test via the SUEDE_TEST_TOKEN environment variable. This
-mirrors how a real API client works: it is handed a token and simply uses it.
+...and it will, by itself:
+    1. generate a fresh random 128-hex secret key,
+    2. launch SuedeServer with that key in its environment,
+    3. wait until the server is actually listening,
+    4. mint a bearer token via `SuedeServer --mint 127.0.0.1` (capturing stdout),
+    5. run every test phase (auth, reads, writes, errors, concurrency),
+    6. ALWAYS shut the server down again, even if a test fails.
 
-What it checks, in order:
-    1. Authentication    - no token -> rejected; garbage token -> rejected;
-                           valid token -> accepted. (NEW.)
-    2. Reachability      - GET /stats (authed) returns 200 and valid JSON.
-    3. Statefulness      - inserts persist ACROSS separate requests.
-    4. Reads             - SELECT / MATCH come back correctly.
-    5. Error handling    - bad JSON -> 400, bad query -> 422, bad route -> 404
-                           (all WITH a valid token, so we test the engine's
-                           contract, not the auth layer).
-    6. Concurrency       - many simultaneous authed requests exercise the
-                           shared_mutex / MVCC through the real socket path.
+Where to find the executable: set SUEDE_SERVER_EXE to its path, or let the
+harness try a few common build locations. On Windows that's typically
+    x64\\Release\\SuedeServer.exe
 
-Uses only the Python standard library (urllib) - no `pip install` needed.
+External mode (test an already-running server, the old behaviour):
+    set SUEDE_TEST_TOKEN=<a token minted for 127.0.0.1>
+    python local_server_smoke_test.py --external
+In --external mode the harness does NOT launch or mint anything; it just uses
+SUEDE_TEST_TOKEN against whatever server is already at HOST.
+
+Uses only the Python standard library - no `pip install` needed.
 """
 
 import json
 import os
+import secrets
+import socket
+import subprocess
 import sys
 import time
 import urllib.request
@@ -45,14 +43,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-HOST = "http://localhost:8080"
+HOST_NAME = "127.0.0.1"
+PORT = 8080
+HOST = f"http://{HOST_NAME}:{PORT}"
 CONCURRENCY = 50        # how many simultaneous requests in the load phase
 LOAD_REQUESTS = 500     # total requests fired in the load phase
+CLIENT_IP = "127.0.0.1"  # the IP this test connects FROM; the token is bound to it
 
-# The bearer token this client authenticates with. Minted by the operator for
-# the IP this test connects from, and passed in via the environment. Without it
-# the test cannot do anything past the auth phase, so we require it up front.
-TEST_TOKEN = os.environ.get("SUEDE_TEST_TOKEN", "")
+# How long to wait for the server to come up before giving up (seconds).
+SERVER_START_TIMEOUT = 10.0
+
+# The token is set during startup (self-driving) or read from the environment
+# (--external mode). Populated by main() before the phases run.
+TEST_TOKEN = ""
 
 # simple pass/fail bookkeeping
 _passed = 0
@@ -70,6 +73,137 @@ def _check(name, condition, detail=""):
         print(f"  [FAIL] {name}   {detail}")
 
 
+# ===========================================================================
+# Server lifecycle (self-driving mode)
+# ===========================================================================
+
+def find_server_exe():
+    """Locate the SuedeServer executable, trying hard so you don't have to set
+    anything. Order:
+      1. SUEDE_SERVER_EXE env var, if set (an explicit override always wins).
+      2. common build-output locations, resolved relative to BOTH this script's
+         folder and the current working directory (so it works no matter where
+         you launch python from).
+      3. last resort: walk up from the script looking for any SuedeServer.exe /
+         SuedeServer under the repo (finds the VS build output wherever it lands).
+    Returns the path or None.
+    """
+    # 1) explicit override
+    env_path = os.environ.get("SUEDE_SERVER_EXE")
+    if env_path and os.path.isfile(env_path):
+        return env_path
+
+    # the executable's possible names (Windows vs POSIX build)
+    exe_names = ["SuedeServer.exe", "SuedeServer", "suede"]
+
+    # relative sub-paths where a build typically lands, from a base directory
+    rel_layouts = [
+        os.path.join("x64", "Release"),
+        os.path.join("x64", "Debug"),
+        os.path.join("SuedeServer", "x64", "Release"),
+        os.path.join("SuedeServer", "x64", "Debug"),
+        "",   # the base dir itself (e.g. a local g++ build next to the script)
+    ]
+
+    # 2) search relative to the SCRIPT's folder and the CURRENT WORKING DIR.
+    #    Using the script's folder is what makes "just run it" work regardless of
+    #    which directory you happen to be in when you launch python.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    bases = [script_dir, os.getcwd()]
+    for base in bases:
+        for layout in rel_layouts:
+            for name in exe_names:
+                candidate = os.path.join(base, layout, name)
+                if os.path.isfile(candidate):
+                    return candidate
+
+    # 3) last resort: walk the tree from the script folder AND a couple of parent
+    #    levels (the script may live under SuedeServer/, the .exe under the repo
+    #    root's x64/). Return the first SuedeServer executable found.
+    roots = [script_dir,
+             os.path.dirname(script_dir),
+             os.path.dirname(os.path.dirname(script_dir))]
+    seen = set()
+    for root in roots:
+        root = os.path.abspath(root)
+        if root in seen or not os.path.isdir(root):
+            continue
+        seen.add(root)
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in ("SuedeServer.exe", "SuedeServer"):
+                if name in filenames:
+                    return os.path.join(dirpath, name)
+
+    return None
+
+
+def generate_key_hex():
+    """A fresh random 64-byte key as 128 hex characters (matches the server's
+    SUEDE_SECRET_KEY format)."""
+    return secrets.token_hex(64)
+
+
+def wait_until_listening(host, port, timeout):
+    """Poll the TCP port until something accepts a connection, or timeout.
+    Returns True if the server became reachable, False otherwise. This is far
+    more reliable than a fixed sleep -- it waits for ACTUAL readiness."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
+def mint_token(exe, env, ip):
+    """Run `<exe> --mint <ip>` and capture the token it prints to stdout. Returns
+    the token string, or raises RuntimeError with the server's stderr on failure.
+    The minting process uses the SAME env (same key) as the launched server, so
+    the token it produces will verify against that server."""
+    proc = subprocess.run(
+        [exe, "--mint", ip],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"mint failed (exit {proc.returncode}): {proc.stderr.strip()}")
+    token = proc.stdout.strip()
+    if not token:
+        raise RuntimeError("mint produced no token on stdout")
+    return token
+
+
+def start_server(exe, env):
+    """Launch the server as a subprocess with the given environment. Returns the
+    Popen handle. The caller MUST ensure stop_server() is called (use try/finally)."""
+    # inherit stdout/stderr so the operator sees the server's own logs inline
+    return subprocess.Popen([exe, str(PORT)], env=env)
+
+
+def stop_server(proc):
+    """Shut the server down cleanly, escalating to kill if it doesn't exit.
+    Safe to call with proc=None. Never raises."""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is not None:
+            return  # already exited
+        proc.terminate()          # SIGTERM -> our graceful shutdown handler
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()           # last resort
+            proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # HTTP helpers - the client side of the protocol.
 # Each returns (status_code, parsed_json_or_None, raw_text).
@@ -77,16 +211,21 @@ def _check(name, condition, detail=""):
 # `token` controls the Authorization header:
 #   * a string  -> sent as "Authorization: Bearer <string>"
 #   * None      -> no Authorization header at all (to test the unauthed path)
-# Most calls default to the valid TEST_TOKEN; the auth phase overrides it.
+#   * "" / default sentinel -> use the global TEST_TOKEN
 # ---------------------------------------------------------------------------
+_USE_DEFAULT = object()   # sentinel: "use the global TEST_TOKEN"
+
+
 def _auth_headers(token, extra=None):
     headers = dict(extra or {})
+    if token is _USE_DEFAULT:
+        token = TEST_TOKEN
     if token is not None:
         headers["Authorization"] = "Bearer " + token
     return headers
 
 
-def http_get(path, token=TEST_TOKEN):
+def http_get(path, token=_USE_DEFAULT):
     url = HOST + path
     try:
         req = urllib.request.Request(url, method="GET", headers=_auth_headers(token))
@@ -94,14 +233,13 @@ def http_get(path, token=TEST_TOKEN):
             raw = resp.read().decode("utf-8", "replace")
             return resp.status, _try_json(raw), raw
     except urllib.error.HTTPError as e:
-        # 4xx/5xx come back as HTTPError; we still want the status + body
         raw = e.read().decode("utf-8", "replace")
         return e.code, _try_json(raw), raw
     except urllib.error.URLError as e:
         return None, None, f"CONNECTION FAILED: {e}"
 
 
-def http_post(path, body_obj=None, raw_body=None, token=TEST_TOKEN):
+def http_post(path, body_obj=None, raw_body=None, token=_USE_DEFAULT):
     """POST JSON. Pass body_obj to send a dict as JSON, or raw_body to send an
     exact string (used to test malformed JSON)."""
     url = HOST + path
@@ -131,36 +269,23 @@ def _try_json(raw):
         return None
 
 
-def query(command, token=TEST_TOKEN):
+def query(command, token=_USE_DEFAULT):
     """Convenience: POST a Query-SQL command to /query (authed by default)."""
     return http_post("/query", {"command": command}, token=token)
 
 
-# ---------------------------------------------------------------------------
-# Phase 0 - preflight: make sure we actually have a token to test with.
-# ---------------------------------------------------------------------------
-def phase_preflight():
-    print("\n== Phase 0: preflight ==")
-    if not TEST_TOKEN:
-        print("  [FATAL] No token provided. Set SUEDE_TEST_TOKEN to a token minted")
-        print("          for this client's IP (e.g. 127.0.0.1), then re-run.")
-        sys.exit(2)
-    print(f"  token present ({len(TEST_TOKEN)} chars)")
+# ===========================================================================
+# Test phases
+# ===========================================================================
 
-
-# ---------------------------------------------------------------------------
-# Phase 1 - authentication (the auth contract)
-# The server must reject requests with no token or a bad token, and accept the
-# valid one. We hit /stats for all three because it is a simple GET.
-# ---------------------------------------------------------------------------
 def phase_auth():
     print("\n== Phase 1: authentication ==")
 
-    # (a) no Authorization header at all -> rejected (server returns 400: missing header)
+    # (a) no Authorization header at all -> rejected
     status, _, raw = http_get("/stats", token=None)
     if status is None:
         print(f"  [FATAL] Could not reach the server at {HOST}.")
-        print(f"          Is the server running? ({raw})")
+        print(f"          ({raw})")
         sys.exit(2)
     _check("no token -> rejected (not 200)", status != 200, f"got {status}: {raw!r}")
 
@@ -175,9 +300,6 @@ def phase_auth():
            isinstance(body, dict) and "nodes" in body, f"body={raw!r}")
 
 
-# ---------------------------------------------------------------------------
-# Phase 2 - reachability (authed)
-# ---------------------------------------------------------------------------
 def phase_reachability():
     print("\n== Phase 2: reachability (authed) ==")
     status, body, raw = http_get("/stats")
@@ -187,9 +309,6 @@ def phase_reachability():
     return body
 
 
-# ---------------------------------------------------------------------------
-# Phase 3 - statefulness (inserts persist across separate requests)
-# ---------------------------------------------------------------------------
 def phase_statefulness():
     print("\n== Phase 3: statefulness (state persists across requests) ==")
     _, before, _ = http_get("/stats")
@@ -218,9 +337,6 @@ def phase_statefulness():
            f"status={status} body={raw!r}")
 
 
-# ---------------------------------------------------------------------------
-# Phase 4 - reads
-# ---------------------------------------------------------------------------
 def phase_reads():
     print("\n== Phase 4: reads ==")
     status, body, raw = query("SELECT * FROM NODES WHERE LABEL = 'Person'")
@@ -235,12 +351,6 @@ def phase_reads():
            f"status={status} body={raw!r}")
 
 
-# ---------------------------------------------------------------------------
-# Phase 5 - error handling (the HTTP status contract)
-# All of these carry a VALID token, so we are testing the ENGINE's error
-# contract, not the auth layer (that was Phase 1). This keeps the two concerns
-# separate: a 400 here means "bad request body", not "bad token".
-# ---------------------------------------------------------------------------
 def phase_errors():
     print("\n== Phase 5: error handling (authed) ==")
     # malformed JSON -> 400
@@ -260,9 +370,6 @@ def phase_errors():
     _check("unknown route -> 404", status == 404, f"got {status}: {raw!r}")
 
 
-# ---------------------------------------------------------------------------
-# Phase 6 - concurrency / load (all authed)
-# ---------------------------------------------------------------------------
 def _one_load_request(i):
     """A single authed load request: mostly reads, some writes. Returns
     (ok, status, elapsed_seconds). Never raises."""
@@ -321,18 +428,84 @@ def phase_load():
            f"expected +{expected_writes} (got +{end_nodes - start_nodes})")
 
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
-def main():
-    print(f"Suede server integration test -> {HOST}")
-    phase_preflight()
+def run_all_phases():
+    """Run every test phase in order."""
     phase_auth()
     phase_reachability()
     phase_statefulness()
     phase_reads()
     phase_errors()
     phase_load()
+
+
+# ===========================================================================
+# main
+# ===========================================================================
+
+def run_external():
+    """--external: test an already-running server using SUEDE_TEST_TOKEN."""
+    global TEST_TOKEN
+    print(f"Suede integration test (external) -> {HOST}")
+    TEST_TOKEN = os.environ.get("SUEDE_TEST_TOKEN", "")
+    if not TEST_TOKEN:
+        print("  [FATAL] --external mode needs SUEDE_TEST_TOKEN set to a token")
+        print("          minted for 127.0.0.1. Set it and re-run.")
+        sys.exit(2)
+    run_all_phases()
+
+
+def run_self_driving():
+    """Default: generate a key, launch the server, mint a token, run, tear down."""
+    global TEST_TOKEN
+    print(f"Suede integration test (self-driving) -> {HOST}")
+
+    exe = find_server_exe()
+    if exe is None:
+        print("  [FATAL] Could not find the SuedeServer executable.")
+        print("          Set SUEDE_SERVER_EXE to its path, e.g.:")
+        print("            set SUEDE_SERVER_EXE=x64\\Release\\SuedeServer.exe")
+        sys.exit(2)
+    print(f"  server exe: {exe}")
+
+    # a fresh key for THIS run; both the server and the mint call use it.
+    key = generate_key_hex()
+    child_env = dict(os.environ)
+    child_env["SUEDE_SECRET_KEY"] = key
+
+    server = None
+    try:
+        # launch the server, then wait until it is actually accepting connections
+        print(f"  launching server on port {PORT} ...")
+        server = start_server(exe, child_env)
+        if not wait_until_listening(HOST_NAME, PORT, SERVER_START_TIMEOUT):
+            # if the server died on startup, surface why
+            if server.poll() is not None:
+                print(f"  [FATAL] server exited during startup (code {server.returncode}).")
+            else:
+                print(f"  [FATAL] server did not start listening within "
+                      f"{SERVER_START_TIMEOUT}s.")
+            sys.exit(2)
+        print("  server is listening.")
+
+        # mint a token bound to the client IP, using the same key
+        print(f"  minting a token for {CLIENT_IP} ...")
+        TEST_TOKEN = mint_token(exe, child_env, CLIENT_IP)
+        print(f"  token minted ({len(TEST_TOKEN)} chars).")
+
+        run_all_phases()
+    finally:
+        # ALWAYS shut the server down, even if a phase raised or sys.exit fired.
+        print("\n  shutting server down ...")
+        stop_server(server)
+
+
+def main():
+    external = "--external" in sys.argv
+
+    if external:
+        run_external()
+    else:
+        run_self_driving()
 
     print("\n" + "=" * 48)
     print(f"  RESULT: {_passed} passed, {_failed} failed")

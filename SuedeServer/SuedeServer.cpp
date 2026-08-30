@@ -114,13 +114,67 @@ static bool parsePortNumber(const std::string& text, uint64_t& port, std::string
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// printHelp: print full usage to stdout. Covers both modes, the one-time key
+// setup, and the token flow -- i.e. everything you need to actually get running.
+// ---------------------------------------------------------------------------
+static void printHelp() {
+    std::cout <<
+        "Suede Graph Database server\n"
+        "\n"
+        "USAGE\n"
+        "  SuedeServer [port]              Start the HTTP server (default port 8080).\n"
+        "  SuedeServer --mint <ip> [ttl]   Mint a bearer token for <ip>, print it, exit.\n"
+        "  SuedeServer --help | -h         Show this help.\n"
+        "\n"
+        "BEFORE YOU START (one-time): set the secret key\n"
+        "  The server signs auth tokens with a secret key read from the\n"
+        "  SUEDE_SECRET_KEY environment variable, and refuses to start without it.\n"
+        "\n"
+        "  Windows (PowerShell) -- generate a key and save it permanently:\n"
+        "    $key = -join ((1..64) | ForEach-Object { '{0:x2}' -f (Get-Random -Max 256) })\n"
+        "    [Environment]::SetEnvironmentVariable(\"SUEDE_SECRET_KEY\", $key, \"User\")\n"
+        "  Linux / macOS (bash) -- add to ~/.bashrc or ~/.profile:\n"
+        "    export SUEDE_SECRET_KEY=$(openssl rand -hex 64)\n"
+        "\n"
+        "  NOTE: env vars are only seen by terminals opened AFTER you set them --\n"
+        "  open a NEW terminal before running the server or minting a token.\n"
+        "\n"
+        "RUNNING (typical local session)\n"
+        "  1. Start the server (leave it running):\n"
+        "       SuedeServer\n"
+        "  2. In another terminal, mint a token for your client IP:\n"
+        "       SuedeServer --mint 127.0.0.1\n"
+        "     (127.0.0.1 = same machine. The token is BOUND to this IP and expires\n"
+        "      after 1 hour by default; pass a ttl in seconds to change it, e.g.\n"
+        "      'SuedeServer --mint 127.0.0.1 86400' for a day.)\n"
+        "  3. Open http://localhost:8080/ in a browser, paste the token into the\n"
+        "     visualiser, and run queries. Or call the API directly with the header:\n"
+        "       Authorization: Bearer <token>\n"
+        "\n"
+        "ROUTES\n"
+        "  GET  /            The graph visualiser page (public, no token).\n"
+        "  POST /query       Run a query        (requires a valid bearer token).\n"
+        "  GET  /stats       Node / edge counts (requires a valid bearer token).\n";
+}
+
 int main(int argc, char** argv)
 {
+    // ---- --help mode: print usage and exit (before anything else) ----
+    if (argc >= 2) {
+        const std::string a1 = argv[1];
+        if (a1 == "--help" || a1 == "-h" || a1 == "/?") {
+            printHelp();
+            return 0;
+        }
+    }
+
     // ---- --mint mode (operator action): mint a token and exit ----
     // Usage: SuedeServer.exe --mint <ip> [ttl_seconds]
     if (argc >= 2 && std::string(argv[1]) == "--mint") {
         if (argc < 3) {
             std::cerr << "usage: SuedeServer --mint <ip> [ttl_seconds]" << std::endl;
+            std::cerr << "run 'SuedeServer --help' for details." << std::endl;
             return 2;
         }
         const std::string ip = argv[2];

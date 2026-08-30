@@ -49,7 +49,9 @@ static const size_t TAG_HEX_CHARS = TAG_BYTES * 2;
 
 // Name of the environment variable holding the HMAC secret key, as 128 hex
 // characters (= 64 bytes). The operator sets this per-deployment; it is NEVER
-// committed to the repo. Generate one with:  openssl rand -hex 64
+// committed to the repo. Generate one per-platform (see the detailed message in
+// loadSecretKey below): PowerShell can generate+save it, or `openssl rand -hex 64`
+// on Linux/macOS. Remember env vars only load in terminals opened AFTER setting.
 static const char* SECRET_KEY_ENV_VAR = "SUEDE_SECRET_KEY";
 // The key is exactly 64 raw bytes (SHA-256 block size) = 128 hex characters.
 static const size_t SECRET_KEY_BYTES = 64;
@@ -314,9 +316,30 @@ public:
         // read the environment variable
         const char* raw = std::getenv(SECRET_KEY_ENV_VAR);
         if (raw == nullptr) {
-            err = std::string("Environment variable ") + SECRET_KEY_ENV_VAR +
-                " is not set. Generate a key with 'openssl rand -hex 64' and set it. "
-                "Refusing to start without a secret key.";
+            const std::string v = SECRET_KEY_ENV_VAR;
+            err =
+                "\n"
+                "==================================================================\n"
+                " The server needs a secret key and " + v + " is not set.\n"
+                " (This key signs auth tokens. The server refuses to start without it.)\n"
+                "\n"
+                " ONE-TIME SETUP:\n"
+                "\n"
+                " Windows (PowerShell) -- generate a key and save it permanently:\n"
+                "   $key = -join ((1..64) | ForEach-Object { '{0:x2}' -f (Get-Random -Max 256) })\n"
+                "   [Environment]::SetEnvironmentVariable(\"" + v + "\", $key, \"User\")\n"
+                "\n"
+                " Linux / macOS (bash) -- add this to your ~/.bashrc or ~/.profile:\n"
+                "   export " + v + "=$(openssl rand -hex 64)\n"
+                "\n"
+                " IMPORTANT: environment variables are only picked up by terminals\n"
+                " opened AFTER you set them. So after the setup above, OPEN A NEW\n"
+                " TERMINAL and run the server again -- this window won't see the key.\n"
+                "\n"
+                " (Quick one-off for THIS PowerShell window, without a new terminal:\n"
+                "   $env:" + v + " = [Environment]::GetEnvironmentVariable(\"" + v + "\",\"User\")\n"
+                " then run the server again.)\n"
+                "==================================================================\n";
             keyLoaded = false;
             return false;
         }

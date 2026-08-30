@@ -156,6 +156,11 @@
     <ClInclude Include="Server_Core\nlohmann_json.hpp" />
     <ClInclude Include="Server_Core\UseServer.h" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="SuedeVisualiser.htm">
+      <DeploymentContent>true</DeploymentContent>
+    </None>
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

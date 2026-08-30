@@ -2,6 +2,47 @@
 // This is the ONLY translation unit that sees all three layers.
 
 #include "UseServer.h"
+#include <fstream>      // reading the visualiser HTML file for GET /
+#include <sstream>      // slurping the file into a string
+
+// Name of the visualiser page served at GET /. It is read from the server's
+// WORKING DIRECTORY (for a VS build, x64\Release next to SuedeServer.exe), so
+// SuedeVisualiser.htm must sit beside the executable. If it is missing, GET /
+// returns a clear error rather than a blank page.
+static const std::string VISUALISER_FILE = "SuedeVisualiser.htm";
+
+// ---------------------------------------------------------------------------
+// serveVisualiserPage: fill `res` with the visualiser HTML (GET /).
+//
+// This route is deliberately PUBLIC (no token): the user has no token until the
+// page gives them somewhere to enter one, so the page shell itself must load
+// without auth. The API routes it then calls (/query, /stats) STAY token-gated.
+//
+// Because the page is served BY this server, its JavaScript calls /query on the
+// SAME origin (a relative fetch), so there is no cross-origin request and no
+// CORS handling is needed at all.
+//
+// The file is read FRESH on each request so you can edit SuedeVisualiser.htm and
+// just refresh the browser -- no server restart. The per-request read cost is
+// negligible at this scale.
+// ---------------------------------------------------------------------------
+static void serveVisualiserPage(HttpResponse& res) {
+    std::ifstream in(VISUALISER_FILE, std::ios::binary);
+    if (!in) {
+        // Not found / unreadable: a readable error beats a blank page. Note this
+        // is the server's own file, so a failure here is an operator/deploy issue
+        // (the .htm wasn't placed next to the exe), hence 500 not 404.
+        replyError(res, Http::ServerError,
+            "could not open " + VISUALISER_FILE +
+            " (it must sit in the server's working directory, e.g. next to SuedeServer.exe)");
+        return;
+    }
+    std::ostringstream buffer;
+    buffer << in.rdbuf();               // slurp the whole file
+    res.status = Http::Ok;
+    res.contentType = "text/html";      // so the browser renders it as a page
+    res.body = buffer.str();
+}
 
 // ---------------------------------------------------------------------------
 // authenticate: run the request's bearer token through the auth layer.
@@ -77,6 +118,14 @@ static bool authenticate(const HttpRequest& req, AuthState& auth, HttpResponse& 
 // ---------------------------------------------------------------------------
 static HttpResponse routeRequest(const HttpRequest& req, GraphHandler& gh, AuthState& auth) {
     HttpResponse res;
+
+    // ---- GET / : serve the visualiser page (PUBLIC, no token) ----
+    // The page shell must load without auth so the user can enter their token;
+    // the API routes it calls afterwards (/query, /stats) remain token-gated.
+    if (req.method == "GET" && (req.path == "/" || req.path == "/index.htm" || req.path == "/index.html")) {
+        serveVisualiserPage(res);
+        return res;
+    }
 
     // ---- POST /query : run a Query-SQL command ----
     if (req.method == "POST" && req.path == "/query") {

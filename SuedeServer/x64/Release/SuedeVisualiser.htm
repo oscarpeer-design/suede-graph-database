@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Suede Graph Visualiser</title>
+    <style>
+        :root {
+            --bg: #f7f7f8;
+            --panel: #ffffff;
+            --ink: #1a1a1e;
+            --ink-soft: #55555f;
+            --ink-muted: #8a8a94;
+            --border: #e2e2e8;
+            --accent: #3b5bdb;
+            --edge: #b9bcc6;
+            --highlight: #e8590c; /* MATCH traversal highlight */
+            --danger-bg: #fdecec;
+            --danger-ink: #b42318;
+            font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html, body {
+            margin: 0;
+            height: 100%;
+            background: var(--bg);
+            color: var(--ink);
+        }
+
+        body {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        header {
+            background: var(--panel);
+            border-bottom: 1px solid var(--border);
+            padding: 10px 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            flex: 0 0 auto;
+        }
+
+        .title-row {
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+        }
+
+            .title-row h1 {
+                font-size: 16px;
+                margin: 0;
+                font-weight: 650;
+            }
+
+            .title-row .sub {
+                font-size: 12px;
+                color: var(--ink-muted);
+            }
+
+        .controls {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+            .controls input[type=text] {
+                font: inherit;
+                font-size: 13px;
+                padding: 6px 9px;
+                border: 1px solid var(--border);
+                border-radius: 7px;
+                background: #fff;
+                color: var(--ink);
+            }
+
+        #token {
+            width: 300px;
+        }
+
+        #query {
+            flex: 1 1 340px;
+            min-width: 240px;
+        }
+
+        button {
+            font: inherit;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            padding: 6px 14px;
+            border: 1px solid var(--accent);
+            border-radius: 7px;
+            background: var(--accent);
+            color: #fff;
+        }
+
+            button.secondary {
+                background: #fff;
+                color: var(--ink-soft);
+                border-color: var(--border);
+            }
+
+            button:active {
+                transform: translateY(1px);
+            }
+
+        #status {
+            font-size: 12.5px;
+            min-height: 18px;
+            padding: 2px 0;
+        }
+
+            #status.error {
+                color: var(--danger-ink);
+            }
+
+            #status.ok {
+                color: var(--ink-soft);
+            }
+
+        main {
+            flex: 1 1 auto;
+            display: flex;
+            min-height: 0;
+        }
+
+        #canvas-wrap {
+            flex: 1 1 auto;
+            position: relative;
+            overflow: hidden;
+            background: var(--bg);
+        }
+
+        svg {
+            width: 100%;
+            height: 100%;
+            display: block;
+            cursor: grab;
+        }
+
+            svg.panning {
+                cursor: grabbing;
+            }
+
+        .edge {
+            stroke: var(--edge);
+            stroke-width: 2;
+        }
+
+            .edge.hl {
+                stroke: var(--highlight);
+                stroke-width: 3;
+            }
+
+        .edge-label {
+            fill: var(--ink-muted);
+            font-size: 10px;
+            pointer-events: none;
+        }
+
+        .node circle {
+            stroke: #fff;
+            stroke-width: 2;
+            cursor: pointer;
+        }
+
+        .node.hl circle {
+            stroke: var(--highlight);
+            stroke-width: 4;
+        }
+
+        .node.selected circle {
+            stroke: var(--ink);
+            stroke-width: 4;
+        }
+
+        .node-label {
+            fill: var(--ink);
+            font-size: 11px;
+            font-weight: 600;
+            pointer-events: none;
+            text-anchor: middle;
+            paint-order: stroke;
+            stroke: var(--bg);
+            stroke-width: 3px;
+        }
+
+        /* side panel */
+        #side {
+            flex: 0 0 300px;
+            background: var(--panel);
+            border-left: 1px solid var(--border);
+            padding: 14px;
+            overflow-y: auto;
+            font-size: 13px;
+        }
+
+            #side h2 {
+                font-size: 13px;
+                margin: 0 0 8px;
+                text-transform: uppercase;
+                letter-spacing: .04em;
+                color: var(--ink-muted);
+            }
+
+            #side .empty {
+                color: var(--ink-muted);
+                font-style: italic;
+            }
+
+        .kv {
+            display: grid;
+            grid-template-columns: max-content 1fr;
+            gap: 4px 10px;
+            margin-top: 6px;
+        }
+
+            .kv dt {
+                color: var(--ink-muted);
+            }
+
+            .kv dd {
+                margin: 0;
+                word-break: break-word;
+            }
+
+        .badge {
+            display: inline-block;
+            padding: 1px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        /* legend */
+        #legend {
+            margin-top: 16px;
+        }
+
+            #legend .row {
+                display: flex;
+                align-items: center;
+                gap: 7px;
+                margin: 3px 0;
+                font-size: 12px;
+            }
+
+            #legend .sw {
+                width: 12px;
+                height: 12px;
+                border-radius: 3px;
+                flex: 0 0 auto;
+            }
+
+        .hint {
+            font-size: 11px;
+            color: var(--ink-muted);
+            margin-top: 4px;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="title-row">
+            <h1>Suede Graph Visualiser</h1>
+            <span class="sub">nodes &amp; edges from your query, drawn live</span>
+        </div>
+        <div class="controls">
+            <input type="text" id="token" placeholder="Bearer token (from: SuedeServer --mint &lt;ip&gt;)" autocomplete="off" spellcheck="false">
+            <input type="text" id="query" placeholder="e.g.  SELECT * FROM NODES WHERE LABEL = 'Person'  |  MATCH REACHABLE FROM 1"
+                   value="SELECT * FROM NODES WHERE LABEL = 'Person'">
+            <button id="run">Run</button>
+            <button id="fit" class="secondary" title="Fit graph to view">Fit</button>
+        </div>
+        <div id="status" class="ok">Enter a token and a query, then Run. The token is remembered for this tab only.</div>
+    </header>
+
+    <main>
+        <div id="canvas-wrap">
+            <svg id="svg">
+                <defs>
+                    <!-- arrowhead for edge direction -->
+                    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                        <path d="M0,0 L10,5 L0,10 z" fill="#b9bcc6"></path>
+                    </marker>
+                    <marker id="arrow-hl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                        <path d="M0,0 L10,5 L0,10 z" fill="#e8590c"></path>
+                    </marker>
+                </defs>
+                <g id="viewport">
+                    <g id="edges-layer"></g>
+                    <g id="nodes-layer"></g>
+                </g>
+            </svg>
+        </div>
+
+        <aside id="side">
+            <h2>Selection</h2>
+            <div id="detail"><p class="empty">Click a node to see its properties.</p></div>
+            <div id="legend"></div>
+        </aside>
+    </main>
+
+    <script>
+        "use strict";
+        // ===========================================================================
+        // Suede Graph Visualiser -- self-contained, dependency-free.
+        //
+        // This page is served BY the SuedeServer (its GET / route), so it calls the API
+        // on its OWN origin with a relative fetch("/query") -- that means the browser
+        // treats it as same-origin and there is NO CORS involved. The user supplies a
+        // bearer token; every /query call carries "Authorization: Bearer <token>".
+        //
+        // End-to-end pipeline:
+        //   1. runQuery()      POST the command to /query, get back {nodes,edges,traversal}
+        //   2. ingestResult()  turn that JSON into drawable node/edge objects
+        //   3. computeLayout() position nodes with a force-directed simulation
+        //   4. render()        draw everything as SVG (then drag / zoom / pan / click)
+        // A MATCH query's returned path is highlighted; clicking a node shows its props.
+        // ===========================================================================
+
+        const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
+
+        // tiny helper: look up an element by id (used constantly below).
+        function byElementId(id) { return document.getElementById(id); }
+
+        // ---------------------------------------------------------------------------
+        // Bearer token: remembered for THIS browser tab only (sessionStorage). It is
+        // never sent anywhere except the same-origin /query call. sessionStorage access
+        // is wrapped in try/catch because some privacy modes throw on it.
+        // ---------------------------------------------------------------------------
+        const tokenInput = byElementId("token");
+        try { tokenInput.value = sessionStorage.getItem("suede_token") || ""; } catch (e) { }
+        tokenInput.addEventListener("input", () => {
+            try { sessionStorage.setItem("suede_token", tokenInput.value); } catch (e) { }
+        });
+
+        // ---------------------------------------------------------------------------
+        // Status line under the controls. `kind` is "ok" or "error" (drives colour).
+        // ---------------------------------------------------------------------------
+        function setStatus(message, kind) {
+            const statusEl = byElementId("status");
+            statusEl.textContent = message;
+            statusEl.className = kind || "ok";
+        }
+
+        // ===========================================================================
+        // Colour-by-label: each distinct node label gets a fixed colour, assigned in
+        // order the first time that label is seen and never changed afterwards (so a
+        // label keeps its colour across re-queries within a session). Colour only ever
+        // carries node identity; the legend repeats it in words so identity is never
+        // colour-alone. The palette is a brand-neutral, colourblind-aware set.
+        // ===========================================================================
+        const LABEL_PALETTE = [
+            "#3b5bdb", "#2f9e44", "#e8590c", "#9c36b5", "#0c8599",
+            "#e03131", "#5c940d", "#1864ab", "#c2255c", "#495057"
+        ];
+        const colourByLabel = new Map();    // label -> hex colour
+        let nextPaletteIndex = 0;
+        function colourForLabel(label) {
+            if (!colourByLabel.has(label)) {
+                colourByLabel.set(label, LABEL_PALETTE[nextPaletteIndex % LABEL_PALETTE.length]);
+                nextPaletteIndex++;
+            }
+            return colourByLabel.get(label);
+        }
+
+        // ===========================================================================
+        // Graph state (the current thing being displayed).
+        // ===========================================================================
+        // Each node: { id, label, properties, x, y, velocityX, velocityY }
+        let graphNodes = [];
+        // Each edge: { fromId, toId, label }
+        let graphEdges = [];
+        // Fast id -> node lookup, rebuilt whenever graphNodes changes.
+        let nodeLookup = new Map();
+        // Node ids that are part of a MATCH traversal (drawn highlighted).
+        let highlightedNodeIds = new Set();
+        // The currently clicked/selected node id (or null).
+        let selectedNodeId = null;
+
+        // The pan/zoom transform applied to the whole drawing:
+        //   panX / panY = translation in screen pixels, zoom = scale factor.
+        let camera = { panX: 0, panY: 0, zoom: 1 };
+
+        // ===========================================================================
+        // Step 1: run a query against the server.
+        // ===========================================================================
+        async function runQuery() {
+            const token = tokenInput.value.trim();
+            const command = byElementId("query").value.trim();
+            if (!token) { setStatus("Enter a bearer token first.", "error"); return; }
+            if (!command) { setStatus("Enter a query first.", "error"); return; }
+
+            setStatus("Running...", "ok");
+
+            let response, resultJson, rawResponseText;
+            try {
+                response = await fetch("/query", {            // relative URL -> same origin -> no CORS
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer " + token
+                    },
+                    body: JSON.stringify({ command })
+                });
+                rawResponseText = await response.text();
+                try { resultJson = JSON.parse(rawResponseText); } catch (e) { resultJson = null; }
+            } catch (networkError) {
+                setStatus("Could not reach the server: " + networkError.message, "error");
+                return;
+            }
+
+            // Non-2xx: surface the server's own error contract (400 bad request,
+            // 422 rejected-or-unauthorised, etc.) using its error/message field.
+            if (!response.ok) {
+                const serverMessage =
+                    (resultJson && (resultJson.error || resultJson.message))
+                        ? (resultJson.error || resultJson.message)
+                        : rawResponseText;
+                setStatus("Server " + response.status + ": " + serverMessage, "error");
+                return;
+            }
+            if (!resultJson) {
+                setStatus("Server returned non-JSON: " + rawResponseText.slice(0, 200), "error");
+                return;
+            }
+
+            // Only READ queries (SELECT / MATCH) produce a graph to draw. Mutations
+            // (INSERT / UPDATE / DELETE / IMPORT / EXPORT / SAVE / LOAD / SNAPSHOT ...)
+            // succeeded, but their result is not a graph view -- redrawing on them would
+            // wipe whatever you're looking at (e.g. an INSERT returns only its one new
+            // node, which would replace the whole graph with a single dot). So for a
+            // mutation we just report the server's message and LEAVE THE DRAWING ALONE.
+            const firstKeyword = command.split(/\s+/)[0].toUpperCase();
+            const isReadQuery = (firstKeyword === "SELECT" || firstKeyword === "MATCH");
+
+            if (!isReadQuery) {
+                setStatus(resultJson.message || "OK (drawing unchanged)", "ok");
+                return;
+            }
+
+            ingestResult(resultJson);
+            setStatus(
+                (resultJson.message ? resultJson.message + "  " : "") +
+                "(" + graphNodes.length + " nodes, " + graphEdges.length + " edges" +
+                (highlightedNodeIds.size ? ", " + highlightedNodeIds.size + " in path" : "") + ")",
+                "ok");
+        }
+
+        // ===========================================================================
+        // Step 2: turn a server QueryResult {nodes, edges, traversal} into the
+        // graphNodes / graphEdges we draw.
+        // ===========================================================================
+        function ingestResult(result) {
+            const returnedNodes = Array.isArray(result.nodes) ? result.nodes : [];
+            const returnedEdges = Array.isArray(result.edges) ? result.edges : [];
+            const traversalIds = Array.isArray(result.traversal) ? result.traversal : [];
+
+            // Collect the nodes to draw, keyed by id. A MATCH usually returns ONLY the
+            // traversal (a list of ids) with no node rows, so for any traversal id we
+            // don't have a full row for, we synthesise a bare stub so the path can draw.
+            const nodesById = new Map();
+            for (const node of returnedNodes) {
+                nodesById.set(node.id, {
+                    id: node.id,
+                    label: node.label || "",
+                    properties: node.properties || {}
+                });
+            }
+            for (const id of traversalIds) {
+                if (!nodesById.has(id)) nodesById.set(id, { id, label: "", properties: {} });
+            }
+
+            // Collect edges. Keep only edges whose BOTH endpoints are in our node set
+            // (so nothing dangles). SELECT FROM EDGES gives real edge rows; a MATCH gives
+            // none, so when there are no edge rows we stitch consecutive traversal ids
+            // together so the path itself is still visible as connected segments.
+            const edgesToDraw = [];
+            for (const edge of returnedEdges) {
+                if (nodesById.has(edge.from) && nodesById.has(edge.to))
+                    edgesToDraw.push({ fromId: edge.from, toId: edge.to, label: edge.label || "" });
+            }
+            if (edgesToDraw.length === 0 && traversalIds.length >= 2) {
+                for (let i = 0; i + 1 < traversalIds.length; i++)
+                    edgesToDraw.push({ fromId: traversalIds[i], toId: traversalIds[i + 1], label: "" });
+            }
+
+            // Remember where nodes we've seen before were, so a re-query keeps the layout
+            // stable instead of jumping everything to new random spots.
+            const previousPositions = new Map(graphNodes.map(n => [n.id, { x: n.x, y: n.y }]));
+
+            const canvas = byElementId("canvas-wrap");
+            const canvasWidth = canvas.clientWidth || 800;
+            const canvasHeight = canvas.clientHeight || 600;
+
+            // Initial placement: lay NEW nodes evenly around a ring centred on the canvas
+            // (not a tiny random cluster). The ring matters because: (a) a random cluster
+            // can drop nodes almost on top of each other -- and two at the EXACT same
+            // point have an undefined repulsion direction, so they'd never separate; and
+            // (b) edge-less nodes have no springs pulling them into a shape, so a good
+            // starting spread is the main thing keeping them apart. Previously-seen nodes
+            // keep their old position for stability.
+            graphNodes = [];
+            nodeLookup = new Map();
+            const nodeCount = nodesById.size;
+            const ringRadius = Math.min(canvasWidth, canvasHeight) * 0.32 + nodeCount * 4;
+            let placementIndex = 0;
+            for (const nodeData of nodesById.values()) {
+                const previous = previousPositions.get(nodeData.id);
+                const angle = (placementIndex / Math.max(nodeCount, 1)) * Math.PI * 2;
+                const node = {
+                    ...nodeData,
+                    x: previous ? previous.x : (canvasWidth / 2 + Math.cos(angle) * ringRadius),
+                    y: previous ? previous.y : (canvasHeight / 2 + Math.sin(angle) * ringRadius),
+                    velocityX: 0,
+                    velocityY: 0
+                };
+                graphNodes.push(node);
+                nodeLookup.set(node.id, node);
+                placementIndex++;
+            }
+
+            graphEdges = edgesToDraw;
+            highlightedNodeIds = new Set(traversalIds);
+            selectedNodeId = null;
+            renderSelectionPanel(null);
+            renderLegend();
+
+            computeLayout();
+            render();
+            fitToView();
+        }
+
+        // ===========================================================================
+        // Step 3: force-directed layout (a Fruchterman-Reingold-style simulation).
+        //
+        // The idea: treat every node as a charged particle that PUSHES all other nodes
+        // away (repulsion), and every edge as a SPRING that pulls its two endpoints
+        // together (attraction). Iterating these forces, with a "temperature" that
+        // shrinks each round so motion settles, arranges the graph into the familiar
+        // spread-out, edges-roughly-even shape. A final pass guarantees no overlap.
+        // ===========================================================================
+        function computeLayout() {
+            const nodeCount = graphNodes.length;
+            if (nodeCount === 0) return;
+
+            const canvas = byElementId("canvas-wrap");
+            const canvasWidth = canvas.clientWidth || 800;
+            const canvasHeight = canvas.clientHeight || 600;
+            const centreX = canvasWidth / 2, centreY = canvasHeight / 2;
+
+            // idealDistance is the target spacing between nodes: derived from how much
+            // canvas area each node has to itself. The 0.75 just tightens it a little.
+            const idealDistance = Math.sqrt((canvasWidth * canvasHeight) / nodeCount) * 0.75;
+            const ITERATIONS = 300;
+            let temperature = canvasWidth / 8;   // caps how far a node may move per round
+
+            for (let iteration = 0; iteration < ITERATIONS; iteration++) {
+                // --- repulsion: every ordered pair pushes apart. O(N^2), which is fine for
+                //     graphs up to a few hundred nodes. Force grows as nodes get closer. ---
+                for (let i = 0; i < nodeCount; i++) {
+                    graphNodes[i].velocityX = 0;
+                    graphNodes[i].velocityY = 0;
+                    for (let j = 0; j < nodeCount; j++) {
+                        if (i === j) continue;
+                        let deltaX = graphNodes[i].x - graphNodes[j].x;
+                        let deltaY = graphNodes[i].y - graphNodes[j].y;
+                        let distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY) || 0.01;
+                        const repulsion = (idealDistance * idealDistance) / distance;
+                        graphNodes[i].velocityX += (deltaX / distance) * repulsion;
+                        graphNodes[i].velocityY += (deltaY / distance) * repulsion;
+                    }
+                }
+
+                // --- attraction: each edge is a spring pulling its endpoints together.
+                //     Force grows with distance (a stretched spring pulls harder). ---
+                for (const edge of graphEdges) {
+                    const fromNode = nodeLookup.get(edge.fromId);
+                    const toNode = nodeLookup.get(edge.toId);
+                    if (!fromNode || !toNode) continue;
+                    let deltaX = fromNode.x - toNode.x;
+                    let deltaY = fromNode.y - toNode.y;
+                    let distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY) || 0.01;
+                    const attraction = (distance * distance) / idealDistance;
+                    const pullX = (deltaX / distance) * attraction;
+                    const pullY = (deltaY / distance) * attraction;
+                    fromNode.velocityX -= pullX; fromNode.velocityY -= pullY;
+                    toNode.velocityX += pullX; toNode.velocityY += pullY;
+                }
+
+                // --- a VERY gentle pull toward the centre so disconnected pieces don't
+                //     drift off-screen. Deliberately weak (0.003): a strong centre-pull
+                //     collapses edge-less nodes into a pile (the bug where 2 unconnected
+                //     nodes stacked on top of each other). ---
+                for (const node of graphNodes) {
+                    node.velocityX += (centreX - node.x) * 0.003;
+                    node.velocityY += (centreY - node.y) * 0.003;
+                }
+
+                // --- apply the accumulated velocity, but never move a node further than the
+                //     current temperature in one round; then cool down so motion settles. ---
+                for (const node of graphNodes) {
+                    let speed = Math.sqrt(node.velocityX * node.velocityX + node.velocityY * node.velocityY) || 0.01;
+                    node.x += (node.velocityX / speed) * Math.min(speed, temperature);
+                    node.y += (node.velocityY / speed) * Math.min(speed, temperature);
+                }
+                temperature *= 0.98;   // cooling schedule
+            }
+
+            // --- Hard minimum-separation pass. Whatever the simulation produced, no two
+            //     nodes may end up closer than MIN_SEPARATION, so they can never visually
+            //     overlap. Repeated relaxation rounds push any too-close pair apart until
+            //     none remain (or we hit the round cap). This is a safety net on top of
+            //     the repulsion above, not a replacement for it. ---
+            const MIN_SEPARATION = 70;
+            for (let round = 0; round < 60; round++) {
+                let anyMoved = false;
+                for (let i = 0; i < nodeCount; i++) {
+                    for (let j = i + 1; j < nodeCount; j++) {
+                        let deltaX = graphNodes[j].x - graphNodes[i].x;
+                        let deltaY = graphNodes[j].y - graphNodes[i].y;
+                        let distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
+                        if (distance < MIN_SEPARATION) {
+                            // exactly coincident: pick a deterministic direction to split them.
+                            if (distance < 0.001) { deltaX = Math.cos(i * 1.7); deltaY = Math.sin(i * 1.7); distance = 1; }
+                            const pushEach = (MIN_SEPARATION - distance) / 2;
+                            const unitX = deltaX / distance, unitY = deltaY / distance;
+                            graphNodes[i].x -= unitX * pushEach; graphNodes[i].y -= unitY * pushEach;
+                            graphNodes[j].x += unitX * pushEach; graphNodes[j].y += unitY * pushEach;
+                            anyMoved = true;
+                        }
+                    }
+                }
+                if (!anyMoved) break;
+            }
+        }
+
+        // ===========================================================================
+        // Step 4: draw the current graph as SVG (edges first, then nodes on top).
+        // ===========================================================================
+        const NODE_RADIUS = 13;
+
+        function render() {
+            const edgesLayer = byElementId("edges-layer");
+            const nodesLayer = byElementId("nodes-layer");
+            edgesLayer.textContent = "";   // clear previous drawing
+            nodesLayer.textContent = "";
+
+            // --- edges (drawn first so nodes sit visually on top of them) ---
+            for (const edge of graphEdges) {
+                const fromNode = nodeLookup.get(edge.fromId);
+                const toNode = nodeLookup.get(edge.toId);
+                if (!fromNode || !toNode) continue;
+
+                // an edge is highlighted only if BOTH its endpoints are in the MATCH path.
+                const isHighlighted = highlightedNodeIds.has(edge.fromId) && highlightedNodeIds.has(edge.toId);
+
+                // Shorten the line at each end by the node radius, so the line (and its
+                // arrowhead) meets the rim of the circle rather than its centre.
+                const deltaX = toNode.x - fromNode.x;
+                const deltaY = toNode.y - fromNode.y;
+                const length = Math.sqrt(deltaX * deltaX + deltaY * deltaY) || 1;
+                const unitX = deltaX / length, unitY = deltaY / length;
+                const startX = fromNode.x + unitX * NODE_RADIUS, startY = fromNode.y + unitY * NODE_RADIUS;
+                const endX = toNode.x - unitX * NODE_RADIUS, endY = toNode.y - unitY * NODE_RADIUS;
+
+                const lineEl = document.createElementNS(SVG_NAMESPACE, "line");
+                lineEl.setAttribute("x1", startX); lineEl.setAttribute("y1", startY);
+                lineEl.setAttribute("x2", endX); lineEl.setAttribute("y2", endY);
+                lineEl.setAttribute("class", "edge" + (isHighlighted ? " hl" : ""));
+                lineEl.setAttribute("marker-end", isHighlighted ? "url(#arrow-hl)" : "url(#arrow)");
+                edgesLayer.appendChild(lineEl);
+
+                if (edge.label) {
+                    const labelEl = document.createElementNS(SVG_NAMESPACE, "text");
+                    labelEl.setAttribute("x", (startX + endX) / 2);
+                    labelEl.setAttribute("y", (startY + endY) / 2 - 3);
+                    labelEl.setAttribute("text-anchor", "middle");
+                    labelEl.setAttribute("class", "edge-label");
+                    labelEl.textContent = edge.label;
+                    edgesLayer.appendChild(labelEl);
+                }
+            }
+
+            // --- nodes ---
+            for (const node of graphNodes) {
+                const groupEl = document.createElementNS(SVG_NAMESPACE, "g");
+                let className = "node";
+                if (highlightedNodeIds.has(node.id)) className += " hl";
+                if (node.id === selectedNodeId) className += " selected";
+                groupEl.setAttribute("class", className);
+                groupEl.setAttribute("transform", `translate(${node.x},${node.y})`);
+                groupEl.dataset.id = node.id;
+
+                const circleEl = document.createElementNS(SVG_NAMESPACE, "circle");
+                circleEl.setAttribute("r", NODE_RADIUS);
+                circleEl.setAttribute("fill", colourForLabel(node.label));
+                groupEl.appendChild(circleEl);
+
+                const labelEl = document.createElementNS(SVG_NAMESPACE, "text");
+                labelEl.setAttribute("class", "node-label");
+                labelEl.setAttribute("y", -NODE_RADIUS - 5);
+                // caption preference: a name/title property, else the label, else "#id".
+                const properties = node.properties || {};
+                labelEl.textContent = properties.name || properties.title || node.label || ("#" + node.id);
+                groupEl.appendChild(labelEl);
+
+                attachNodePointerHandlers(groupEl, node);
+                nodesLayer.appendChild(groupEl);
+            }
+        }
+
+        // ===========================================================================
+        // Camera (pan / zoom) + coordinate conversion.
+        // ===========================================================================
+        // Push the current camera onto the SVG group that wraps the whole drawing.
+        function applyCamera() {
+            byElementId("viewport").setAttribute(
+                "transform",
+                `translate(${camera.panX},${camera.panY}) scale(${camera.zoom})`);
+        }
+
+        // Convert a screen (client) pixel position into the drawing's coordinate space,
+        // undoing the current pan and zoom. Used when dragging a node so the node
+        // follows the cursor correctly at any zoom level.
+        function screenToWorld(clientX, clientY) {
+            const svgEl = byElementId("svg");
+            const rect = svgEl.getBoundingClientRect();
+            return {
+                x: (clientX - rect.left - camera.panX) / camera.zoom,
+                y: (clientY - rect.top - camera.panY) / camera.zoom
+            };
+        }
+
+        // ===========================================================================
+        // Node interaction: press-and-drag to move a node; a press with no movement is
+        // treated as a click that selects the node.
+        // ===========================================================================
+        let draggingNode = null;      // the node currently being dragged, or null
+        let dragDidMove = false;      // did the pointer actually move during this press?
+
+        function attachNodePointerHandlers(groupEl, node) {
+            groupEl.addEventListener("pointerdown", (event) => {
+                event.stopPropagation();                 // don't also start a canvas pan
+                draggingNode = node;
+                dragDidMove = false;
+                groupEl.setPointerCapture(event.pointerId);
+            });
+            groupEl.addEventListener("pointermove", (event) => {
+                if (draggingNode !== node) return;
+                const world = screenToWorld(event.clientX, event.clientY);
+                node.x = world.x; node.y = world.y;
+                dragDidMove = true;
+                render();
+            });
+            groupEl.addEventListener("pointerup", (event) => {
+                // a press that never moved = a click -> select this node.
+                if (draggingNode === node && !dragDidMove) selectNode(node);
+                draggingNode = null;
+                try { groupEl.releasePointerCapture(event.pointerId); } catch (e) { }
+            });
+        }
+
+        function selectNode(node) {
+            selectedNodeId = node.id;
+            render();
+            renderSelectionPanel(node);
+        }
+
+        // ===========================================================================
+        // Canvas pan (drag the background) and wheel zoom (centred on the cursor).
+        // ===========================================================================
+        (function setUpCanvasPanAndZoom() {
+            const svgEl = byElementId("svg");
+            let isPanning = false;
+            let panStartX = 0, panStartY = 0;   // pointer position where the pan began
+            let panOriginX = 0, panOriginY = 0; // camera pan at the moment the pan began
+
+            svgEl.addEventListener("pointerdown", (event) => {
+                isPanning = true;
+                svgEl.classList.add("panning");
+                panStartX = event.clientX; panStartY = event.clientY;
+                panOriginX = camera.panX; panOriginY = camera.panY;
+            });
+            window.addEventListener("pointermove", (event) => {
+                if (!isPanning) return;
+                camera.panX = panOriginX + (event.clientX - panStartX);
+                camera.panY = panOriginY + (event.clientY - panStartY);
+                applyCamera();
+            });
+            window.addEventListener("pointerup", () => {
+                isPanning = false;
+                svgEl.classList.remove("panning");
+            });
+
+            // Wheel zoom. We scale about the cursor: the world point currently under the
+            // cursor must stay under the cursor after zooming, which is what the panX/panY
+            // adjustment below achieves.
+            svgEl.addEventListener("wheel", (event) => {
+                event.preventDefault();
+                const zoomFactor = event.deltaY < 0 ? 1.1 : (1 / 1.1);   // wheel up = zoom in
+                const rect = svgEl.getBoundingClientRect();
+                const cursorX = event.clientX - rect.left;
+                const cursorY = event.clientY - rect.top;
+                camera.panX = cursorX - (cursorX - camera.panX) * zoomFactor;
+                camera.panY = cursorY - (cursorY - camera.panY) * zoomFactor;
+                camera.zoom *= zoomFactor;
+                applyCamera();
+            }, { passive: false });
+        })();
+
+        // ===========================================================================
+        // Fit: pan/zoom the camera so the whole graph is visible and centred.
+        // ===========================================================================
+        function fitToView() {
+            if (graphNodes.length === 0) {
+                camera = { panX: 0, panY: 0, zoom: 1 };
+                applyCamera();
+                return;
+            }
+            // bounding box of all node positions
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const node of graphNodes) {
+                minX = Math.min(minX, node.x); maxX = Math.max(maxX, node.x);
+                minY = Math.min(minY, node.y); maxY = Math.max(maxY, node.y);
+            }
+            const PADDING = 60;
+            const svgEl = byElementId("svg");
+            const viewWidth = svgEl.clientWidth, viewHeight = svgEl.clientHeight;
+            const graphWidth = (maxX - minX) || 1;
+            const graphHeight = (maxY - minY) || 1;
+
+            // pick the zoom that fits both dimensions (capped at 2x so tiny graphs don't
+            // balloon), then centre the bounding box in the view.
+            const zoom = Math.min(
+                viewWidth / (graphWidth + PADDING * 2),
+                viewHeight / (graphHeight + PADDING * 2),
+                2);
+            camera.zoom = zoom;
+            camera.panX = (viewWidth - graphWidth * zoom) / 2 - minX * zoom;
+            camera.panY = (viewHeight - graphHeight * zoom) / 2 - minY * zoom;
+            applyCamera();
+        }
+
+        // ===========================================================================
+        // Side panel: the selected node's details, and the label legend.
+        // ===========================================================================
+        function renderSelectionPanel(node) {
+            const panelEl = byElementId("detail");
+            if (!node) {
+                panelEl.innerHTML = '<p class="empty">Click a node to see its properties.</p>';
+                return;
+            }
+            const colour = colourForLabel(node.label);
+            let html =
+                `<div style="margin-bottom:8px">
+           <span class="badge" style="background:${colour}">${escapeHtml(node.label || "(no label)")}</span>
+           <span style="color:var(--ink-muted); font-size:12px; margin-left:6px">id ${node.id}</span>
+         </div>`;
+
+            const properties = node.properties || {};
+            const propertyKeys = Object.keys(properties);
+            if (propertyKeys.length === 0) {
+                html += '<p class="empty">No properties.</p>';
+            } else {
+                html += '<dl class="kv">';
+                for (const key of propertyKeys)
+                    html += `<dt>${escapeHtml(key)}</dt><dd>${escapeHtml(String(properties[key]))}</dd>`;
+                html += '</dl>';
+            }
+            panelEl.innerHTML = html;
+        }
+
+        function renderLegend() {
+            // distinct labels, in first-seen order
+            const labelsSeen = [];
+            for (const node of graphNodes) {
+                const label = node.label || "(no label)";
+                if (!labelsSeen.includes(label)) labelsSeen.push(label);
+            }
+            const legendEl = byElementId("legend");
+            if (labelsSeen.length === 0) { legendEl.innerHTML = ""; return; }
+
+            let html = "<h2>Labels</h2>";
+            for (const label of labelsSeen) {
+                const swatchColour = colourForLabel(label === "(no label)" ? "" : label);
+                html += `<div class="row"><span class="sw" style="background:${swatchColour}"></span>${escapeHtml(label)}</div>`;
+            }
+            if (highlightedNodeIds.size) {
+                html += `<div class="row" style="margin-top:8px"><span class="sw" style="background:var(--highlight)"></span>MATCH path</div>`;
+            }
+            legendEl.innerHTML = html;
+        }
+
+        // Escape user/DB-supplied text before putting it in innerHTML (labels and
+        // property values could contain <, &, quotes, etc.).
+        function escapeHtml(text) {
+            return text.replace(/[&<>"']/g, ch =>
+                ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+        }
+
+        // ===========================================================================
+        // Wire up the controls.
+        // ===========================================================================
+        byElementId("run").addEventListener("click", runQuery);
+        byElementId("fit").addEventListener("click", fitToView);
+        byElementId("query").addEventListener("keydown", (event) => {
+            if (event.key === "Enter") runQuery();
+        });
+        applyCamera();
+    </script>
+</body>
+</html>

@@ -217,7 +217,8 @@ static int test_query_layer_part1() {
         check("reject empty query", !q.parse(""));
         check("reject unknown keyword", !q.parse("FROBNICATE NODES"));
         check("reject SELECT with empty projection", !q.parse("SELECT FROM NODES WHERE ID = 1"));
-        check("reject SELECT without WHERE", !q.parse("SELECT * FROM NODES"));
+        // NOTE: a WHERE-less "SELECT * FROM NODES" is now ACCEPTED as a full scan
+        // (see the full-scan accept checks below). It is no longer a parse error.
         check("reject SELECT bad target", !q.parse("SELECT * FROM PLANETS WHERE ID = 1"));
         check("reject INSERT NODES no label", !q.parse("INSERT INTO NODES (name) VALUES ('Zed')"));
         check("reject INSERT count mismatch", !q.parse("INSERT INTO NODES (label, name) VALUES ('Person')"));
@@ -233,9 +234,38 @@ static int test_query_layer_part1() {
         check("reject WHERE bad connector", !q.parse("SELECT * FROM NODES WHERE age > 20 XOR age < 10"));
         // COUNT must be followed by '*'.
         check("reject SELECT COUNT without star", !q.parse("SELECT COUNT name FROM NODES WHERE LABEL = 'Person'"));
-        // A WHERE-less non-count live SELECT is still rejected (index-driven path).
-        check("reject SELECT without WHERE (non-count)", !q.parse("SELECT * FROM NODES"));
         check("reject trailing tokens", !q.parse("MATCH REACHABLE FROM 1 EXTRA"));
+    }
+
+    // -----------------------------------------------------------------
+    // 1c. PARSING -- WHERE-less full scans and the GRAPH target
+    // -----------------------------------------------------------------
+    // A bare "SELECT * FROM NODES / EDGES" is now a full scan (no WHERE needed),
+    // and "SELECT * FROM GRAPH" reads the whole graph (all nodes + all edges).
+    // GRAPH is deliberately restricted to the bare "SELECT * FROM GRAPH" form.
+    std::cout << "\n== Parsing: WHERE-less full scans + GRAPH target ==\n";
+    {
+        Query q;
+        // Bare full scans now parse (previously rejected as "WHERE required").
+        check("accept SELECT * FROM NODES (full scan)", q.parse("SELECT * FROM NODES"));
+        check("accept SELECT * FROM EDGES (full scan)", q.parse("SELECT * FROM EDGES"));
+        // TOP composes with a bare full scan.
+        check("accept SELECT TOP 5 * FROM NODES", q.parse("SELECT TOP 5 * FROM NODES"));
+        // Projection composes with a bare NODES full scan.
+        check("accept SELECT name FROM NODES (full scan)", q.parse("SELECT name FROM NODES"));
+
+        // GRAPH target: the whole-graph read.
+        check("accept SELECT * FROM GRAPH", q.parse("SELECT * FROM GRAPH"));
+        check("accept SELECT * FROM GRAPH SNAPSHOT", q.parse("SELECT * FROM GRAPH SNAPSHOT"));
+        check("accept SELECT * FROM GRAPH is case-insensitive", q.parse("select * from graph"));
+        check("SELECT * FROM GRAPH sets target = Graph",
+            q.parse("SELECT * FROM GRAPH") && q.target() == QueryTarget::Graph);
+
+        // GRAPH rejects WHERE / COUNT / projection -- it is a whole-graph read only.
+        check("reject SELECT * FROM GRAPH WHERE ...",
+            !q.parse("SELECT * FROM GRAPH WHERE LABEL = 'Person'"));
+        check("reject SELECT COUNT * FROM GRAPH", !q.parse("SELECT COUNT * FROM GRAPH"));
+        check("reject SELECT name FROM GRAPH (projection)", !q.parse("SELECT name FROM GRAPH"));
     }
 
     // -----------------------------------------------------------------
@@ -1154,6 +1184,115 @@ static int test_query_layer_part2() {
         check("delete missing edge: reports failure", !r.success);
     }
 
+    // -----------------------------------------------------------------
+    // 3c. EXECUTION -- WHERE-less full scans (live)
+    // -----------------------------------------------------------------
+    // A bare "SELECT * FROM NODES / EDGES" returns every row (capped). The
+    // fixture has 3 nodes and 2 edges, well under DEFAULT_SCAN_CAP, so nothing
+    // is truncated here (the cap itself is exercised in block 3e below).
+    std::cout << "\n== Execute: WHERE-less full scans (live) ==\n";
+    {
+        Graph graph;
+        buildQueryFixture(graph);           // 3 nodes (2 Person, 1 City), 2 edges
+        Query q;
+        QueryResult r;
+
+        r = q.run("SELECT * FROM NODES", graph);
+        check("full-scan nodes: success", r.success);
+        check("full-scan nodes: all 3 rows", r.nodes.size() == 3);
+        check("full-scan nodes: not truncated", !r.truncated);
+        check("full-scan nodes: totalMatched == 3", r.totalMatched == 3);
+
+        r = q.run("SELECT * FROM EDGES", graph);
+        check("full-scan edges: success", r.success);
+        check("full-scan edges: all 2 rows", r.edges.size() == 2);
+        check("full-scan edges: not truncated", !r.truncated);
+
+        // TOP still caps a full scan.
+        r = q.run("SELECT TOP 2 * FROM NODES", graph);
+        check("full-scan nodes TOP 2: 2 rows", r.success && r.nodes.size() == 2);
+        check("full-scan nodes TOP 2: truncated flag set", r.truncated);
+        check("full-scan nodes TOP 2: totalMatched == 3", r.totalMatched == 3);
+
+        // Projection still trims columns on a full scan.
+        r = q.run("SELECT name FROM NODES", graph);
+        check("full-scan nodes projection: 3 rows", r.success && r.nodes.size() == 3);
+        bool onlyName = !r.nodes.empty();
+        for (const Node& n : r.nodes)
+            if (n.properties.size() != 1 || n.properties.count("name") != 1) onlyName = false;
+        check("full-scan nodes projection: each row has only 'name'", onlyName);
+    }
+
+    // -----------------------------------------------------------------
+    // 3d. EXECUTION -- SELECT * FROM GRAPH (whole-graph read, live)
+    // -----------------------------------------------------------------
+    // GRAPH returns all nodes AND all edges in one result, and keeps only edges
+    // whose both endpoints are in the returned node set.
+    std::cout << "\n== Execute: SELECT * FROM GRAPH (live) ==\n";
+    {
+        Graph graph;
+        buildQueryFixture(graph);           // 3 nodes, 2 edges (1->2, 2->3)
+        Query q;
+        QueryResult r;
+
+        r = q.run("SELECT * FROM GRAPH", graph);
+        check("graph read: success", r.success);
+        check("graph read: 3 nodes", r.nodes.size() == 3);
+        check("graph read: 2 edges", r.edges.size() == 2);
+        check("graph read: not truncated", !r.truncated);
+
+        // Every returned edge's endpoints must be among the returned nodes
+        // (the internal-consistency guarantee).
+        std::vector<uint64_t> ids;
+        for (const Node& n : r.nodes) ids.push_back(n.id.value());
+        bool consistent = true;
+        for (const Edge& e : r.edges) {
+            bool fromIn = std::find(ids.begin(), ids.end(), e.from.value()) != ids.end();
+            bool toIn = std::find(ids.begin(), ids.end(), e.to.value()) != ids.end();
+            if (!fromIn || !toIn) consistent = false;
+        }
+        check("graph read: every edge's endpoints are in the node set", consistent);
+    }
+
+    // -----------------------------------------------------------------
+    // 3e. EXECUTION -- the DEFAULT_SCAN_CAP (1000) on a WHERE-less scan
+    // -----------------------------------------------------------------
+    // Build more than 1000 nodes and confirm a bare full scan caps at 1000,
+    // reports truncated == true, and reports the true total in totalMatched.
+    // TOP overrides the default cap (both below and above it).
+    std::cout << "\n== Execute: DEFAULT_SCAN_CAP on a full scan ==\n";
+    {
+        Graph graph;
+        const size_t N = 1500;              // > DEFAULT_SCAN_CAP (1000)
+        for (size_t i = 0; i < N; ++i)
+            graph.CreateNode("Bulk", { {"n", std::to_string(i)} });
+
+        Query q;
+        QueryResult r;
+
+        // Bare full scan: capped at 1000, truncated, total reported.
+        r = q.run("SELECT * FROM NODES", graph);
+        check("cap: success", r.success);
+        check("cap: returns exactly DEFAULT_SCAN_CAP (1000) rows", r.nodes.size() == 1000);
+        check("cap: truncated flag set", r.truncated);
+        check("cap: totalMatched == 1500 (true total before cap)", r.totalMatched == N);
+
+        // TOP below the default cap wins (returns fewer, still truncated).
+        r = q.run("SELECT TOP 10 * FROM NODES", graph);
+        check("cap: TOP 10 overrides default (10 rows)", r.success && r.nodes.size() == 10);
+        check("cap: TOP 10 still truncated (10 < 1500)", r.truncated);
+
+        // TOP above the default cap wins too (returns more than 1000).
+        r = q.run("SELECT TOP 1200 * FROM NODES", graph);
+        check("cap: TOP 1200 overrides default (1200 rows)", r.success && r.nodes.size() == 1200);
+        check("cap: TOP 1200 still truncated (1200 < 1500)", r.truncated);
+
+        // TOP at/above the true total returns everything, not truncated.
+        r = q.run("SELECT TOP 1500 * FROM NODES", graph);
+        check("cap: TOP 1500 returns all 1500 rows", r.success && r.nodes.size() == N);
+        check("cap: TOP 1500 not truncated", !r.truncated);
+    }
+
     std::cout << "\n" << pass << " passed, " << fail << " failed (cumulative).\n";
     return fail == 0 ? 0 : 1;
 }
@@ -1458,6 +1597,83 @@ static int test_select_snapshot() {
         check("early snapshot payloads resolved (label + name present)", payloadOk);
     }
 
+    // -----------------------------------------------------------------
+    // SELECT * FROM GRAPH SNAPSHOT: whole-graph read against a frozen snapshot.
+    // -----------------------------------------------------------------
+    std::cout << "\n== Execute: SELECT * FROM GRAPH SNAPSHOT ==\n";
+    {
+        Graph graph;
+        buildQueryFixture(graph);           // 3 nodes, 2 edges (1->2, 2->3)
+
+        CSR_Representation snap(graph);
+        snap.Load_CSR();
+
+        // Mutate the live graph AFTER capture: a 4th node and a 3rd edge.
+        int warning = operationSuccessful;
+        graph.CreateNode("Robot", { {"name", "R2"} });     // id 4
+        graph.CreateEdge(NodeId(3), NodeId(4), "BUILT", warning);
+
+        Query q;
+        QueryResult r;
+
+        // Snapshot whole-graph read: the frozen 3 nodes / 2 edges, not the later
+        // mutation.
+        q.parse("SELECT * FROM GRAPH SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("graph snapshot: success", r.success);
+        check("graph snapshot: 3 nodes (ignores later insert)", r.nodes.size() == 3);
+        check("graph snapshot: 2 edges (ignores later edge)", r.edges.size() == 2);
+
+        // Live whole-graph read sees the mutation: 4 nodes, 3 edges.
+        q.parse("SELECT * FROM GRAPH");
+        r = q.execute(graph, snap);
+        check("graph live: 4 nodes", r.success && r.nodes.size() == 4);
+        check("graph live: 3 edges", r.edges.size() == 3);
+
+        // GRAPH SNAPSHOT with no snapshot supplied falls back to the live read.
+        q.parse("SELECT * FROM GRAPH SNAPSHOT");
+        r = q.execute(graph);
+        check("graph snapshot, no snapshot supplied: falls back to live (4 nodes, 3 edges)",
+            r.success && r.nodes.size() == 4 && r.edges.size() == 3);
+    }
+
+    // -----------------------------------------------------------------
+    // The DEFAULT_SCAN_CAP applies to snapshot full scans too (nodes AND edges),
+    // uniformly with the live paths.
+    // -----------------------------------------------------------------
+    std::cout << "\n== Execute: DEFAULT_SCAN_CAP on snapshot full scans ==\n";
+    {
+        Graph graph;
+        const size_t N = 1200;              // > DEFAULT_SCAN_CAP (1000)
+        std::vector<NodeId> ids;
+        ids.reserve(N);
+        for (size_t i = 0; i < N; ++i)
+            ids.push_back(graph.CreateNode("Bulk", { {"n", std::to_string(i)} }));
+        // Chain 1200 edges so a WHERE-less snapshot edge scan also exceeds the cap.
+        int warning = operationSuccessful;
+        for (size_t i = 0; i + 1 < N; ++i)
+            graph.CreateEdge(ids[i], ids[i + 1], "NEXT", warning);   // 1199 edges
+
+        CSR_Representation snap(graph);
+        snap.Load_CSR();
+
+        Query q;
+        QueryResult r;
+
+        // Snapshot node full scan capped at 1000.
+        q.parse("SELECT * FROM NODES SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("snapshot node scan: capped at 1000", r.success && r.nodes.size() == 1000);
+        check("snapshot node scan: truncated", r.truncated);
+        check("snapshot node scan: totalMatched == 1200", r.totalMatched == N);
+
+        // Snapshot edge full scan capped at 1000 (1199 edges > cap).
+        q.parse("SELECT * FROM EDGES SNAPSHOT");
+        r = q.execute(graph, snap);
+        check("snapshot edge scan: capped at 1000", r.success && r.edges.size() == 1000);
+        check("snapshot edge scan: truncated", r.truncated);
+    }
+
     std::cout << "\n" << pass << " passed, " << fail << " failed (cumulative).\n";
     return fail == 0 ? 0 : 1;
 }
@@ -1465,7 +1681,14 @@ static int test_select_snapshot() {
 // ---------------------------------------------------------------------------
 // UPDATE / LOAD / SAVE query commands
 // ---------------------------------------------------------------------------
-static int test_update_load_save() {
+// The UPDATE / LOAD / SAVE suite is split into part1 / part2 for the same
+// reason as the query-layer suite: a single function accumulating the per-block
+// Graph / StorageEngine / CSR_Representation locals of all ten blocks sizes its
+// stack frame to their sum (~19 KB), tripping the compiler stack-size warning.
+// Each block is fully self-contained (its own locals, nothing shared across
+// blocks), and the pass/fail counters are file-static, so the split is
+// transparent to the reported totals. test_update_load_save() runs both halves.
+static int test_update_load_save_part1() {
     std::cout << "\n============= UPDATE / LOAD / SAVE =============\n";
 
     // -- UPDATE NODES by property value ---------------------------------------
@@ -1566,6 +1789,12 @@ static int test_update_load_save() {
         check("UPDATE EDGES bad column: message mentions label",
             r.message.find("label") != std::string::npos);
     }
+
+    return fail == 0 ? 0 : 1;
+}
+
+// Second half of the UPDATE / LOAD / SAVE suite (see the note on part1).
+static int test_update_load_save_part2() {
 
     // -- UPDATE parse errors ---------------------------------------------------
     {
@@ -1709,6 +1938,15 @@ static int test_update_load_save() {
 
     std::cout << "\n" << pass << " passed, " << fail << " failed (cumulative).\n";
     return fail == 0 ? 0 : 1;
+}
+
+// Runs both halves of the UPDATE / LOAD / SAVE suite. Split purely to keep each
+// function's stack frame small (see the note on part1); the counters are
+// file-static so the totals are identical to the un-split version.
+static int test_update_load_save() {
+    int rc1 = test_update_load_save_part1();
+    int rc2 = test_update_load_save_part2();
+    return (rc1 == 0 && rc2 == 0) ? 0 : 1;
 }
 
 // Public entry point: prints the banner and runs both halves of the query-layer

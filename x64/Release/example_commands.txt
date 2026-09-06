@@ -39,7 +39,9 @@ NODE COUNT
 EDGE COUNT
 
 # ---------------------------------------------------------------------
-# 4. Selecting nodes (live SELECT needs WHERE: ID or LABEL)
+# 4. Selecting nodes
+#    A WHERE with ID or LABEL uses the fast index path. A WHERE-less
+#    SELECT is a full scan (see section 4d) -- both are valid.
 # ---------------------------------------------------------------------
 SELECT * FROM NODES WHERE ID = 1
 SELECT * FROM NODES WHERE LABEL = 'Person'
@@ -84,6 +86,37 @@ SELECT COUNT * FROM NODES WHERE LABEL = 'Person' OR LABEL = 'City'
 SELECT COUNT * FROM EDGES WHERE LABEL = 'KNOWS'
 # count all edges
 SELECT COUNT * FROM EDGES
+
+# ---------------------------------------------------------------------
+# 4d. Whole-graph and WHERE-less full-scan reads
+#     A bare SELECT (no WHERE) is a full scan and returns every row:
+#       SELECT * FROM NODES   -> all nodes
+#       SELECT * FROM EDGES   -> all edges
+#       SELECT * FROM GRAPH   -> all nodes AND all edges, in one result
+#     Full scans are CAPPED at 1000 rows by default (DEFAULT_SCAN_CAP) to
+#     protect the client; the result message says so when it caps. Use
+#     TOP <n> to raise or lower that cap for a given query.
+#
+#     GRAPH is a whole-graph read only: it takes NO WHERE, NO COUNT, and
+#     NO column list -- use FROM NODES / FROM EDGES to filter or project.
+#     (GRAPH also keeps only edges whose endpoints are both in the returned
+#      node set, so the result is always internally consistent.)
+# ---------------------------------------------------------------------
+# every node / every edge (capped at 1000)
+SELECT * FROM NODES
+SELECT * FROM EDGES
+# the whole graph in one result -- what the visualiser uses
+SELECT * FROM GRAPH
+# raise the cap for this query (TOP overrides DEFAULT_SCAN_CAP)
+SELECT TOP 5000 * FROM NODES
+# a WHERE-less scan still honours projection (NODES only)
+SELECT name, age FROM NODES
+# the point-in-time whole-graph read (see section 8)
+SELECT * FROM GRAPH SNAPSHOT
+# these are EXPECTED to fail (GRAPH takes no WHERE / COUNT / projection):
+#SELECT * FROM GRAPH WHERE LABEL = 'Person'
+#SELECT COUNT * FROM GRAPH
+#SELECT name FROM GRAPH
 
 # ---------------------------------------------------------------------
 # 5. Selecting edges (use '*'; projection is NODES-only)
@@ -146,14 +179,15 @@ SNAPSHOT RELEASE 1
 
 # ---------------------------------------------------------------------
 # 8b. WHERE-less SELECT ... SNAPSHOT (full point-in-time scan)
-#     A SELECT ... SNAPSHOT is a full scan and may OMIT WHERE. Even
-#     through the batch route (which supplies no CSR snapshot object and
-#     falls back to the live executor) these now succeed as full scans,
-#     honouring TOP, projection, and any property filter given.
+#     A SELECT ... SNAPSHOT is a full scan and may OMIT WHERE. Through the
+#     batch route (which supplies no CSR snapshot object) these fall back
+#     to the live executor and succeed as full scans, honouring TOP,
+#     projection, and any property filter given. Like every full scan they
+#     are capped at 1000 rows (DEFAULT_SCAN_CAP) unless TOP raises it.
 #
-#     Contrast: the SAME queries WITHOUT the trailing SNAPSHOT are
-#     rejected (a live SELECT is index-driven and needs WHERE ID/LABEL) -
-#     the two commented lines at the end show that rejection on purpose.
+#     NOTE: the SAME queries WITHOUT the trailing SNAPSHOT are now ALSO
+#     valid full scans (see section 4d) -- a WHERE-less live SELECT is no
+#     longer rejected.
 # ---------------------------------------------------------------------
 # unfiltered full scans
 SELECT * FROM NODES SNAPSHOT
@@ -164,9 +198,8 @@ SELECT TOP 2 * FROM NODES SNAPSHOT
 SELECT name FROM NODES SNAPSHOT
 # a property filter with NO ID/LABEL predicate is allowed on a snapshot scan
 SELECT * FROM NODES WHERE age > '20' SNAPSHOT
-# these two are EXPECTED to error (WHERE-less live SELECT is rejected):
-#SELECT * FROM NODES
-#SELECT * FROM EDGES
+# the whole-graph read also has a point-in-time form
+SELECT * FROM GRAPH SNAPSHOT
 
 
 # ---------------------------------------------------------------------

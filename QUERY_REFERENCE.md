@@ -68,8 +68,10 @@ The convenience method `run(text, graph)` does parse-then-execute in one call
 and is what most callers use.
 
 A `QueryResult` contains: `success` (bool), a human-readable `message`, and —
-depending on the statement — `nodes`, `edges`, or `traversalResult` (a list of
-`NodeId`s for `MATCH`).
+depending on the statement — `nodes`, `edges` (both populated for a `GRAPH`
+read), or `traversalResult` (a list of `NodeId`s for `MATCH`). A full scan also
+sets `truncated` (true when the row cap dropped rows) and `totalMatched` (the
+match count before the cap), so a caller can render "showing 1000 of 5000".
 
 > **Note on `success`:** a query that runs correctly but matches nothing is a
 > **success** with zero rows (e.g. looking up an id that doesn't exist). A query
@@ -139,10 +141,12 @@ General rules that apply everywhere:
 - `SELECT` and `MATCH` accept an optional leading **`TOP <n>`** that caps the
   number of rows returned. `SELECT` also accepts a **column projection** in place
   of `*`. See §2.1 and §2.4.
-- A **live** `SELECT` **requires** a `WHERE ID`/`LABEL` predicate — Suede is a
-  graph store optimised for indexed, traversal-style access, so there is no
-  relational-style live full-table scan. A **`SELECT ... SNAPSHOT`** may omit
-  `WHERE` and scan the whole point-in-time set. See §2.1 and §2.5.
+- A `SELECT` may be run **with or without** a `WHERE`. With a `WHERE ID`/`LABEL`
+  predicate it uses the fast index path; **without** a `WHERE` it is a full scan
+  that returns every matching row, **capped at `DEFAULT_SCAN_CAP` (1000) rows** by
+  default (raise or lower the cap with `TOP <n>`). The `GRAPH` target
+  (`SELECT * FROM GRAPH`) reads the whole graph — all nodes **and** all edges — in
+  one result. See §2.1.
 
 The statements are `SELECT`, `INSERT`, `DELETE`, `MATCH`, `UPDATE`, `LOAD`,
 `SAVE`, `IMPORT`, and `EXPORT`. `LOAD`/`SAVE` move the graph to and from the
@@ -153,64 +157,98 @@ compact **binary** format; `IMPORT`/`EXPORT` do the same with the human-readable
 
 ### 2.1 SELECT
 
-Retrieve nodes or edges. On the **live** graph a `WHERE` clause is **required**
-(see "Why live SELECT requires WHERE" below); a **`SELECT ... SNAPSHOT`** may
-omit it and scan the whole point-in-time set (see §2.5). The projection may be
-`*` (whole rows) or a comma-separated list of columns, and an optional leading
-`TOP <n>` caps the number of rows returned.
+Retrieve nodes, edges, or the whole graph. A `WHERE` clause is **optional**: with
+one, the read uses the fast index path (`ID`/`LABEL`); without one, it is a full
+scan capped at 1000 rows (see "Full scans and the row cap" below). The projection
+may be `*` (whole rows) or a comma-separated list of columns, and an optional
+leading `TOP <n>` caps the number of rows returned.
 
 ```
-SELECT [TOP <n>] <* | col1, col2, ...> FROM NODES WHERE <conditions>
-SELECT [TOP <n>] *                     FROM EDGES WHERE <conditions>
+SELECT [TOP <n>] <* | col1, col2, ...> FROM NODES [WHERE <conditions>]
+SELECT [TOP <n>] *                     FROM EDGES [WHERE <conditions>]
+SELECT           *                     FROM GRAPH
 
 SELECT [TOP <n>] <* | col1, col2, ...> FROM NODES [WHERE <conditions>] SNAPSHOT
 SELECT [TOP <n>] *                     FROM EDGES [WHERE <conditions>] SNAPSHOT
+SELECT           *                     FROM GRAPH                        SNAPSHOT
 ```
 
-#### Why live SELECT requires WHERE
+#### Full scans and the row cap
 
-This is a deliberate design choice that reflects what Suede is: a **graph
-database**, not a relational one. A relational `SELECT * FROM table` with no
-predicate means "scan the whole table" — a sequential pass over every row. Suede
-is built around the opposite access pattern: you **enter the graph at a known
-point** (a node id or a label) and traverse relationships from there. The engine
-is optimised for exactly that — id and label are backed by hash indexes, and
-edges by adjacency lists — so a live read wants an `ID`/`LABEL` predicate to use
-as its entry key. There is intentionally **no** live full-table scan: a bare
-`SELECT * FROM NODES` is rejected with
+A `SELECT` with **no `WHERE`** is a full scan that returns every matching row:
 
-```
-SELECT: a WHERE clause is required (WHERE ID = ... or WHERE LABEL = ...).
+```sql
+SELECT * FROM NODES      -- every node
+SELECT * FROM EDGES      -- every edge
+SELECT * FROM GRAPH      -- every node AND every edge, in one result
 ```
 
-and `SELECT * FROM EDGES` likewise. Requiring the predicate steers callers toward
-the indexed, traversal-oriented access the store is designed to serve, rather
-than bolting a relational-style scan onto the live graph.
+Full scans are the natural "show me everything" gesture — for example, loading a
+whole graph into the visualiser. To keep a stray full scan from flooding a client
+or the wire, every WHERE-less scan is **capped at `DEFAULT_SCAN_CAP` (1000) rows**
+by default. When the cap drops rows, the result still succeeds but says so, e.g.:
 
-The one place an unfiltered scan **is** well-defined is a snapshot: a
-`CSR_Representation` has already materialised the whole point-in-time set as
-contiguous arrays, so `SELECT * FROM NODES SNAPSHOT` is a cheap, well-defined
-full scan. That is why the WHERE requirement is lifted for `SNAPSHOT` reads — it
-matches how the data is physically laid out. See §2.5.
+```
+Found 1000 row(s). (capped at 1000; 5000 total -- use TOP <n> for more)
+```
 
-Two further cases lift the WHERE requirement, favouring "the command always
-works" over the strict index-only rule:
+`TOP <n>` overrides the default cap for a given query — below it (`TOP 50` returns
+50) or above it (`TOP 5000` returns up to 5000). The cap is a fixed constant, not
+a function of free memory, so the same query returns the same rows on every run;
+raising it is always an explicit `TOP`. (An operator-configurable hard ceiling is
+a planned future addition.)
+
+Projection and property filters still compose with a full scan:
+`SELECT name FROM NODES` returns every node trimmed to `name`, and
+`SELECT * FROM NODES WHERE age > '20'` scans and filters by property with no
+`ID`/`LABEL` anchor.
+
+#### SELECT FROM GRAPH (whole-graph read)
+
+`SELECT * FROM GRAPH` returns **all nodes and all edges** in a single
+`QueryResult` (`nodes` and `edges` both populated) — the one query that reads the
+entire graph in one round trip. It is what the visualiser issues to draw the graph.
+
+`GRAPH` is a whole-graph read only, so it accepts **only** the bare
+`SELECT * FROM GRAPH` form. It rejects:
+
+- **`WHERE`** — a predicate on `GRAPH` is ambiguous (filter nodes? edges? both?);
+  use `FROM NODES` / `FROM EDGES` to filter.
+- **`COUNT`** — "count *what*, nodes or edges?"; use `COUNT * FROM NODES` /
+  `FROM EDGES`.
+- **a column list** — it returns edges too, which have no columns; use `*`.
+
+Both the node and edge scans are capped as above. Crucially, `GRAPH` keeps only
+edges whose **both** endpoints are among the returned nodes, so the result is
+always internally consistent — no edge dangles off a node the cap dropped. When
+that trimming (or either scan's cap) drops rows, the result message reports it.
+
+```sql
+SELECT * FROM GRAPH               -- the whole graph (nodes + edges), capped at 1000 each
+SELECT * FROM GRAPH SNAPSHOT      -- the whole graph as of a point-in-time snapshot (§2.5)
+```
+
+#### OR and COUNT also run as full scans
+
+Two more forms are served by the same full-scan machinery:
 
 - **`OR` queries** (§2.1 "AND / OR in WHERE"). When a WHERE contains `OR`, the
   query cannot be served from a single index anchor, so it runs as a full scan
-  with per-row boolean evaluation. `WHERE LABEL = 'Person' OR age = '99'` — which
-  the old rule would have rejected — now simply works (and scans). Pure-`AND`
-  queries still take the fast index path.
+  with per-row boolean evaluation. Pure-`AND` queries still take the fast index
+  path.
 - **`COUNT`** (below). `SELECT COUNT * FROM NODES` with no WHERE counts the whole
-  graph, a natural aggregate over a full scan.
+  graph, a natural aggregate over a full scan. (A `COUNT` reports a number, not
+  rows, so it is **not** subject to the row cap.)
 
 #### COUNT
 
 `SELECT COUNT * FROM <NODES|EDGES> [WHERE ...]` returns **how many rows match**
 rather than the rows themselves. `COUNT` must be written as `COUNT *` (there is
 nothing to project when only counting). It composes with `WHERE` (including `OR`)
-exactly like a normal `SELECT`, and — unlike a plain live `SELECT` — may omit
-`WHERE` to count the whole graph.
+exactly like a normal `SELECT`, and may omit `WHERE` to count the whole graph. A
+`COUNT` reports a single number, so unlike a row-returning scan it is **not**
+subject to the 1000-row cap. `COUNT` is not supported on the `GRAPH` target
+(count nodes or edges specifically instead).
 
 ```sql
 SELECT COUNT * FROM NODES WHERE LABEL = 'Person'   -- Count: 15
@@ -289,9 +327,11 @@ Supported `WHERE` forms:
 
 | Form | Meaning |
 |------|---------|
+| *(no `WHERE`)* | Full scan: every node, capped at 1000 (or `TOP <n>`). |
 | `WHERE ID = <n>` | Look up a single node by id. |
 | `WHERE LABEL = '<label>'` | All nodes with the given label. |
 | `WHERE LABEL = '<label>' AND <prop> <op> <value> ...` | Label match, then filter by property comparisons. |
+| `WHERE <prop> <op> <value>` | Property filter with no `ID`/`LABEL` anchor: full scan, then filter. |
 
 Examples:
 
@@ -324,6 +364,7 @@ lookup; other operators in an edge `WHERE` are ignored):
 
 | Form | Meaning |
 |------|---------|
+| *(no `WHERE`)* | Full scan: every edge, capped at 1000 (or `TOP <n>`). |
 | `WHERE ID = <n>` | Look up a single edge by id. |
 | `WHERE LABEL = '<label>'` | All edges with the given label. |
 | `WHERE FROM = <n>` | Edges touching node `<n>` (default direction `OUTGOING`). |
@@ -500,12 +541,13 @@ MATCH REACHABLE FROM 1 LIVE          -- identical, explicit
 MATCH SHORTEST_PATH FROM 1 TO 3 SNAPSHOT
 MATCH KHOP FROM 1 STEPS 2 SNAPSHOT
 
--- Snapshot SELECT: point-in-time reads over nodes / edges
+-- Snapshot SELECT: point-in-time reads over nodes / edges / whole graph
 SELECT * FROM NODES SNAPSHOT                              -- full point-in-time scan
 SELECT * FROM NODES WHERE LABEL = 'Person' SNAPSHOT
 SELECT name, age FROM NODES WHERE LABEL = 'Person' SNAPSHOT
 SELECT TOP 10 * FROM NODES SNAPSHOT
 SELECT * FROM EDGES WHERE LABEL = 'KNOWS' SNAPSHOT
+SELECT * FROM GRAPH SNAPSHOT                              -- whole graph, point-in-time
 ```
 
 Rules and behaviour:
@@ -514,25 +556,21 @@ Rules and behaviour:
   and `DELETE` **reject it at parse time**
   (`SNAPSHOT applies only to reads (SELECT, MATCH); INSERT and DELETE always run
   against the live graph.`).
-- **A `SELECT ... SNAPSHOT` may omit `WHERE`.** Because a snapshot materializes
-  the whole point-in-time set, an unfiltered `SELECT * FROM NODES SNAPSHOT` is a
-  well-defined full scan. (The live `SELECT` still requires a `WHERE ID`/`LABEL`
-  predicate, since the live path is index-driven — see §2.1 "Why live SELECT
-  requires WHERE".) The same `WHERE` forms as the live path are otherwise
-  supported: `ID`/`LABEL` and property filters for nodes;
-  `ID`/`LABEL`/`FROM`(+`DIRECTION`)/`TO` for edges. Projection (`col1, col2`) and
-  `TOP <n>` compose with `SNAPSHOT` exactly as they do live.
+- **`SELECT ... SNAPSHOT` supports the same forms as a live `SELECT`,** including
+  a WHERE-less full scan — which live reads now also allow (§2.1). The difference
+  is only *which version of the graph* the read observes: a `SNAPSHOT` read sees
+  the frozen point-in-time set, a live read sees the current graph. All the same
+  shapes apply: `ID`/`LABEL` and property filters for nodes;
+  `ID`/`LABEL`/`FROM`(+`DIRECTION`)/`TO` for edges; the whole-graph `GRAPH` target;
+  projection; and `TOP <n>`. Full scans are capped at 1000 rows in either mode.
 
-  This full-scan behaviour holds **regardless of whether a CSR snapshot object is
-  supplied**. When executed with a snapshot (`execute(Graph&,
+  A `SELECT ... SNAPSHOT` behaves consistently **regardless of whether a CSR
+  snapshot object is supplied**. When executed with a snapshot (`execute(Graph&,
   CSR_Representation&)`) the read resolves against MVCC history at the captured
   version; when executed with no snapshot available (the single-argument
-  `execute(Graph&)`, e.g. the batch command route), a `SELECT ... SNAPSHOT`
-  gracefully **falls back to a live full scan** rather than demanding a `WHERE`.
-  Either way, an unfiltered `SELECT ... SNAPSHOT` succeeds — only *which* version
-  of the graph it observes differs. A property filter supplied without any
-  `ID`/`LABEL` predicate (e.g. `SELECT * FROM NODES WHERE age > '20' SNAPSHOT`) is
-  honoured on this scan, a form the live path rejects.
+  `execute(Graph&)`, e.g. the batch command route), it gracefully **falls back to
+  the live read**. Either way the query succeeds — only the observed version
+  differs.
 - **A snapshot must actually exist.** The snapshot is supplied by the caller
   (`Query::execute(Graph& live, CSR_Representation& snapshot)`). If a `SNAPSHOT`
   query is executed with no snapshot available (the single-argument
@@ -772,9 +810,11 @@ the executor reports the outcome). Below is the authoritative list.
 | `SELECT TOP: expected a non-negative integer row count after TOP.` | `TOP` without a valid count. |
 | `MATCH TOP: expected a non-negative integer row count after TOP.` | `MATCH TOP` without a valid count. |
 | `SELECT: expected FROM.` | Missing `FROM`. |
-| `SELECT: expected NODES or EDGES after FROM.` | Bad or missing target. |
+| `SELECT: expected NODES, EDGES, or GRAPH after FROM.` | Bad or missing target. |
 | `SELECT: unexpected token '<tok>'.` | Extra token where `WHERE` was expected. |
-| `SELECT: a WHERE clause is required (WHERE ID = ... or WHERE LABEL = ...).` | `SELECT` with no `WHERE`. |
+| `SELECT: FROM GRAPH returns nodes and edges; it does not take a column list (use '*').` | A column list against `GRAPH`. |
+| `SELECT: COUNT is not supported on GRAPH; use SELECT COUNT * FROM NODES or FROM EDGES.` | `COUNT` against `GRAPH`. |
+| `SELECT: FROM GRAPH reads the whole graph and takes no WHERE clause (use FROM NODES or FROM EDGES to filter).` | A `WHERE` against `GRAPH`. |
 | `INSERT: expected INTO.` | Missing `INTO`. |
 | `INSERT: expected NODES or EDGES after INTO.` | Bad or missing target. |
 | `INSERT: expected '(' to begin column list.` | Missing `(` before columns. |
@@ -815,6 +855,8 @@ the executor reports the outcome). Below is the authoritative list.
 | `Found 1 row.` | Single-id lookup hit. | ✅ |
 | `Found 0 row(s).` | Single-id lookup missed. | ✅ |
 | `Found <n> row(s).` | Label / edge query result count. | ✅ |
+| `Found <n> row(s). (capped at <n>; <total> total -- use TOP <n> for more)` | A full scan whose result hit the row cap (`DEFAULT_SCAN_CAP` or `TOP`); `<total>` is the true match count before capping. | ✅ |
+| `Graph: <n> node(s), <m> edge(s).` | `SELECT * FROM GRAPH` — whole-graph read (with trailing notes when nodes/edges were capped or edges hidden for an out-of-cap endpoint). | ✅ |
 | `Count: <n>` | `SELECT COUNT * FROM ...` — number of matching rows (no rows returned). | ✅ |
 | `Inserted node.` / `Inserted edge.` | Insert succeeded. | ✅ |
 | `Deleted node.` / `Deleted edge.` | Delete succeeded. | ✅ |
@@ -833,8 +875,8 @@ the executor reports the outcome). Below is the authoritative list.
 | `No nodes found with that label.` | `SELECT NODES` label unknown. | ❌ |
 | `No edges found with that label.` | `SELECT EDGES` label unknown. | ❌ |
 | `No edges found for that node.` | Edge lookup for a node failed. | ❌ |
-| `SELECT FROM NODES requires WHERE ID = ... or WHERE LABEL = ....` | A live node `SELECT` with an unsupported / absent `WHERE`. Live reads are indexed graph access, not a relational table scan (§2.1); use `SNAPSHOT` for an unfiltered full scan. | ❌ |
-| `SELECT FROM EDGES requires WHERE ID = ..., WHERE LABEL = ..., or WHERE FROM = ....` | A live edge `SELECT` with an unsupported / absent `WHERE`. Same rationale as nodes; use `SNAPSHOT` for a full scan. | ❌ |
+| `SELECT FROM NODES requires WHERE ID = ... or WHERE LABEL = ....` | A live node `SELECT` whose `WHERE` is present but uses **no** supported anchor and is not a form the full-scan path handles. A WHERE-*less* `SELECT` is now a valid full scan (§2.1), so this fires only for a malformed / unsupported predicate, not an absent one. | ❌ |
+| `SELECT FROM EDGES requires WHERE ID = ..., WHERE LABEL = ..., or WHERE FROM = ....` | A live edge `SELECT` whose `WHERE` uses no supported anchor and is not a full-scan form. Same as nodes — an absent `WHERE` is a valid full scan. | ❌ |
 | `Invalid DIRECTION (expected OUTGOING, INCOMING, or BOTH).` | Bad `DIRECTION` value. | ❌ |
 | `Invalid FROM node id.` / `Invalid TO node id.` | Non-numeric `FROM` / `TO`. | ❌ |
 | `INSERT INTO EDGES: 'from' and 'to' must be numeric node ids.` | Non-numeric endpoints. | ❌ |
@@ -904,6 +946,9 @@ SELECT * FROM EDGES WHERE FROM = 2 AND DIRECTION = 'BOTH'               -- Found
 
 -- Just the names of the people, at most 10 of them
 SELECT TOP 10 name FROM NODES WHERE LABEL = 'Person'                   -- rows carry only `name`
+
+-- The whole graph in one result (nodes + edges) -- what the visualiser loads
+SELECT * FROM GRAPH                                                     -- Graph: 3 node(s), 2 edge(s).
 
 -- Everyone/everything reachable from Alice
 MATCH REACHABLE FROM 1                                                  -- Found 3 reachable node(s).

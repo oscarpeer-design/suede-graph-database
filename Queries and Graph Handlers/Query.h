@@ -31,7 +31,8 @@ enum class QueryOperation {
 enum class QueryTarget {
     Unknown,
     Nodes,
-    Edges
+    Edges,
+    Graph     // whole-graph read: SELECT * FROM GRAPH -> all nodes AND all edges
 };
 
 // Execution mode: which view of the graph a query resolves against.
@@ -73,6 +74,14 @@ struct QueryResult {
     std::vector<Node> nodes;
     std::vector<Edge> edges;
     std::vector<NodeId> traversalResult; // used by MATCH queries
+
+    // Full-scan cap reporting. A WHERE-less scan (SELECT * FROM NODES/EDGES/GRAPH)
+    // returns at most DEFAULT_SCAN_CAP rows (or TOP <n> if given). When that cap
+    // drops rows, `truncated` is true and `totalMatched` is how many rows matched
+    // BEFORE the cap -- so a caller can say "showing 1000 of 5000". For an
+    // un-capped result, truncated is false and totalMatched equals the row count.
+    bool truncated = false;
+    size_t totalMatched = 0;
 };
 
 // Query class: parsing and execution of lightweight SQL-like statements.
@@ -159,6 +168,14 @@ private:
     QueryResult executeSelectNodes(Graph& graph) const;
     QueryResult executeSelectEdges(Graph& graph) const;
 
+    // Whole-graph read (SELECT * FROM GRAPH). Runs the node scan and the edge
+    // scan, then keeps only edges whose BOTH endpoints are in the returned node
+    // set, so the merged {nodes, edges} bundle is always internally consistent
+    // (no edge points at a node the cap dropped). Mode-aware: in Snapshot mode
+    // (when a snapshot is supplied) it reads the two point-in-time scans instead
+    // of the live ones. `snapshot` is null when no CSR snapshot is available.
+    QueryResult executeSelectGraph(Graph& live, CSR_Representation* snapshot) const;
+
     // Snapshot-mode SELECT resolves against a frozen CSR snapshot.
     //
     // NODES: the CSR snapshot is the authority for *which* nodes are visible --
@@ -198,13 +215,28 @@ private:
 
     // Build the SELECT result message: "Count: <n>" for a COUNT, else the usual
     // "Found <n> row(s)." / "Found 1 row." Keeps the two output shapes in one place.
+    // Full-scan branches call selectMessageCapped() instead, which appends a
+    // "(capped; <total> total)" note when a cap dropped rows.
     std::string selectMessage(size_t rowCount) const;
+
+    // Like selectMessage, but for a capped full scan: appends "(capped; <total>
+    // total)" when rowCount < totalMatched, so the caller sees it was truncated.
+    std::string selectMessageCapped(size_t rowCount, size_t totalMatched) const;
 
     // Truncate a result vector to the TOP <n> limit, if one was given.
     template <typename T>
     void applyLimit(std::vector<T>& rows) const {
         if (hasLimit_ && rows.size() > limit_) rows.resize(limit_);
     }
+
+    // Apply the full-scan cap to a scanned result vector and record truncation
+    // on `result`. The cap is TOP <n> when one was given, else DEFAULT_SCAN_CAP.
+    // Records totalMatched (the row count BEFORE the cap) and sets truncated when
+    // the cap actually dropped rows. Use this ONLY on the WHERE-less full-scan
+    // paths -- ID/LABEL fast-paths and MATCH keep plain applyLimit(). Defined in
+    // the .cpp because it reads DEFAULT_SCAN_CAP (a .cpp-local constant).
+    template <typename T>
+    void applyScanCap(std::vector<T>& rows, QueryResult& result) const;
 
     // Shared execution core for both execute() overloads. `snapshot` is null
     // when no CSR snapshot is available. MATCH reads route to the CSR snapshot

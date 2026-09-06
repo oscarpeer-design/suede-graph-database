@@ -14,6 +14,7 @@
 #include <cctype>                               // std::toupper, std::isspace, std::isdigit
 #include <cstdlib>                              // std::strtoull
 #include <unordered_map>                        // used for mapping field names to values
+#include <unordered_set>                        // kept-node-id set for the GRAPH merge
 
 namespace {                                    // anonymous namespace for internal helpers
 
@@ -21,6 +22,20 @@ namespace {                                    // anonymous namespace for intern
     bool isOperatorChar(char c) {
         return c == '=' || c == '!' || c == '<' || c == '>'; // operator chars: =, !, <, >
     }
+
+    // Default row cap for a WHERE-less full scan (SELECT * FROM NODES / EDGES /
+    // GRAPH) when no TOP <n> is given. It protects the visualiser -- a
+    // force-directed SVG layout is O(n^2) per tick and unreadable well before
+    // this many nodes -- and bounds the JSON response size. A user who genuinely
+    // wants more overrides it per-query with TOP <n> (e.g. SELECT * FROM NODES
+    // TOP 5000), which is reproducible and puts the choice with whoever knows the
+    // client. This is a fixed constant on purpose: keying it off free RAM would
+    // make the same query return different row counts on different runs.
+    //
+    // TODO(operator-config): an operator-configurable SUEDE_MAX_SCAN ceiling
+    // (read once at startup, like SUEDE_SECRET_KEY) could hard-bound even TOP for
+    // memory safety on a given deployment. Not needed yet.
+    constexpr size_t DEFAULT_SCAN_CAP = 1000;
 
 } // anonymous namespace
 
@@ -234,6 +249,7 @@ bool Query::parseTarget(const std::string& token, QueryTarget& outTarget) const 
     std::string t = toUpper(token);              // compare case-insensitively
     if (t == "NODES") { outTarget = QueryTarget::Nodes; return true; } // match nodes
     if (t == "EDGES") { outTarget = QueryTarget::Edges; return true; } // match edges
+    if (t == "GRAPH") { outTarget = QueryTarget::Graph; return true; } // whole graph (nodes + edges)
     return false;                                // unknown target
 }
 
@@ -305,7 +321,7 @@ bool Query::parseSelect(const std::vector<std::string>& tokens, size_t pos) {
     ++pos;                                        // advance past 'FROM'
 
     if (pos >= tokens.size() || !parseTarget(tokens[pos], target_)) { // read target token and set target_
-        setError("SELECT: expected NODES or EDGES after FROM.");
+        setError("SELECT: expected NODES, EDGES, or GRAPH after FROM.");
         return false;
     }
     ++pos;                                        // advance past target token
@@ -317,23 +333,49 @@ bool Query::parseSelect(const std::vector<std::string>& tokens, size_t pos) {
         return false;
     }
 
+    // GRAPH is a whole-graph read (all nodes + all edges). It intentionally
+    // supports only the bare "SELECT * FROM GRAPH" form:
+    //   - no projection: it returns nodes AND edges, so a node-column list makes
+    //     no sense (use FROM NODES to project columns);
+    //   - no COUNT: "how many" of what -- nodes or edges? (use COUNT * FROM NODES
+    //     / EDGES for a specific count);
+    //   - no WHERE: a predicate on GRAPH is ambiguous (filter nodes? edges?
+    //     both?) -- filter with FROM NODES / FROM EDGES instead.
+    // The optional trailing LIVE/SNAPSHOT keyword was already stripped in parse()
+    // before we got here, so a valid "SELECT * FROM GRAPH SNAPSHOT" leaves NO
+    // trailing tokens; only a genuine WHERE (or junk) survives to be rejected below.
+    if (target_ == QueryTarget::Graph) {
+        if (!projection_.empty()) {
+            setError("SELECT: FROM GRAPH returns nodes and edges; it does not take a column list (use '*').");
+            return false;
+        }
+        if (isCount_) {
+            setError("SELECT: COUNT is not supported on GRAPH; use SELECT COUNT * FROM NODES or FROM EDGES.");
+            return false;
+        }
+        if (pos < tokens.size()) {                // any surviving token is a WHERE or junk
+            setError("SELECT: FROM GRAPH reads the whole graph and takes no WHERE clause "
+                "(use FROM NODES or FROM EDGES to filter).");
+            return false;
+        }
+        return true;                              // bare whole-graph scan (live or snapshot)
+    }
+
     if (pos < tokens.size()) {                    // if there are more tokens, expect a WHERE clause
         if (toUpper(tokens[pos]) != "WHERE") { setError("SELECT: unexpected token '" + tokens[pos] + "'."); return false; } // unexpected token
         return parseWhereClause(tokens, pos + 1); // delegate WHERE parsing starting after 'WHERE'
     }
 
-    // A WHERE-less SELECT is a full scan. Against the live graph this is normally
-    // rejected (the live path is index-driven and needs an ID/LABEL predicate),
-    // but it is permitted in two cases:
-    //   - SELECT ... SNAPSHOT, which materializes the whole point-in-time set;
-    //   - SELECT COUNT * FROM ..., since counting the whole graph ("how many
-    //     nodes are there?") is a natural aggregate over a full scan.
-    if (executionMode_ == ExecutionMode::Snapshot || isCount_) {
-        return true;                              // no conditions: full scan (snapshot or count)
-    }
-
-    setError("SELECT: a WHERE clause is required (WHERE ID = ... or WHERE LABEL = ...)."); // require explicit WHERE
-    return false;
+    // A WHERE-less SELECT is a full scan, and it is now always permitted:
+    //   - SELECT * FROM NODES / EDGES  -> every node / every edge (capped at
+    //     DEFAULT_SCAN_CAP, or TOP <n> if given). This is the "show me the whole
+    //     live graph" gesture the visualiser needs; it used to be rejected here.
+    //   - SELECT ... SNAPSHOT          -> the whole point-in-time set.
+    //   - SELECT COUNT * FROM ...      -> counting the whole graph.
+    // The full-scan executor paths (executeSelectNodes / executeSelectEdges) walk
+    // every row and keep those matching the (possibly empty) WHERE, so an empty
+    // condition list correctly means "keep everything". The cap is applied there.
+    return true;                                  // no conditions: full scan
 }
 
 // parse INSERT INTO <NODES|EDGES> (col1, col2, ...) VALUES (val1, val2, ...)
@@ -555,6 +597,12 @@ QueryResult Query::executeResolved(Graph& live, CSR_Representation* snapshot) co
 
     switch (operation_) {                         // dispatch by operation type
     case QueryOperation::Select:
+        // GRAPH is a whole-graph read (all nodes + all edges). executeSelectGraph
+        // is itself mode-aware -- it picks the live or snapshot node/edge scans
+        // from executionMode_ and whether a snapshot was supplied -- so route it
+        // here before the Nodes/Edges split below.
+        if (target_ == QueryTarget::Graph)
+            return executeSelectGraph(live, snapshot);
         // SELECT ... SNAPSHOT resolves against MVCC history at the snapshot's
         // captured version, when a CSR snapshot is available to supply it.
         // Without a snapshot there is no captured version, so we fall back to
@@ -665,6 +713,44 @@ std::string Query::selectMessage(size_t rowCount) const {
         : "Found " + std::to_string(rowCount) + " row(s).";
 }
 
+// selectMessageCapped: like selectMessage, but for a capped full scan. When the
+// cap dropped rows (rowCount < totalMatched) it appends a note so the caller
+// knows the result is partial, e.g. "Found 1000 row(s) (capped; 5000 total)."
+// A COUNT is never capped (it returns a number, not rows), so it defers to
+// selectMessage unchanged.
+std::string Query::selectMessageCapped(size_t rowCount, size_t totalMatched) const {
+    if (isCount_)
+        return selectMessage(rowCount);
+    std::string base = (rowCount == 1)
+        ? "Found 1 row."
+        : "Found " + std::to_string(rowCount) + " row(s).";
+    if (rowCount < totalMatched)
+        base += " (capped at " + std::to_string(rowCount) +
+        "; " + std::to_string(totalMatched) + " total -- use TOP <n> for more)";
+    return base;
+}
+
+// applyScanCap: cap a scanned result vector and record truncation on `result`.
+// The cap is TOP <n> when one was given, otherwise DEFAULT_SCAN_CAP. Records
+// totalMatched (the row count BEFORE the cap) and sets truncated when the cap
+// actually removed rows. Used ONLY by the WHERE-less full-scan paths; ID/LABEL
+// fast-paths and MATCH keep plain applyLimit() (they are not full scans).
+template <typename T>
+void Query::applyScanCap(std::vector<T>& rows, QueryResult& result) const {
+    const size_t total = rows.size();
+    // TOP <n> overrides the default cap; with no TOP, the default protects the
+    // client. (TOP 0 legitimately caps to zero rows.)
+    const size_t cap = hasLimit_ ? limit_ : DEFAULT_SCAN_CAP;
+    if (rows.size() > cap) rows.resize(cap);
+    result.totalMatched = total;
+    result.truncated = (rows.size() < total);
+}
+
+// Explicit instantiations so the template definition (in this .cpp) links for the
+// two row types the full-scan paths actually use.
+template void Query::applyScanCap<Node>(std::vector<Node>&, QueryResult&) const;
+template void Query::applyScanCap<Edge>(std::vector<Edge>&, QueryResult&) const;
+
 void Query::projectNodes(std::vector<Node>& nodes) const {
     if (projection_.empty()) return;              // '*' -> keep all columns
 
@@ -730,15 +816,18 @@ static bool evaluateConditions(const std::vector<Condition>& conditions, TestFn 
 QueryResult Query::executeSelectNodes(Graph& graph) const {
     QueryResult result;                           // prepare result container
 
-    // Full-scan path. Taken when the WHERE contains an OR (which the single-anchor
-    // index fast-paths below cannot serve), when this is a Snapshot-mode read (a
-    // point-in-time full scan), or for a WHERE-less COUNT (count the whole graph).
-    // A live OR query deliberately falls back to a scan rather than being rejected
-    // -- the language favours "the command always works" over forbidding the
-    // un-indexable case. nodeMatchesConditions honours AND/OR precedence, so an
-    // empty WHERE keeps everything.
+    // Full-scan path. Taken when:
+    //   - the WHERE contains an OR (the single-anchor index fast-paths below
+    //     cannot serve it, so it falls back to a scan rather than being rejected
+    //     -- the language favours "the command always works");
+    //   - this is a Snapshot-mode read (a point-in-time full scan);
+    //   - there is no WHERE at all (conditions_ empty): "SELECT * FROM NODES" now
+    //     means "every node", the whole-live-graph read the visualiser needs.
+    //     This also covers the WHERE-less COUNT (count the whole graph).
+    // nodeMatchesConditions honours AND/OR precedence, and an empty condition
+    // list matches every node, so the same loop serves all three cases.
     if (whereHasOr() || executionMode_ == ExecutionMode::Snapshot ||
-        (isCount_ && conditions_.empty())) {
+        conditions_.empty()) {
         std::vector<NodeId> ids;
         graph.GetNodeIdOrder(ids);                // deterministic insertion order
         for (NodeId id : ids) {
@@ -749,10 +838,10 @@ QueryResult Query::executeSelectNodes(Graph& graph) const {
         }
         result.success = true;
         projectNodes(result.nodes);               // trim to selected columns (no-op for '*')
-        applyLimit(result.nodes);                 // apply TOP <n> row cap
+        applyScanCap(result.nodes, result);       // cap at TOP <n> or DEFAULT_SCAN_CAP; record truncation
         size_t n = result.nodes.size();
         if (isCount_) result.nodes.clear();       // COUNT reports the number, not the rows
-        result.message = selectMessage(n);
+        result.message = selectMessageCapped(n, result.totalMatched);
         return result;
     }
 
@@ -832,13 +921,14 @@ QueryResult Query::executeSelectNodes(Graph& graph) const {
 QueryResult Query::executeSelectEdges(Graph& graph) const {
     QueryResult result;                           // prepare result container
 
-    // Full-scan path (OR present, Snapshot-mode read, or WHERE-less COUNT). The
-    // index fast-paths below build a field map that assumes every condition is an
-    // AND-ed equality, which OR breaks -- so any OR routes here, evaluating AND/OR
-    // precedence per edge over a full scan. edgeMatchesConditions honours empty
-    // WHERE (match all), which also serves "SELECT COUNT * FROM EDGES".
+    // Full-scan path. Taken when the WHERE contains an OR (the index fast-paths
+    // below build an AND-ed-equality field map that OR breaks), on a Snapshot-mode
+    // read, or when there is no WHERE at all (conditions_ empty): "SELECT * FROM
+    // EDGES" now means "every edge", which also serves "SELECT COUNT * FROM EDGES".
+    // edgeMatchesConditions matches every edge on an empty condition list, so one
+    // loop serves all three cases.
     if (whereHasOr() || executionMode_ == ExecutionMode::Snapshot ||
-        (isCount_ && conditions_.empty())) {
+        conditions_.empty()) {
         std::vector<EdgeId> ids;
         graph.GetAllEdgeIds(ids);
         for (EdgeId id : ids) {
@@ -848,10 +938,10 @@ QueryResult Query::executeSelectEdges(Graph& graph) const {
             result.edges.push_back(edge);
         }
         result.success = true;
-        applyLimit(result.edges);                 // apply TOP <n> row cap
+        applyScanCap(result.edges, result);       // cap at TOP <n> or DEFAULT_SCAN_CAP; record truncation
         size_t n = result.edges.size();
         if (isCount_) result.edges.clear();       // COUNT reports the number, not the rows
-        result.message = selectMessage(n);
+        result.message = selectMessageCapped(n, result.totalMatched);
         return result;
     }
 
@@ -954,6 +1044,79 @@ QueryResult Query::executeSelectEdges(Graph& graph) const {
     return result;
 }
 
+// Execute SELECT * FROM GRAPH: a whole-graph read returning all nodes AND all
+// edges in one result. It reuses the node and edge scan executors (which already
+// handle the WHERE-less full scan and the DEFAULT_SCAN_CAP / TOP cap), then keeps
+// only edges whose BOTH endpoints survived the node cap -- so the merged bundle
+// is always internally consistent (no edge dangles off a node the cap dropped).
+//
+// Mode-aware: in Snapshot mode with a snapshot supplied it reads the two
+// point-in-time scans; otherwise (live mode, or Snapshot with no snapshot
+// available) it reads the live scans -- mirroring how a plain SELECT ... SNAPSHOT
+// degrades to live when nothing is frozen (see executeResolved).
+//
+// GRAPH takes no WHERE/COUNT/projection (rejected in parseSelect), so this path
+// never has to consider conditions_, isCount_, or projection_.
+QueryResult Query::executeSelectGraph(Graph& live, CSR_Representation* snapshot) const {
+    const bool useSnapshot =
+        (executionMode_ == ExecutionMode::Snapshot && snapshot != nullptr);
+
+    // 1. Scan nodes and edges. Each call caps itself (TOP <n> or DEFAULT_SCAN_CAP)
+    //    and records its own truncation on the sub-result.
+    QueryResult nodePart = useSnapshot
+        ? executeSelectNodesSnapshot(live, *snapshot)
+        : executeSelectNodes(live);
+    QueryResult edgePart = useSnapshot
+        ? executeSelectEdgesSnapshot(live, *snapshot)
+        : executeSelectEdges(live);
+
+    // A failure in either scan fails the whole read (surface its message).
+    if (!nodePart.success) return nodePart;
+    if (!edgePart.success) return edgePart;
+
+    // 2. Merge. Take the node set as-is, then keep only edges whose endpoints are
+    //    both present, so the drawn graph never references a dropped node.
+    QueryResult result;
+    result.success = true;
+    result.nodes = std::move(nodePart.nodes);
+
+    std::unordered_set<uint64_t> keptNodeIds;         // ids that survived the node cap
+    keptNodeIds.reserve(result.nodes.size());
+    for (const Node& n : result.nodes)
+        keptNodeIds.insert(n.id.value());
+
+    size_t edgesDroppedForMissingEndpoint = 0;
+    for (Edge& e : edgePart.edges) {
+        if (keptNodeIds.count(e.from.value()) && keptNodeIds.count(e.to.value()))
+            result.edges.push_back(std::move(e));
+        else
+            ++edgesDroppedForMissingEndpoint;
+    }
+
+    // 3. Truncation reporting for the bundle. It is "truncated" if either scan was
+    //    capped, OR if we dropped edges because their endpoints fell outside the
+    //    (capped) node set -- in every such case the view is partial.
+    result.truncated =
+        nodePart.truncated || edgePart.truncated || (edgesDroppedForMissingEndpoint > 0);
+    // totalMatched here means "nodes matched before the cap" -- the node count is
+    // what drives the visualiser, so report that as the headline total.
+    result.totalMatched = nodePart.totalMatched;
+
+    std::string msg = "Graph: " + std::to_string(result.nodes.size()) + " node(s), " +
+        std::to_string(result.edges.size()) + " edge(s).";
+    if (nodePart.truncated)
+        msg += " (nodes capped at " + std::to_string(result.nodes.size()) +
+        "; " + std::to_string(nodePart.totalMatched) + " total)";
+    if (edgePart.truncated)
+        msg += " (edges capped at " + std::to_string(edgePart.totalMatched >= result.edges.size()
+            ? result.edges.size() : edgePart.totalMatched) + ")";
+    if (edgesDroppedForMissingEndpoint > 0)
+        msg += " (" + std::to_string(edgesDroppedForMissingEndpoint) +
+        " edge(s) hidden: endpoint outside the node cap)";
+    result.message = msg;
+    return result;
+}
+
 // ----------------------- SELECT ... SNAPSHOT execution -----------------------
 //
 // These resolve the query against the graph's MVCC history at a fixed
@@ -983,10 +1146,10 @@ QueryResult Query::executeSelectNodesSnapshot(Graph& graph, const CSR_Representa
         }
         result.success = true;
         projectNodes(result.nodes);
-        applyLimit(result.nodes);
+        applyScanCap(result.nodes, result);       // cap at TOP <n> or DEFAULT_SCAN_CAP
         size_t n = result.nodes.size();
         if (isCount_) result.nodes.clear();
-        result.message = selectMessage(n);
+        result.message = selectMessageCapped(n, result.totalMatched);
         return result;
     }
 
@@ -1065,9 +1228,14 @@ QueryResult Query::executeSelectNodesSnapshot(Graph& graph, const CSR_Representa
 
     result.success = true;
     projectNodes(result.nodes);              // trim to selected columns (no-op for '*')
+    // Cap the scan. With a TOP, considerNode already stopped at limit_, so this is
+    // a no-op (and truncated stays false -- TOP is the user's explicit cap, not the
+    // safety cap we flag). With no TOP, a WHERE-less snapshot scan is capped to
+    // DEFAULT_SCAN_CAP here, exactly like the live path.
+    applyScanCap(result.nodes, result);
     size_t n = result.nodes.size();
     if (isCount_) result.nodes.clear();      // COUNT reports the number, not the rows
-    result.message = selectMessage(n);
+    result.message = selectMessageCapped(n, result.totalMatched);
     return result;
 }
 
@@ -1094,10 +1262,10 @@ QueryResult Query::executeSelectEdgesSnapshot(Graph& graph, const CSR_Representa
             result.edges.push_back(e);
         }
         result.success = true;
-        applyLimit(result.edges);
+        applyScanCap(result.edges, result);       // cap at TOP <n> or DEFAULT_SCAN_CAP
         size_t n = result.edges.size();
         if (isCount_) result.edges.clear();
-        result.message = selectMessage(n);
+        result.message = selectMessageCapped(n, result.totalMatched);
         return result;
     }
 
@@ -1158,10 +1326,10 @@ QueryResult Query::executeSelectEdgesSnapshot(Graph& graph, const CSR_Representa
     }
 
     result.success = true;
-    applyLimit(result.edges);                // apply TOP <n> row cap
+    applyScanCap(result.edges, result);      // cap at TOP <n> or DEFAULT_SCAN_CAP; record truncation
     size_t n = result.edges.size();
     if (isCount_) result.edges.clear();      // COUNT reports the number, not the rows
-    result.message = selectMessage(n);
+    result.message = selectMessageCapped(n, result.totalMatched);
     return result;
 }
 

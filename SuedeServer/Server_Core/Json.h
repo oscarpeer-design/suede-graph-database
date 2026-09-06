@@ -16,7 +16,7 @@ using json = nlohmann::json;
 // Section A - inbound parse (never throws)
 // ---------------------------------------------------------------------------
 struct ParseResult {
-    bool ok;            // false -> the bytes weren't valid JSON
+    bool ok = true;            // false -> the bytes weren't valid JSON
     json value;         // only meaningful when ok == true
     std::string error;  // human-readable "why" when ok == false
 };
@@ -116,6 +116,15 @@ inline json toJson(const QueryResult& result) {
     out_json["traversal"] = json::array();
     for (const NodeId& id : result.traversalResult)
         out_json["traversal"].push_back(id.value());
+
+    // Full-scan cap reporting. A WHERE-less SELECT (FROM NODES / EDGES / GRAPH) is
+    // capped at DEFAULT_SCAN_CAP rows; when the cap drops rows, `truncated` is true
+    // and `totalMatched` is how many rows matched BEFORE the cap. The visualiser
+    // uses these to show "showing 1000 of 5000" rather than silently drawing a
+    // partial graph. For an un-capped result truncated is false and (per the
+    // QueryResult contract) totalMatched equals the returned row count.
+    out_json["truncated"] = result.truncated;
+    out_json["totalMatched"] = result.totalMatched;
 
     return out_json;
 }

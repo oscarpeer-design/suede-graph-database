@@ -276,8 +276,8 @@
         </div>
         <div class="controls">
             <input type="text" id="token" placeholder="Bearer token (from: SuedeServer --mint &lt;ip&gt;)" autocomplete="off" spellcheck="false">
-            <input type="text" id="query" placeholder="e.g.  SELECT * FROM NODES WHERE LABEL = 'Person'  |  MATCH REACHABLE FROM 1"
-                   value="SELECT * FROM NODES WHERE LABEL = 'Person'">
+            <input type="text" id="query" placeholder="e.g.  SELECT * FROM GRAPH  |  SELECT * FROM NODES WHERE LABEL = 'Person'  |  MATCH REACHABLE FROM 1"
+                   value="SELECT * FROM GRAPH">
             <button id="run">Run</button>
             <button id="fit" class="secondary" title="Fit graph to view">Fit</button>
         </div>
@@ -450,10 +450,25 @@
             }
 
             ingestResult(resultJson);
+
+            // If the server capped a full scan, say so plainly -- a partial graph
+            // should never look like the whole one. `truncated` / `totalMatched`
+            // come from the QueryResult (see Json.h); older servers that don't send
+            // them simply leave `truncated` undefined, so this note is skipped.
+            let truncationNote = "";
+            if (resultJson.truncated) {
+                const total = resultJson.totalMatched;
+                truncationNote = total
+                    ? "  ⚠ showing " + graphNodes.length + " of " + total +
+                    " — add TOP <n> to see more"
+                    : "  ⚠ result was capped — add TOP <n> to see more";
+            }
+
             setStatus(
                 (resultJson.message ? resultJson.message + "  " : "") +
                 "(" + graphNodes.length + " nodes, " + graphEdges.length + " edges" +
-                (highlightedNodeIds.size ? ", " + highlightedNodeIds.size + " in path" : "") + ")",
+                (highlightedNodeIds.size ? ", " + highlightedNodeIds.size + " in path" : "") + ")" +
+                truncationNote,
                 "ok");
         }
 
@@ -864,9 +879,9 @@
             const colour = colourForLabel(node.label);
             let html =
                 `<div style="margin-bottom:8px">
-           <span class="badge" style="background:${colour}">${escapeHtml(node.label || "(no label)")}</span>
-           <span style="color:var(--ink-muted); font-size:12px; margin-left:6px">id ${node.id}</span>
-         </div>`;
+               <span class="badge" style="background:${colour}">${escapeHtml(node.label || "(no label)")}</span>
+               <span style="color:var(--ink-muted); font-size:12px; margin-left:6px">id ${node.id}</span>
+             </div>`;
 
             const properties = node.properties || {};
             const propertyKeys = Object.keys(properties);

@@ -689,43 +689,63 @@ parse time.
 
 ---
 
-### 2.7 LOAD
+### 2.7 LOAD / FLUSH (binary persistence)
 
-Load a graph from a persisted binary file.
+Load and save the graph in the compact binary format.
+
+> **Two layers, two syntaxes — read this.** Binary persistence exists at two
+> levels, and they use *different* command words:
+>
+> - **Through the server / `GraphHandler`** (i.e. the visualiser, the HTTP API, or
+>   anything calling `GraphHandler::executeCommand`), use the **bare-word**
+>   commands **`LOAD <path>`** and **`FLUSH <path>`**. These are what actually read
+>   and write files — the handler owns the `StorageEngine`. This is the form you
+>   want in normal use.
+> - The query language *also* parses `LOAD FILE '<path>'` / `SAVE FILE '<path>'`
+>   as statements, but the `Query` layer only records the path (it owns no
+>   storage). Sent to the server they do **not** perform binary I/O — the command
+>   layer routes on the leading word `LOAD`/`FLUSH`, so `LOAD FILE 'x'` is
+>   mis-read (it treats `FILE 'x'` as the path). **Use `LOAD x`, not
+>   `LOAD FILE 'x'`.**
+
+**`LOAD <path>`** — load the graph from a binary file:
 
 ```
-LOAD FILE '<path>'
+LOAD graph.bin
+LOAD backups/graph_2026_07_09.bin
 ```
 
-```sql
-LOAD FILE 'graph.db'
-LOAD FILE 'backups/graph_2026_07_09.db'
+Bare `LOAD` (no path) loads from the engine's existing path, if one was set.
+`LOAD` builds into the **current** graph, so load into a freshly-started, empty
+server or the duplicated rows will fail the file's integrity check (the loader
+validates that reconstructed node/edge counts match the file header, and verifies
+a CRC32 trailer).
+
+**`FLUSH <path>`** — save the graph to a binary file:
+
+```
+FLUSH graph.bin
+FLUSH backups/graph_2026_07_09.bin
 ```
 
-The quoted path is parsed and exposed via `operation()` / `filePath()`. The actual
-file read is performed by a coordinator that owns a `StorageEngine`; executing a
-bare `LOAD` against a `Graph` alone reports that a coordinator/StorageEngine is
-required, because the `Query` object has no storage of its own.
+Bare `FLUSH` uses the engine's existing path. If the session had no storage
+configured, one is created on demand for the path you give — so you can save to a
+brand-new file without any setup. The write is **atomic** (it writes a temp file
+and renames it over the target), so a failed or interrupted save can never corrupt
+an existing good file.
+
+Paths are relative to the **server's working directory** (where `SuedeServer.exe`
+runs — `x64\Release` for a Release build), so put the file there or give an
+absolute path.
 
 ---
 
-### 2.8 SAVE
+### 2.8 IMPORT / EXPORT CSV — see §2.9 / §2.10
 
-Save the current graph to a binary file.
-
-```
-SAVE FILE '<path>'
-```
-
-```sql
-SAVE FILE 'graph.db'
-SAVE FILE 'backups/graph_2026_07_09.db'
-```
-
-As with `LOAD`, the quoted path is parsed and exposed via `filePath()`, and the
-actual write is performed by a coordinator that owns a `StorageEngine`. This keeps
-the `Query` layer free of file-system concerns while letting file operations be
-expressed as ordinary statements.
+CSV persistence is covered in §2.9 (`IMPORT CSV`) and §2.10 (`EXPORT CSV`). Unlike
+binary `LOAD`/`FLUSH`, CSV **does** use the quoted query-language form
+`IMPORT CSV '<path>'` / `EXPORT CSV '<path>'`, which the server routes to the
+storage engine correctly.
 
 ---
 
@@ -742,13 +762,14 @@ IMPORT CSV 'social.csv'
 IMPORT CSV 'data/people_2026.csv'
 ```
 
-`IMPORT`/`EXPORT` are the CSV counterparts of the binary `LOAD`/`SAVE`. The
-distinct keyword pair keeps the two formats unambiguous at a glance: `LOAD FILE`
-/ `SAVE FILE` are binary `.bin`; `IMPORT CSV` / `EXPORT CSV` are CSV. Exactly like
-`LOAD`/`SAVE`, the `Query` layer only **parses** the statement and records the
-quoted path via `filePath()`; a coordinator that owns a `StorageEngine` performs
-the actual read (`StorageEngine::ImportCSV`). Executed against a bare `Graph`
-alone it reports that a coordinator is required.
+`IMPORT`/`EXPORT` are the CSV counterparts of the binary `LOAD`/`FLUSH` (§2.7).
+The distinct keyword pair keeps the two formats unambiguous at a glance: binary
+uses the bare-word `LOAD` / `FLUSH`; CSV uses the quoted `IMPORT CSV` /
+`EXPORT CSV`. Through the server these CSV statements are routed to
+`StorageEngine::ImportCSV` / `ExportCSV` and work as written. (At the bare `Query`
+layer, with no coordinating `StorageEngine`, they only parse and record the path —
+so a direct `Query::execute` reports that a coordinator is required. In normal use
+the server supplies that coordinator.)
 
 `IMPORT CSV` builds nodes and edges **into the current graph** (it does not clear
 first), so importing into an already-populated graph adds to it. To reconstruct a

@@ -112,6 +112,15 @@
                 transform: translateY(1px);
             }
 
+            button:disabled {
+                cursor: default;
+                opacity: .45;
+            }
+
+                button:disabled:active {
+                    transform: none;
+                }
+
         #status {
             font-size: 12.5px;
             min-height: 18px;
@@ -279,9 +288,10 @@
             <input type="text" id="query" placeholder="e.g.  SELECT * FROM GRAPH  |  SELECT * FROM NODES WHERE LABEL = 'Person'  |  MATCH REACHABLE FROM 1"
                    value="SELECT * FROM GRAPH">
             <button id="run">Run</button>
+            <button id="refresh" class="secondary" title="Re-run your last graph query (e.g. after an INSERT)">Refresh</button>
             <button id="fit" class="secondary" title="Fit graph to view">Fit</button>
         </div>
-        <div id="status" class="ok">Enter a token and a query, then Run. The token is remembered for this tab only.</div>
+        <div id="status" class="ok">Enter a token and a query, then Run. After an INSERT/UPDATE, click Refresh to update the graph. The token is remembered for this tab only.</div>
     </header>
 
     <main>
@@ -392,6 +402,13 @@
         //   panX / panY = translation in screen pixels, zoom = scale factor.
         let camera = { panX: 0, panY: 0, zoom: 1 };
 
+        // The last READ query (SELECT / MATCH) that successfully drew a graph.
+        // The Refresh button re-runs this so you can see the effect of a mutation
+        // (INSERT / UPDATE / DELETE) without it silently redrawing on you. It stays
+        // null until the first successful read, and the Refresh button is disabled
+        // until then (there is nothing to refresh yet).
+        let lastReadQuery = null;
+
         // ===========================================================================
         // Step 1: run a query against the server.
         // ===========================================================================
@@ -435,21 +452,38 @@
                 return;
             }
 
-            // Only READ queries (SELECT / MATCH) produce a graph to draw. Mutations
-            // (INSERT / UPDATE / DELETE / IMPORT / EXPORT / SAVE / LOAD / SNAPSHOT ...)
-            // succeeded, but their result is not a graph view -- redrawing on them would
-            // wipe whatever you're looking at (e.g. an INSERT returns only its one new
-            // node, which would replace the whole graph with a single dot). So for a
-            // mutation we just report the server's message and LEAVE THE DRAWING ALONE.
-            const firstKeyword = command.split(/\s+/)[0].toUpperCase();
-            const isReadQuery = (firstKeyword === "SELECT" || firstKeyword === "MATCH");
+            // Decide whether this result should REPLACE the drawing. The rule is:
+            // the canvas is only ever replaced by a query that actually returns
+            // something to draw -- node rows, edge rows, or a MATCH traversal.
+            // Everything else leaves the current drawing exactly as it is and just
+            // reports to the status line. That covers:
+            //   * mutations (INSERT / UPDATE / DELETE / persistence / snapshots) --
+            //     their response is not a graph view (an INSERT returns only its one
+            //     new node, which would replace the whole graph with a single dot);
+            //   * COUNT (SELECT COUNT * ...) -- returns a number, no rows;
+            //   * a genuine read that matched NOTHING -- e.g. a filter that hit no
+            //     rows. Blanking the canvas on a mistyped filter is exactly the
+            //     "graph state doesn't persist" complaint, so we don't.
+            // This is what makes the drawing persist visibly across every command
+            // that has nothing new to show.
+            const hasDrawableResult =
+                (Array.isArray(resultJson.nodes) && resultJson.nodes.length > 0) ||
+                (Array.isArray(resultJson.edges) && resultJson.edges.length > 0) ||
+                (Array.isArray(resultJson.traversal) && resultJson.traversal.length > 0);
 
-            if (!isReadQuery) {
-                setStatus(resultJson.message || "OK (drawing unchanged)", "ok");
+            if (!hasDrawableResult) {
+                // Nothing to draw -> keep the current view exactly as it is and just
+                // report the message. The drawing is never cleared.
+                setStatus(resultJson.message || "OK", "ok");
                 return;
             }
 
             ingestResult(resultJson);
+
+            // Remember this read so Refresh can replay it (e.g. after an INSERT).
+            // Only a query that actually drew a graph is remembered -- a COUNT or an
+            // empty result never becomes the thing Refresh would replay.
+            lastReadQuery = command;
 
             // If the server capped a full scan, say so plainly -- a partial graph
             // should never look like the whole one. `truncated` / `totalMatched`
@@ -496,14 +530,23 @@
                 if (!nodesById.has(id)) nodesById.set(id, { id, label: "", properties: {} });
             }
 
-            // Collect edges. Keep only edges whose BOTH endpoints are in our node set
-            // (so nothing dangles). SELECT FROM EDGES gives real edge rows; a MATCH gives
-            // none, so when there are no edge rows we stitch consecutive traversal ids
-            // together so the path itself is still visible as connected segments.
+            // Collect edges. For each edge, ensure BOTH endpoints exist as nodes -- if an
+            // endpoint isn't in the result (e.g. SELECT * FROM EDGES returns edge rows
+            // that reference nodes BY ID ONLY, with no node payload), synthesise a bare
+            // stub node for it rather than dropping the edge. Without this, an edge-only
+            // query has an empty node set, every edge fails a "both endpoints known"
+            // check, and the canvas is blank. The stub draws as a "#id" circle; running
+            // SELECT * FROM GRAPH instead fills in the real labels/properties. (This
+            // mirrors Neo4j Browser's "connect result nodes": an edge implies its two
+            // endpoints, so we always draw them.) A real node row for the same id, if it
+            // arrives in this or a later query, takes precedence over the stub.
             const edgesToDraw = [];
             for (const edge of returnedEdges) {
-                if (nodesById.has(edge.from) && nodesById.has(edge.to))
-                    edgesToDraw.push({ fromId: edge.from, toId: edge.to, label: edge.label || "" });
+                if (!nodesById.has(edge.from))
+                    nodesById.set(edge.from, { id: edge.from, label: "", properties: {} });
+                if (!nodesById.has(edge.to))
+                    nodesById.set(edge.to, { id: edge.to, label: "", properties: {} });
+                edgesToDraw.push({ fromId: edge.from, toId: edge.to, label: edge.label || "" });
             }
             if (edgesToDraw.length === 0 && traversalIds.length >= 2) {
                 for (let i = 0; i + 1 < traversalIds.length; i++)
@@ -574,15 +617,43 @@
             const canvasHeight = canvas.clientHeight || 600;
             const centreX = canvasWidth / 2, centreY = canvasHeight / 2;
 
-            // idealDistance is the target spacing between nodes: derived from how much
-            // canvas area each node has to itself. The 0.75 just tightens it a little.
-            const idealDistance = Math.sqrt((canvasWidth * canvasHeight) / nodeCount) * 0.75;
+            // idealDistance is the target spacing between nodes. It is derived from how
+            // much canvas area each node has to itself, BUT CLAMPED to a fixed on-screen
+            // range. Without the clamp, a big window makes this large (e.g. ~425px for a
+            // few nodes on a 1200x800 canvas), the repulsion force -- which scales with
+            // idealDistance^2 -- then blows the graph up to thousands of pixels across,
+            // and fitToView has to zoom way out to catch it, leaving tiny nodes marooned
+            // in empty space. Clamping to ~[70, 130] keeps spacing readable and roughly
+            // constant regardless of monitor size, so the graph stays a compact cluster.
+            const IDEAL_MIN = 70, IDEAL_MAX = 130;
+            const rawIdeal = Math.sqrt((canvasWidth * canvasHeight) / nodeCount) * 0.75;
+            const idealDistance = Math.max(IDEAL_MIN, Math.min(rawIdeal, IDEAL_MAX));
             const ITERATIONS = 300;
             let temperature = canvasWidth / 8;   // caps how far a node may move per round
 
+            // Repulsion only acts within this cutoff. Beyond it, two nodes stop
+            // pushing each other apart -- crucial for DISCONNECTED nodes: with no edge
+            // spring to counter it, unbounded repulsion would push a pair apart until
+            // it only balanced the (weak) centre-pull, settling them very far apart
+            // (the "2 nodes 1300px apart" case). Capping repulsion range lets the
+            // centre-pull win at long range and gather loose nodes into a compact
+            // cluster, while short-range repulsion + the MIN_SEPARATION pass still keep
+            // them from overlapping. ~3x idealDistance is enough to space neighbours.
+            const REPULSION_CUTOFF = idealDistance * 3;
+
+            // PERF: this is O(ITERATIONS * N^2) -- the outer iteration loop wraps the
+            // nested i/j repulsion pass (and the MIN_SEPARATION pass below is another
+            // ~60 * N^2). Fine for the tens-of-nodes case; it will freeze the tab well
+            // before a full 1000-node (DEFAULT_SCAN_CAP) SELECT * FROM GRAPH. When the
+            // visualiser needs to scale, the fixes are: a spatial grid to make repulsion
+            // ~O(N) (bucket nodes by cell, only compare neighbouring cells); early-stop
+            // the outer loop once total movement settles; and a "graph too big to draw --
+            // showing first N" guard. The REPULSION_CUTOFF below already lets far pairs
+            // bail early, cutting the constant but not the asymptotic bound.
             for (let iteration = 0; iteration < ITERATIONS; iteration++) {
-                // --- repulsion: every ordered pair pushes apart. O(N^2), which is fine for
-                //     graphs up to a few hundred nodes. Force grows as nodes get closer. ---
+                // --- repulsion: every ordered pair pushes apart, but only within
+                //     REPULSION_CUTOFF. O(N^2), fine for graphs up to a few hundred
+                //     nodes. Force grows as nodes get closer. ---
                 for (let i = 0; i < nodeCount; i++) {
                     graphNodes[i].velocityX = 0;
                     graphNodes[i].velocityY = 0;
@@ -591,6 +662,7 @@
                         let deltaX = graphNodes[i].x - graphNodes[j].x;
                         let deltaY = graphNodes[i].y - graphNodes[j].y;
                         let distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY) || 0.01;
+                        if (distance > REPULSION_CUTOFF) continue;   // too far to interact
                         const repulsion = (idealDistance * idealDistance) / distance;
                         graphNodes[i].velocityX += (deltaX / distance) * repulsion;
                         graphNodes[i].velocityY += (deltaY / distance) * repulsion;
@@ -613,13 +685,16 @@
                     toNode.velocityX += pullX; toNode.velocityY += pullY;
                 }
 
-                // --- a VERY gentle pull toward the centre so disconnected pieces don't
-                //     drift off-screen. Deliberately weak (0.003): a strong centre-pull
-                //     collapses edge-less nodes into a pile (the bug where 2 unconnected
-                //     nodes stacked on top of each other). ---
+                // --- a pull toward the centre so disconnected pieces stay a compact
+                //     cluster instead of drifting apart. This used to be VERY weak
+                //     (0.003) to avoid an old bug where edge-less nodes collapsed into a
+                //     pile -- but the hard MIN_SEPARATION pass below now guarantees no
+                //     two nodes overlap regardless, so we can safely use a firmer pull
+                //     (0.02). Firmer pull => tighter graph => a sensible fit zoom. ---
+                const CENTRE_PULL = 0.02;
                 for (const node of graphNodes) {
-                    node.velocityX += (centreX - node.x) * 0.003;
-                    node.velocityY += (centreY - node.y) * 0.003;
+                    node.velocityX += (centreX - node.x) * CENTRE_PULL;
+                    node.velocityY += (centreY - node.y) * CENTRE_PULL;
                 }
 
                 // --- apply the accumulated velocity, but never move a node further than the
@@ -856,11 +931,14 @@
             const graphHeight = (maxY - minY) || 1;
 
             // pick the zoom that fits both dimensions (capped at 2x so tiny graphs don't
-            // balloon), then centre the bounding box in the view.
-            const zoom = Math.min(
+            // balloon), then centre the bounding box in the view. A lower bound of 0.05
+            // stops a pathologically large spread from zooming so far out that nodes
+            // render sub-pixel and effectively vanish -- with the compact layout above
+            // this floor should rarely bind, but it guarantees nodes are always visible.
+            const zoom = Math.max(0.05, Math.min(
                 viewWidth / (graphWidth + PADDING * 2),
                 viewHeight / (graphHeight + PADDING * 2),
-                2);
+                2));
             camera.zoom = zoom;
             camera.panX = (viewWidth - graphWidth * zoom) / 2 - minX * zoom;
             camera.panY = (viewHeight - graphHeight * zoom) / 2 - minY * zoom;
@@ -925,9 +1003,23 @@
         }
 
         // ===========================================================================
+        // Refresh: re-run the last graph query (SELECT / MATCH) to pull in the effect
+        // of a mutation (INSERT / UPDATE / DELETE) on demand. Always available: if a
+        // graph query has been run, it replays that (putting it back in the box so it's
+        // visible what ran); if none has yet, it just runs whatever is in the box now
+        // (identical to Run), so the button is never a dead no-op.
+        // ===========================================================================
+        function refreshGraph() {
+            if (lastReadQuery !== null)
+                byElementId("query").value = lastReadQuery;
+            runQuery();
+        }
+
+        // ===========================================================================
         // Wire up the controls.
         // ===========================================================================
         byElementId("run").addEventListener("click", runQuery);
+        byElementId("refresh").addEventListener("click", refreshGraph);
         byElementId("fit").addEventListener("click", fitToView);
         byElementId("query").addEventListener("keydown", (event) => {
             if (event.key === "Enter") runQuery();

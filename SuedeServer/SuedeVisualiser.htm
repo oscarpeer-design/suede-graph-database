@@ -404,21 +404,52 @@
 
         // The last READ query (SELECT / MATCH) that successfully drew a graph.
         // The Refresh button re-runs this so you can see the effect of a mutation
-        // (INSERT / UPDATE / DELETE) without it silently redrawing on you. It stays
-        // null until the first successful read, and the Refresh button is disabled
-        // until then (there is nothing to refresh yet).
+        // (INSERT / UPDATE / DELETE) without it silently redrawing on you.
         let lastReadQuery = null;
+
+        // In-flight guard. runQuery() is async (it awaits a fetch, then runs a
+        // synchronous force layout). Without this flag, a second click while a query
+        // is still running fires a SECOND overlapping request -- two responses then
+        // race to draw, and because the layout blocks the main thread the page feels
+        // frozen, so the user clicks again. That is the "wait and double-click" bug.
+        // While a query runs we ignore new triggers and disable Run/Refresh so a
+        // click can't be lost and the busy state is visible.
+        let queryInProgress = false;
+
+        // Reflect the busy state on the controls: disable Run/Refresh and dim them
+        // while a query runs, re-enable when it finishes. Purely visual feedback +
+        // a hard guard so overlapping runs cannot start.
+        function setBusy(busy) {
+            queryInProgress = busy;
+            byElementId("run").disabled = busy;
+            byElementId("refresh").disabled = busy;
+        }
 
         // ===========================================================================
         // Step 1: run a query against the server.
         // ===========================================================================
         async function runQuery() {
+            // Guard: if a query is already running, ignore this trigger entirely.
+            // This is what stops a fast second click from firing a second request.
+            if (queryInProgress) return;
+
             const token = tokenInput.value.trim();
             const command = byElementId("query").value.trim();
             if (!token) { setStatus("Enter a bearer token first.", "error"); return; }
             if (!command) { setStatus("Enter a query first.", "error"); return; }
 
+            setBusy(true);
             setStatus("Running...", "ok");
+            // Yield one frame so the "Running..." status + disabled buttons actually
+            // PAINT before the (synchronous, main-thread-blocking) force layout runs.
+            // Without this, the status change and the freeze happen in the same tick,
+            // so the user never sees feedback -- the page just locks then updates.
+            await new Promise(requestAnimationFrame);
+
+            // Everything below runs inside try/finally so setBusy(false) ALWAYS runs,
+            // on every exit path (success, network error, non-2xx, non-JSON), and the
+            // buttons can never get stuck disabled.
+            try {
 
             let response, resultJson, rawResponseText;
             try {
@@ -452,29 +483,43 @@
                 return;
             }
 
-            // Decide whether this result should REPLACE the drawing. The rule is:
-            // the canvas is only ever replaced by a query that actually returns
-            // something to draw -- node rows, edge rows, or a MATCH traversal.
-            // Everything else leaves the current drawing exactly as it is and just
-            // reports to the status line. That covers:
-            //   * mutations (INSERT / UPDATE / DELETE / persistence / snapshots) --
-            //     their response is not a graph view (an INSERT returns only its one
-            //     new node, which would replace the whole graph with a single dot);
-            //   * COUNT (SELECT COUNT * ...) -- returns a number, no rows;
-            //   * a genuine read that matched NOTHING -- e.g. a filter that hit no
-            //     rows. Blanking the canvas on a mistyped filter is exactly the
-            //     "graph state doesn't persist" complaint, so we don't.
-            // This is what makes the drawing persist visibly across every command
-            // that has nothing new to show.
-            const hasDrawableResult =
+            // Decide whether this result should REPLACE the drawing. The rule has
+            // TWO parts, and both must pass to redraw:
+            //
+            //   1. It must NOT be a mutation. INSERT / UPDATE / DELETE (and
+            //      persistence / snapshot commands) never redraw -- even though an
+            //      INSERT *does* return its one new node, drawing that node would
+            //      replace the whole graph with a single dot. A mutation only changes
+            //      the underlying data; to SEE the change you re-run a read (Refresh).
+            //   2. It must actually have rows to draw -- node rows, edge rows, or a
+            //      MATCH traversal. This is what stops a COUNT (a number, no rows) or a
+            //      zero-match read from blanking the canvas.
+            //
+            // Everything that fails either part leaves the current drawing exactly as
+            // it is and just reports to the status line. That is what makes the graph
+            // persist visibly across every command that has nothing new to show.
+            const firstKeyword = command.split(/\s+/)[0].toUpperCase();
+            const isMutation =
+                firstKeyword === "INSERT" || firstKeyword === "UPDATE" ||
+                firstKeyword === "DELETE";
+
+            const hasRows =
                 (Array.isArray(resultJson.nodes) && resultJson.nodes.length > 0) ||
                 (Array.isArray(resultJson.edges) && resultJson.edges.length > 0) ||
                 (Array.isArray(resultJson.traversal) && resultJson.traversal.length > 0);
 
-            if (!hasDrawableResult) {
-                // Nothing to draw -> keep the current view exactly as it is and just
-                // report the message. The drawing is never cleared.
-                setStatus(resultJson.message || "OK", "ok");
+            const shouldRedraw = !isMutation && hasRows;
+
+            if (!shouldRedraw) {
+                // Not redrawing -> keep the current view exactly as it is and just
+                // report the message. The drawing is never cleared. (A mutation adds a
+                // nudge to Refresh, since re-running the last read is how you see it.)
+                setStatus(
+                    (resultJson.message || "OK") +
+                    (isMutation && lastReadQuery !== null
+                        ? "  — click Refresh to update the graph"
+                        : ""),
+                    "ok");
                 return;
             }
 
@@ -504,6 +549,13 @@
                 (highlightedNodeIds.size ? ", " + highlightedNodeIds.size + " in path" : "") + ")" +
                 truncationNote,
                 "ok");
+
+            } finally {
+                // Whatever happened above -- success, an early return, or a thrown
+                // error -- clear the busy state so the buttons work again. This is the
+                // single place the guard is released, so it can never get stuck.
+                setBusy(false);
+            }
         }
 
         // ===========================================================================
@@ -600,6 +652,50 @@
         }
 
         // ===========================================================================
+        // Spatial grid -- the optimisation that makes the layout scale.
+        //
+        // A naive force layout compares every node with every other node: O(N^2) per
+        // iteration, which freezes the tab at a thousand nodes. But two nodes only
+        // interact when they are within some cutoff distance (repulsion has a cutoff;
+        // the min-separation pass only cares about pairs closer than MIN_SEPARATION).
+        // So we bucket nodes into square cells whose side is that cutoff, and then a
+        // node only needs to be compared with nodes in its OWN cell and the 8
+        // neighbouring cells -- everything further away is, by construction, beyond
+        // the cutoff and contributes nothing. For a roughly even spread that is O(N).
+        //
+        // buildGrid(cellSize) returns { cellOf(node) -> "cx,cy" key, cells: Map<key,
+        // node[]>, neighbours(node) -> node[] } for the CURRENT node positions. It is
+        // rebuilt each iteration because nodes move; bucketing is itself O(N), cheap.
+        // Correctness hinges on cellSize >= the interaction cutoff: then any pair
+        // within the cutoff necessarily falls in the same or an adjacent cell, so the
+        // 3x3 neighbourhood scan can never miss an interacting pair.
+        // ===========================================================================
+        function buildGrid(nodes, cellSize) {
+            const cells = new Map();               // "cx,cy" -> array of nodes in that cell
+            const cellIndex = (v) => Math.floor(v / cellSize);
+            for (const node of nodes) {
+                const key = cellIndex(node.x) + "," + cellIndex(node.y);
+                let bucket = cells.get(key);
+                if (!bucket) { bucket = []; cells.set(key, bucket); }
+                bucket.push(node);
+            }
+            // Return every node in the 3x3 block of cells around `node` (itself
+            // included). Callers skip the self-pair explicitly.
+            function neighbours(node) {
+                const cx = cellIndex(node.x), cy = cellIndex(node.y);
+                const out = [];
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dy = -1; dy <= 1; dy++) {
+                        const bucket = cells.get((cx + dx) + "," + (cy + dy));
+                        if (bucket) for (const other of bucket) out.push(other);
+                    }
+                }
+                return out;
+            }
+            return { neighbours };
+        }
+
+        // ===========================================================================
         // Step 3: force-directed layout (a Fruchterman-Reingold-style simulation).
         //
         // The idea: treat every node as a charged particle that PUSHES all other nodes
@@ -607,6 +703,13 @@
         // together (attraction). Iterating these forces, with a "temperature" that
         // shrinks each round so motion settles, arranges the graph into the familiar
         // spread-out, edges-roughly-even shape. A final pass guarantees no overlap.
+        //
+        // Repulsion and the min-separation pass both use a SPATIAL GRID (see
+        // buildGrid) so each is ~O(N) per iteration instead of O(N^2) -- this is what
+        // lets a full 1000-node SELECT * FROM GRAPH lay out without freezing. Because
+        // repulsion already had a hard REPULSION_CUTOFF, the grid computes exactly the
+        // same forces as the old all-pairs loop did (it only skips pairs the cutoff
+        // was already zeroing), so the resulting layout is unchanged -- just faster.
         // ===========================================================================
         function computeLayout() {
             const nodeCount = graphNodes.length;
@@ -641,31 +744,28 @@
             // them from overlapping. ~3x idealDistance is enough to space neighbours.
             const REPULSION_CUTOFF = idealDistance * 3;
 
-            // PERF: this is O(ITERATIONS * N^2) -- the outer iteration loop wraps the
-            // nested i/j repulsion pass (and the MIN_SEPARATION pass below is another
-            // ~60 * N^2). Fine for the tens-of-nodes case; it will freeze the tab well
-            // before a full 1000-node (DEFAULT_SCAN_CAP) SELECT * FROM GRAPH. When the
-            // visualiser needs to scale, the fixes are: a spatial grid to make repulsion
-            // ~O(N) (bucket nodes by cell, only compare neighbouring cells); early-stop
-            // the outer loop once total movement settles; and a "graph too big to draw --
-            // showing first N" guard. The REPULSION_CUTOFF below already lets far pairs
-            // bail early, cutting the constant but not the asymptotic bound.
             for (let iteration = 0; iteration < ITERATIONS; iteration++) {
-                // --- repulsion: every ordered pair pushes apart, but only within
-                //     REPULSION_CUTOFF. O(N^2), fine for graphs up to a few hundred
-                //     nodes. Force grows as nodes get closer. ---
-                for (let i = 0; i < nodeCount; i++) {
-                    graphNodes[i].velocityX = 0;
-                    graphNodes[i].velocityY = 0;
-                    for (let j = 0; j < nodeCount; j++) {
-                        if (i === j) continue;
-                        let deltaX = graphNodes[i].x - graphNodes[j].x;
-                        let deltaY = graphNodes[i].y - graphNodes[j].y;
+                // --- repulsion: every node pushes nearby nodes apart, within
+                //     REPULSION_CUTOFF. Uses the spatial grid: a node is only compared
+                //     with nodes in its own + neighbouring cells (cell size = the
+                //     cutoff), so pairs beyond the cutoff -- which contribute zero
+                //     force anyway -- are never even examined. ~O(N) per iteration
+                //     instead of O(N^2). Force grows as nodes get closer. ---
+                for (const node of graphNodes) {
+                    node.velocityX = 0;
+                    node.velocityY = 0;
+                }
+                const repulsionGrid = buildGrid(graphNodes, REPULSION_CUTOFF);
+                for (const node of graphNodes) {
+                    for (const other of repulsionGrid.neighbours(node)) {
+                        if (other === node) continue;
+                        let deltaX = node.x - other.x;
+                        let deltaY = node.y - other.y;
                         let distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY) || 0.01;
                         if (distance > REPULSION_CUTOFF) continue;   // too far to interact
                         const repulsion = (idealDistance * idealDistance) / distance;
-                        graphNodes[i].velocityX += (deltaX / distance) * repulsion;
-                        graphNodes[i].velocityY += (deltaY / distance) * repulsion;
+                        node.velocityX += (deltaX / distance) * repulsion;
+                        node.velocityY += (deltaY / distance) * repulsion;
                     }
                 }
 
@@ -710,23 +810,33 @@
             // --- Hard minimum-separation pass. Whatever the simulation produced, no two
             //     nodes may end up closer than MIN_SEPARATION, so they can never visually
             //     overlap. Repeated relaxation rounds push any too-close pair apart until
-            //     none remain (or we hit the round cap). This is a safety net on top of
-            //     the repulsion above, not a replacement for it. ---
+            //     none remain (or we hit the round cap). A safety net on top of the
+            //     repulsion above, not a replacement for it.
+            //
+            //     Also grid-accelerated: two nodes can only violate MIN_SEPARATION if
+            //     they are within it, so with a cell size of MIN_SEPARATION only the
+            //     3x3 neighbourhood can contain a violating partner. The grid is rebuilt
+            //     each round because positions move as we push pairs apart. We give each
+            //     node a stable index so a pair is handled once per round (i < j), even
+            //     though the grid yields both orderings. ---
             const MIN_SEPARATION = 70;
+            for (let n = 0; n < nodeCount; n++) graphNodes[n]._idx = n;
             for (let round = 0; round < 60; round++) {
                 let anyMoved = false;
-                for (let i = 0; i < nodeCount; i++) {
-                    for (let j = i + 1; j < nodeCount; j++) {
-                        let deltaX = graphNodes[j].x - graphNodes[i].x;
-                        let deltaY = graphNodes[j].y - graphNodes[i].y;
+                const sepGrid = buildGrid(graphNodes, MIN_SEPARATION);
+                for (const a of graphNodes) {
+                    for (const b of sepGrid.neighbours(a)) {
+                        if (b._idx <= a._idx) continue;   // handle each pair once (i < j)
+                        let deltaX = b.x - a.x;
+                        let deltaY = b.y - a.y;
                         let distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
                         if (distance < MIN_SEPARATION) {
                             // exactly coincident: pick a deterministic direction to split them.
-                            if (distance < 0.001) { deltaX = Math.cos(i * 1.7); deltaY = Math.sin(i * 1.7); distance = 1; }
+                            if (distance < 0.001) { deltaX = Math.cos(a._idx * 1.7); deltaY = Math.sin(a._idx * 1.7); distance = 1; }
                             const pushEach = (MIN_SEPARATION - distance) / 2;
                             const unitX = deltaX / distance, unitY = deltaY / distance;
-                            graphNodes[i].x -= unitX * pushEach; graphNodes[i].y -= unitY * pushEach;
-                            graphNodes[j].x += unitX * pushEach; graphNodes[j].y += unitY * pushEach;
+                            a.x -= unitX * pushEach; a.y -= unitY * pushEach;
+                            b.x += unitX * pushEach; b.y += unitY * pushEach;
                             anyMoved = true;
                         }
                     }

@@ -118,10 +118,17 @@ public:
     // Get graph version (useful for snapshot tracking)
     uint64_t getGraphVersion() const;
 
-    // Execute any command: queries, snapshots, persistence
+    // Execute any command: queries, snapshots, persistence. This is a thin timing
+    // wrapper that records the server-side service time (microseconds) onto the
+    // result's serverMicros field, then returns; the real routing is dispatchCommand.
     QueryResult executeCommand(const std::string& commandStr);
 
 private:
+    // The actual command router. executeCommand times a single call to this so the
+    // measured duration covers parse + lock wait + execution. Separated only so the
+    // timing wrapper stays clean; it has no other behavioural purpose.
+    QueryResult dispatchCommand(const std::string& commandStr);
+
     std::unique_ptr<Graph> graph_;
     std::unique_ptr<StorageEngine> storage_;  // Can be null if no persistence
 

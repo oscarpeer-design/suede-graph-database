@@ -1,5 +1,7 @@
 #include "GraphHandler.h"
 
+#include <chrono>   // std::chrono for server-side timing of executeCommand
+
 // commandArgument
 // Returns the trimmed argument that follows a leading keyword in a command,
 // e.g. commandArgument("FLUSH  /tmp/g.bin", "FLUSH") -> "/tmp/g.bin".
@@ -288,8 +290,31 @@ uint64_t GraphHandler::getGraphVersion() const {
 }
 
 // executeCommand
-// this is the interface for all users
+// this is the interface for all users.
+//
+// It is a thin TIMING WRAPPER around dispatchCommand (below): it records how long
+// the whole dispatch took -- parse, lock acquisition (including any wait for the
+// exclusive write lock), and execution -- in microseconds, and stamps that onto
+// the result's serverMicros field. This is the true server-side service time,
+// isolated from all HTTP and client overhead, which a load test reads back from
+// the JSON to measure real engine performance. The wrapper adds essentially no
+// cost (two clock reads) and does not change any behaviour.
 QueryResult GraphHandler::executeCommand(const std::string& commandStr) {
+    const auto startTime = std::chrono::steady_clock::now();
+
+    QueryResult result = dispatchCommand(commandStr);
+
+    const auto endTime = std::chrono::steady_clock::now();
+    result.serverMicros = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        endTime - startTime).count();
+    return result;
+}
+
+// dispatchCommand
+// The actual command router (formerly the body of executeCommand). Kept separate
+// so executeCommand can time it as a single call without threading timing through
+// every return path of the switch.
+QueryResult GraphHandler::dispatchCommand(const std::string& commandStr) {
     std::string command = commandStr;
 
     // trim leading whitespace

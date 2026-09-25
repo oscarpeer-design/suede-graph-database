@@ -126,6 +126,11 @@ inline json toJson(const QueryResult& result) {
     out_json["truncated"] = result.truncated;
     out_json["totalMatched"] = result.totalMatched;
 
+    // Server-side service time in microseconds (see QueryResult::serverMicros and
+    // GraphHandler::executeCommand). Lets a client -- e.g. a load test -- measure
+    // true engine time, excluding all HTTP and client overhead. 0 if never stamped.
+    out_json["serverMicros"] = result.serverMicros;
+
     return out_json;
 }
 

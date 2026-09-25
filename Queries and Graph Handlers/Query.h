@@ -82,6 +82,15 @@ struct QueryResult {
     // un-capped result, truncated is false and totalMatched equals the row count.
     bool truncated = false;
     size_t totalMatched = 0;
+
+    // Server-side service time for this command, in MICROSECONDS. Measured by
+    // GraphHandler::executeCommand around the whole dispatch -- so it INCLUDES the
+    // time spent waiting for the read/write lock, which is the point: it is the
+    // true time the server took to service the request, isolated from all HTTP and
+    // client-side overhead. Emitted in the JSON response (see Json.h) so a load
+    // test can report real engine time separate from network/Python cost. 0 when
+    // the field was never stamped (e.g. a result built outside executeCommand).
+    uint64_t serverMicros = 0;
 };
 
 // Query class: parsing and execution of lightweight SQL-like statements.

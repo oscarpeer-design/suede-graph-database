@@ -486,3 +486,55 @@ void Graph::GetEdgesAtVersion(std::vector<Edge>& out, uint64_t snapshotVersion) 
             out.push_back(ev.edge);
     }
 }
+
+// Fetch one edge's payload at `snapshotVersion` (see Graph.h).
+bool Graph::GetEdgeAtVersion(EdgeId id, uint64_t snapshotVersion, Edge& out) const {
+    auto it = mvccEdges_.find(id);
+    if (it == mvccEdges_.end())
+        return false;                                  // absent or reclaimed
+    const EdgeVersion& ev = it->second;
+    const bool createdInView = ev.createdAtVersion <= snapshotVersion;
+    const bool notYetDeleted = (ev.deletedAtVersion == 0) ||
+        (ev.deletedAtVersion > snapshotVersion);
+    if (!(createdInView && notYetDeleted))
+        return false;                                  // not visible at this version
+    out = ev.edge;
+    return true;
+}
+
+// Label of one node at `snapshotVersion`, without copying its properties.
+bool Graph::GetNodeLabelAtVersion(NodeId id, uint64_t snapshotVersion, std::string& outLabel) const {
+    auto it = mvccNodes_.find(id);
+    if (it == mvccNodes_.end())
+        return false;                                  // absent or reclaimed
+    const NodeVersion& nv = it->second;
+    const bool createdInView = nv.createdAtVersion <= snapshotVersion;
+    const bool notYetDeleted = (nv.deletedAtVersion == 0) ||
+        (nv.deletedAtVersion > snapshotVersion);
+    if (!(createdInView && notYetDeleted))
+        return false;                                  // not visible at this version
+    outLabel = nv.node.label;
+    return true;
+}
+
+// ---------------------- read-only live accessors (no copy) -------------------
+
+const Node* Graph::PeekNode(NodeId id) const {
+    auto it = nodes.find(id);
+    return (it == nodes.end()) ? nullptr : &it->second;
+}
+
+const Edge* Graph::PeekEdge(EdgeId id) const {
+    auto it = edges.find(id);
+    return (it == edges.end()) ? nullptr : &it->second;
+}
+
+const std::vector<NodeId>* Graph::NodeIdsForLabel(const std::string& label) const {
+    auto it = labelToNodes.find(label);
+    return (it == labelToNodes.end()) ? nullptr : &it->second;
+}
+
+const std::vector<EdgeId>* Graph::EdgeIdsForLabel(const std::string& label) const {
+    auto it = labelToEdges.find(label);
+    return (it == labelToEdges.end()) ? nullptr : &it->second;
+}

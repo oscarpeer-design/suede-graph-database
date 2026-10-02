@@ -85,7 +85,11 @@ class Workload:
         # Ids are drawn from 1..idSpace; clamp to at least 1 so randint never fails.
         self.idSpace = max(1, idSpace)
         # When snapshotId is set, READ operations (SELECT / MATCH) are issued as
-        # point-in-time SNAPSHOT reads. WRITES always stay LIVE, because the engine
+        # point-in-time reads of THAT snapshot: the command ends with "SNAPSHOT <id>".
+        # The id is required -- a bare trailing SNAPSHOT is rejected by the server
+        # (it used to be silently executed against the LIVE graph, so the old
+        # "SNAPSHOT mode" of this test never actually read a snapshot).
+        # WRITES always stay LIVE, because the engine
         # rejects SNAPSHOT on a mutation by design -- so a write drawn while in
         # snapshot mode simply runs against the live graph (see commandFor).
         self.snapshotId = snapshotId
@@ -112,7 +116,7 @@ class Workload:
             else:
                 command = "SELECT * FROM NODES WHERE ID = %d" % randomId
             if isSnapshotRead:
-                command += " SNAPSHOT"
+                command += " SNAPSHOT %d" % self.snapshotId
             return ("SELECT", command)
 
         if operation == "MATCH":
@@ -125,7 +129,7 @@ class Workload:
             ])
             command = "MATCH " + traversal
             if isSnapshotRead:
-                command += " SNAPSHOT"
+                command += " SNAPSHOT %d" % self.snapshotId
             return ("MATCH", command)
 
         if operation == "INSERT":
@@ -271,7 +275,9 @@ class StressClient:
         stays responsive. Spawns `workerCount` workers, each pulling request slots
         until `totalRequests` is reached.
         """
-        self.stopRequested.clear()
+        # NOTE: stopRequested is deliberately NOT cleared here. A client is built per
+        # run, and clearing it would erase a stop() that arrived just before run()
+        # started (the Stop button pressed during setup), so the load would run in full.
         self.requestsClaimed = 0
         with ThreadPoolExecutor(max_workers=self.workerCount) as pool:
             workerFutures = [pool.submit(self._runWorkerLoop)

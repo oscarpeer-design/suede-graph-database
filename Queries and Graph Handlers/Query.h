@@ -120,6 +120,15 @@ public:
     // Snapshot when the statement ended with the SNAPSHOT keyword).
     ExecutionMode executionMode() const { return executionMode_; }
 
+    // Which snapshot a SNAPSHOT-mode read targets. A statement names one by ending
+    // with "SNAPSHOT <id>" (the id returned by SNAPSHOT CREATE), e.g.
+    //     SELECT * FROM NODES WHERE ID = 5 SNAPSHOT 2
+    // hasSnapshotId() is false for a bare trailing SNAPSHOT (or a LIVE statement);
+    // a coordinator that owns the snapshots (GraphHandler) uses snapshotId() to pick
+    // the CSR_Representation and passes it to execute(Graph&, CSR_Representation&).
+    bool hasSnapshotId() const { return hasSnapshotId_; }
+    uint64_t snapshotId() const { return snapshotId_; }
+
     // The projected columns for a SELECT (empty means "*" -- all columns). Only
     // meaningful for SELECT FROM NODES; property keys plus the reserved names
     // "id" and "label" are valid columns. Exposed for testing.
@@ -217,6 +226,14 @@ private:
     // The reserved columns "id"/"label" are structural and always retained.
     void projectNodes(std::vector<Node>& nodes) const;
 
+    // True if the WHERE has a top-level ID = <n> / LABEL = '<x>' equality that the
+    // live SELECT fast paths can anchor on (nodes), or an ID / FROM / LABEL equality
+    // (edges). Used so a SNAPSHOT-mode query that falls back to the live graph (no
+    // snapshot supplied) still takes the index path whenever one exists, and scans
+    // only when there is genuinely nothing to anchor on.
+    bool hasNodeIndexAnchor() const;
+    bool hasEdgeIndexAnchor() const;
+
     // True if any parsed WHERE condition is joined by OR. A pure-AND WHERE can use
     // the fast index paths (anchor on ID/LABEL, filter the rest); an OR forces the
     // general boolean evaluation over a full scan (see conditionsMatch* below).
@@ -280,6 +297,10 @@ private:
 
     // Execution mode selected by an optional trailing LIVE / SNAPSHOT keyword.
     ExecutionMode executionMode_ = ExecutionMode::Live;
+
+    // Snapshot named by a trailing "SNAPSHOT <id>" (see hasSnapshotId()).
+    bool hasSnapshotId_ = false;
+    uint64_t snapshotId_ = 0;
 
     // MATCH-specific
     CSR_Mode matchMode_ = CSR_Mode::REACHABLE;

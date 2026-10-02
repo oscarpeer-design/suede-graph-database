@@ -188,6 +188,7 @@ here explicitly.
 | `EDGE COUNT` | Returns `message: "Edge count: <n>"`. |
 | `SNAPSHOT CREATE` | Captures a point-in-time snapshot; `message` carries the new snapshot id. |
 | `SNAPSHOT RELEASE <id>` | Releases a snapshot by id. |
+| `<SELECT or MATCH statement> SNAPSHOT <id>` | Runs a read against snapshot `<id>` (the id from `SNAPSHOT CREATE`) instead of the live graph, e.g. `SELECT * FROM NODES WHERE LABEL = 'Person' SNAPSHOT 2`. The id is required: a bare trailing `SNAPSHOT`, or an unknown / released id, returns `success: false`. |
 | `FLUSH [path]` | Saves the live graph to binary. Bare `FLUSH` uses the engine's existing path; `FLUSH graph.bin` saves to that path. |
 | `LOAD [path]` | Loads the live graph from binary. `LOAD graph.bin` loads that file. |
 | `IMPORT CSV '<path>'` | Imports a CSV file into the live graph (query-language statement). |

@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -384,4 +385,47 @@ public:
 
     // Collect every edge visible to the snapshot taken at `snapshotVersion`.
     void GetEdgesAtVersion(std::vector<Edge>& out, uint64_t snapshotVersion) const;
+
+    // Fetch ONE edge's payload as it was at `snapshotVersion`, by id (O(1) history
+    // lookup, same visibility rule as GetEdgesAtVersion). Lets SELECT ... FROM EDGES
+    // WHERE ID = <n> SNAPSHOT avoid materialising every visible edge.
+    bool GetEdgeAtVersion(EdgeId id, uint64_t snapshotVersion, Edge& out) const;
+
+    // Like GetEdgesAtVersion, but only copies edges for which `pred(edge)` is true.
+    // The predicate runs against the retained history record IN PLACE, so edges that
+    // fail it are never copied. Order is unspecified (same as GetEdgesAtVersion).
+    template <typename Pred>
+    void GetEdgesAtVersionIf(std::vector<Edge>& out, uint64_t snapshotVersion, Pred pred) const {
+        out.clear();
+        for (const auto& kv : mvccEdges_) {
+            const EdgeVersion& ev = kv.second;
+            const bool createdInView = ev.createdAtVersion <= snapshotVersion;
+            const bool notYetDeleted = (ev.deletedAtVersion == 0) ||
+                (ev.deletedAtVersion > snapshotVersion);
+            if (createdInView && notYetDeleted && pred(ev.edge))
+                out.push_back(ev.edge);
+        }
+    }
+
+    // Label of ONE node as it was at `snapshotVersion`, without copying the node's
+    // property map. Same visibility rule as GetNodeAtVersion. Used to build a
+    // snapshot's label index (labels are immutable, so one read per node suffices).
+    bool GetNodeLabelAtVersion(NodeId id, uint64_t snapshotVersion, std::string& outLabel) const;
+
+    // ------------------------ read-only live accessors ------------------------
+    // These expose the live indexes WITHOUT copying, so a caller that already holds
+    // the engine lock (UPDATE executes under the exclusive lock) can find rows via
+    // the id / label indexes instead of scanning and copying every row.
+    //
+    // Pointers/references are valid only until the next mutation of the graph. A
+    // caller that mutates while iterating must copy the ids first.
+
+    // Live node / edge by id, or nullptr if absent.
+    const Node* PeekNode(NodeId id) const;
+    const Edge* PeekEdge(EdgeId id) const;
+
+    // Live ids carrying `label` (insertion order), or nullptr if the label has
+    // never been used.
+    const std::vector<NodeId>* NodeIdsForLabel(const std::string& label) const;
+    const std::vector<EdgeId>* EdgeIdsForLabel(const std::string& label) const;
 };

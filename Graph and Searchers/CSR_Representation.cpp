@@ -31,6 +31,31 @@ void CSR_Representation::Load_CSR() {
 	FillRowOffsets(nodeOrder);
 	// fill columns
 	FillColumns(nodeOrder);
+	// index member nodes by label for fast SELECT ... WHERE LABEL = ... SNAPSHOT
+	BuildLabelIndex();
+}
+
+// BuildLabelIndex
+// Group the snapshot's member ids by label. Each label is read from the graph's
+// MVCC history as of snapshotVersion_ (no property-map copy). Members that are not
+// visible at that version are skipped -- exactly what the scan path would skip.
+void CSR_Representation::BuildLabelIndex() {
+	labelIndex_.clear();
+	std::string label;
+	for (NodeId id : csrToNode) {
+		if (graph.GetNodeLabelAtVersion(id, snapshotVersion_, label))
+			labelIndex_[label].push_back(id);
+	}
+	labelIndexBuilt_ = true;
+}
+
+// NodesWithLabel
+const std::vector<NodeId>* CSR_Representation::NodesWithLabel(const std::string& label) const {
+	if (!labelIndexBuilt_)
+		return nullptr;                       // no index: caller scans
+	static const std::vector<NodeId> kNone;   // built, but nobody has this label
+	auto it = labelIndex_.find(label);
+	return (it == labelIndex_.end()) ? &kNone : &it->second;
 }
 
 // Reset_CSR
@@ -41,6 +66,8 @@ void CSR_Representation::Reset_CSR() {
 	nodeToCSR.clear();
 	csrToNode.clear();
 	adjacency_cache.clear();
+	labelIndex_.clear();
+	labelIndexBuilt_ = false;
 }
 
 // convert graph node to CSR_ID

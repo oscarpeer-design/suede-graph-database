@@ -26,6 +26,15 @@ private:
 	std::vector<NodeId> csrToNode;
 	// data structure that tracks neighouring nodes
 	std::vector<std::vector<NodeId>> adjacency_cache;
+	// label -> ids of the snapshot's member nodes carrying that label, in CSR
+	// (insertion) order. Built once by BuildLabelIndex() so that
+	// SELECT ... WHERE LABEL = '...' SNAPSHOT touches only the matching ids instead
+	// of scanning every member. The snapshot is immutable and labels never change
+	// on UPDATE, so the index never goes stale. labelIndexBuilt_ is false for a
+	// snapshot whose mapping was installed through the setters (e.g. loaded from
+	// disk) until BuildLabelIndex() is called; readers then fall back to a scan.
+	std::unordered_map<std::string, std::vector<NodeId>> labelIndex_;
+	bool labelIndexBuilt_ = false;
 
 	// Build Adjacency cache
 	void BuildAdjacencyCache(std::vector<NodeId>& nodeOrder) {
@@ -117,6 +126,20 @@ public:
 	// load CSR
 	void Load_CSR();
 
+	// Build the per-snapshot label index from the current node mapping, reading each
+	// member's label as of this snapshot's version. Called by Load_CSR(); a snapshot
+	// restored through the setters should call it once after installing its mapping
+	// (while still single-threaded, i.e. under the handler's exclusive lock).
+	void BuildLabelIndex();
+
+	// True once BuildLabelIndex() has run for the current mapping.
+	bool HasLabelIndex() const { return labelIndexBuilt_; }
+
+	// Member ids carrying `label`, in CSR order. Returns nullptr when the index has
+	// not been built (caller must scan); returns a pointer to an empty vector when
+	// it has been built and no member has that label.
+	const std::vector<NodeId>* NodesWithLabel(const std::string& label) const;
+
 	// reset CSR
 	void Reset_CSR();
 
@@ -139,10 +162,19 @@ public:
 	const std::vector<size_t>& GetColumns() const { return columns; }
 
 	// Setter for snapshot version
-	void SetSnapshotVersion(uint64_t version) { snapshotVersion_ = version; }
+	// (invalidates the label index, which is read as of a specific version)
+	void SetSnapshotVersion(uint64_t version) {
+		snapshotVersion_ = version;
+		labelIndex_.clear();
+		labelIndexBuilt_ = false;
+	}
 
-	// Setter for csrToNode mapping
-	void SetCSRNodeMapping(std::vector<NodeId> mapping) { csrToNode = std::move(mapping); }
+	// Setter for csrToNode mapping (invalidates the label index: rebuild it afterwards)
+	void SetCSRNodeMapping(std::vector<NodeId> mapping) {
+		csrToNode = std::move(mapping);
+		labelIndex_.clear();
+		labelIndexBuilt_ = false;
+	}
 
 	// Setter for row offsets
 	void SetRowOffsets(std::vector<size_t> offsets) { row_offsets = std::move(offsets); }

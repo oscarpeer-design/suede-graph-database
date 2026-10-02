@@ -513,9 +513,18 @@ Any statement may end with an optional execution-mode keyword. It selects which
 view of the graph the query resolves against:
 
 ```
-<statement> LIVE       -- (default) read the current, live graph
-<statement> SNAPSHOT   -- read a frozen, point-in-time CSR snapshot
+<statement> LIVE              -- (default) read the current, live graph
+<statement> SNAPSHOT <id>     -- read the frozen, point-in-time snapshot numbered <id>
 ```
+
+`<id>` is the number returned by `SNAPSHOT CREATE` (e.g. `Snapshot created with ID: 2`).
+Through the server / `GraphHandler`, **the id is required**: a bare trailing
+`SNAPSHOT` is rejected with `SNAPSHOT requires a snapshot id: append the id returned
+by SNAPSHOT CREATE, e.g. '... SNAPSHOT 1'.`, and an id that was never created (or has
+been released) is rejected with `... could not be matched against a snapshot version.`
+Neither silently falls back to the live graph. (The bare keyword still *parses*; it is
+what you use when calling `Query::execute(Graph&, CSR_Representation&)` yourself,
+because there the snapshot object is supplied by the caller.)
 
 `LIVE` is the default, so omitting the keyword is the same as writing `LIVE`.
 Writing it explicitly is a harmless no-op that documents intent.
@@ -537,17 +546,19 @@ live graph.
 MATCH REACHABLE FROM 1
 MATCH REACHABLE FROM 1 LIVE          -- identical, explicit
 
--- Snapshot traversal: reads the frozen CSR snapshot
-MATCH SHORTEST_PATH FROM 1 TO 3 SNAPSHOT
-MATCH KHOP FROM 1 STEPS 2 SNAPSHOT
+-- Snapshot traversal: reads the frozen CSR snapshot (here, snapshot 1)
+MATCH SHORTEST_PATH FROM 1 TO 3 SNAPSHOT 1
+MATCH KHOP FROM 1 STEPS 2 SNAPSHOT 1
 
 -- Snapshot SELECT: point-in-time reads over nodes / edges / whole graph
-SELECT * FROM NODES SNAPSHOT                              -- full point-in-time scan
-SELECT * FROM NODES WHERE LABEL = 'Person' SNAPSHOT
-SELECT name, age FROM NODES WHERE LABEL = 'Person' SNAPSHOT
-SELECT TOP 10 * FROM NODES SNAPSHOT
-SELECT * FROM EDGES WHERE LABEL = 'KNOWS' SNAPSHOT
-SELECT * FROM GRAPH SNAPSHOT                              -- whole graph, point-in-time
+SELECT * FROM NODES SNAPSHOT 1                            -- full point-in-time scan
+SELECT * FROM NODES WHERE ID = 5 SNAPSHOT 1               -- O(1) id lookup at the snapshot
+SELECT * FROM NODES WHERE LABEL = 'Person' SNAPSHOT 1     -- served by the snapshot's label index
+SELECT name, age FROM NODES WHERE LABEL = 'Person' SNAPSHOT 1
+SELECT TOP 10 * FROM NODES SNAPSHOT 1
+SELECT * FROM EDGES WHERE ID = 7 SNAPSHOT 1               -- O(1) edge lookup at the snapshot
+SELECT * FROM EDGES WHERE LABEL = 'KNOWS' SNAPSHOT 1
+SELECT * FROM GRAPH SNAPSHOT 1                            -- whole graph, point-in-time
 ```
 
 Rules and behaviour:
@@ -577,7 +588,7 @@ Rules and behaviour:
   `Query::execute(Graph&)`), it **gracefully falls back** to the live path
   (live BFS for `MATCH`, the live graph for `SELECT`) rather than failing.
 - **The keyword is a reserved trailing token.** Only a bare, final `LIVE` /
-  `SNAPSHOT` is treated as a mode keyword; a quoted value such as `'SNAPSHOT'`
+  `SNAPSHOT` (optionally followed by the snapshot id) is treated as a mode keyword; a quoted value such as `'SNAPSHOT'`
   keeps its quotes and is left untouched, so
   `SELECT * FROM NODES WHERE LABEL = 'SNAPSHOT'` is an ordinary live query.
 - Results and messages are identical to the live equivalents — a `SNAPSHOT`
@@ -862,6 +873,8 @@ the executor reports the outcome). Below is the authoritative list.
 | `MATCH KHOP: expected a numeric step count after STEPS.` | Non-numeric step count. |
 | `MATCH: unexpected trailing tokens.` | Extra tokens after a complete `MATCH`. |
 | `SNAPSHOT applies only to reads (SELECT, MATCH); INSERT, DELETE, and UPDATE always run against the live graph.` | `SNAPSHOT` keyword used on an `INSERT`, `DELETE`, or `UPDATE`. |
+| `SNAPSHOT requires a snapshot id: append the id returned by SNAPSHOT CREATE, e.g. '... SNAPSHOT 1'.` | A `SELECT` / `MATCH` ended in a bare `SNAPSHOT` when run through the server / `GraphHandler`. |
+| `Parse error: snapshot ID: <n> could not be matched against a snapshot version.` | `SNAPSHOT <n>` named a snapshot that does not exist or was released. |
 | `WHERE: expected operator.` | Property with no operator. |
 | `WHERE: invalid operator '<op>'.` | Operator not in the valid set. |
 | `WHERE: expected value.` | Operator with no right-hand value. |

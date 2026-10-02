@@ -60,6 +60,25 @@ QueryResult GraphHandler::executeQueryLive(const std::string& queryStr) {
     if (isReadOnly(query.operation())) {
         // Shared lock for reads (SELECT, MATCH)
         std::shared_lock<std::shared_mutex> lock(mutex_);
+        // A statement ending in SNAPSHOT reads a point-in-time snapshot, so it must
+        // name one: "... SNAPSHOT <id>" with the id from SNAPSHOT CREATE. Previously
+        // this path ignored the keyword and executed against the LIVE graph (a
+        // snapshot-tagged SELECT even degraded to a full scan), so a SNAPSHOT query
+        // silently wasn't reading any snapshot. Now it is routed to the CSR snapshot
+        // (MATCH) / MVCC history at its version (SELECT), and an unnamed or unknown
+        // snapshot is an explicit error rather than a silent fall-back to live.
+        if (query.executionMode() == ExecutionMode::Snapshot) {
+            if (!query.hasSnapshotId()) {
+                return { false, "SNAPSHOT requires a snapshot id: append the id returned by "
+                                "SNAPSHOT CREATE, e.g. '... SNAPSHOT 1'." };
+            }
+            auto it = snapshots_.find(query.snapshotId());
+            if (it == snapshots_.end()) {
+                return { false, "Parse error: snapshot ID: " + std::to_string(query.snapshotId()) +
+                                " could not be matched against a snapshot version." };
+            }
+            return query.execute(*graph_, *it->second);
+        }
         return query.execute(*graph_);
     }
     else {
@@ -159,6 +178,10 @@ bool GraphHandler::loadSnapshot(const std::string& filename) {
     std::unique_ptr<CSR_Representation> csr_snapshot = std::make_unique<CSR_Representation>(*graph_);
     bool loaded = storage_->LoadSnapshot(*csr_snapshot, filename);
     if (loaded) {
+        // The setters used by LoadSnapshot invalidate the per-snapshot label index;
+        // rebuild it now (we hold the exclusive lock) so label reads stay indexed.
+        if (!csr_snapshot->HasLabelIndex())
+            csr_snapshot->BuildLabelIndex();
         // Store loaded snapshot in snapshots_
         uint64_t snapshotId = nextSnapshotId_;
         snapshots_[snapshotId] = std::move(csr_snapshot);

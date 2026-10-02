@@ -88,6 +88,9 @@ class Dashboard:
         self.csvLogger = None        # the CsvLogger for the current run (or None)
         self.runThread = None        # background thread the run executes on
         self.isRunning = False
+        # Set by the Stop button. Checked by EVERY stage of a run (seeding, snapshot
+        # creation, the load itself), so Stop works no matter which stage is active.
+        self.stopRequested = threading.Event()
         # "phase" tracks WHERE we are so the tiles read sensibly: "idle" before a
         # run, "seeding" while building the graph (no load yet), "load" once real
         # requests are flying. runStartTime is set when the LOAD starts, not at
@@ -251,6 +254,9 @@ class Dashboard:
 
         # Everything network-touching runs on a background thread so the GUI never
         # freezes (seeding a large graph can take a while).
+        self.stopRequested.clear()
+        self.loadClient = None       # drop the previous run's client; Stop must not hit it
+        self.csvLogger = None        # likewise the previous run's logger
         self.isRunning = True
         self.startButton.config(state="disabled")
         self.stopButton.config(state="normal")
@@ -276,6 +282,10 @@ class Dashboard:
             if seedNodeCount > 0:
                 self._setStatus("Seeding %d nodes..." % seedNodeCount)
                 self._seedGraph(serverUrl, token, seedNodeCount)
+            if self.stopRequested.is_set():
+                self._setStatus("Stopped during seeding (%d / %d nodes seeded)."
+                                % (self.seededSoFar, seedNodeCount))
+                return
 
             # 2. For SNAPSHOT mode, capture a snapshot after seeding and learn its id.
             snapshotId = None
@@ -289,6 +299,9 @@ class Dashboard:
                     if token_.isdigit():
                         snapshotId = int(token_)
                 self._setStatus("Snapshot %d created; starting load..." % snapshotId)
+                if self.stopRequested.is_set():
+                    self._setStatus("Stopped before the load started.")
+                    return
 
             # 3. Wire up the logger and the load client, then run the load.
             self.csvLogger = CsvLogger(outputDir=".", summaryWindowSeconds=1.0)
@@ -296,10 +309,17 @@ class Dashboard:
             workload = Workload(operationMix,
                                 idSpace=max(1, seedNodeCount),
                                 snapshotId=snapshotId)
-            self.loadClient = StressClient(
+            loadClient = StressClient(
                 serverUrl, token, workload,
                 workerCount=workerCount, totalRequests=totalRequests,
                 onResult=self._onRequestResult)
+            # Publish the client, THEN re-check the stop flag. If Stop landed before
+            # the client was published, onStop could not reach it -- this re-check
+            # catches that. If it lands after, onStop stops the client directly.
+            self.loadClient = loadClient
+            if self.stopRequested.is_set():
+                self._setStatus("Stopped before the load started.")
+                return
             # The load proper begins NOW -- start the elapsed clock here (not at
             # button press) and flip into the load phase so the tiles switch from
             # the seeding view to live throughput.
@@ -309,8 +329,8 @@ class Dashboard:
             self.requestsThisSecond = 0
             self._setStatus("Load running: %d requests, %d threads, %s reads."
                             % (totalRequests, workerCount, readMode))
-            self.loadClient.run()
-            self._setStatus("Load complete.")
+            loadClient.run()
+            self._setStatus("Stopped." if self.stopRequested.is_set() else "Load complete.")
         except Exception as error:
             self._setStatus("ERROR: %s" % error)
         finally:
@@ -338,11 +358,12 @@ class Dashboard:
             self.seededSoFar = done
             self._setStatus("Seeding... %d / %d" % (done, seedNodeCount))
 
-        sendManyCommands(
+        sentCount = sendManyCommands(
             serverUrl, token, commandStream(),
             onProgress=onProgress, progressEvery=500,
-            shouldStop=lambda: not self.isRunning)
-        self.seededSoFar = seedNodeCount
+            shouldStop=self.stopRequested.is_set)
+        # sentCount is the true number inserted (less than seedNodeCount if stopped).
+        self.seededSoFar = sentCount
 
     def _onRequestResult(self, result):
         """CALLED FROM WORKER THREADS. Must not touch Tkinter here -- just log the
@@ -357,8 +378,12 @@ class Dashboard:
         self.stopButton.config(state="disabled")
 
     def onStop(self):
+        # Stop whatever stage is active. The flag covers seeding and the setup steps;
+        # the client's own stop() covers the load once it exists.
+        self.stopRequested.set()
         if self.loadClient is not None:
             self.loadClient.stop()
+        self.stopButton.config(state="disabled")
         self._setStatus("Stopping...")
 
     def _setStatus(self, text):

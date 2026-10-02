@@ -154,6 +154,8 @@ bool Query::parse() {
     operation_ = QueryOperation::Unknown;        // reset operation type
     target_ = QueryTarget::Unknown;              // reset target type
     executionMode_ = ExecutionMode::Live;        // reset to the default (live) view
+    hasSnapshotId_ = false;                      // reset the named-snapshot target
+    snapshotId_ = 0;
     projection_.clear();                         // reset projection (empty == "*")
     isCount_ = false;                            // reset COUNT flag (set only by SELECT COUNT)
     hasLimit_ = false;                           // reset row limit
@@ -172,15 +174,33 @@ bool Query::parse() {
     // tokens" checks keep working unchanged. Only a bare, final LIVE/SNAPSHOT
     // token is treated as a mode keyword -- a quoted value such as 'SNAPSHOT'
     // tokenizes with its quotes and is left untouched.
-    if (tokens.size() >= 2) {
-        std::string lastUpper = toUpper(tokens.back());
-        if (lastUpper == "SNAPSHOT") {
+    //
+    // SNAPSHOT may carry the id of the snapshot to read -- "... SNAPSHOT <id>", where
+    // <id> is the number returned by SNAPSHOT CREATE. That form is checked first
+    // (the last token is all digits and the one before it is SNAPSHOT); a bare
+    // trailing SNAPSHOT still parses and leaves hasSnapshotId() false, so callers
+    // that supply their own snapshot (Query::execute(live, snapshot)) are unaffected.
+    {
+        uint64_t namedSnapshot = 0;
+        if (tokens.size() >= 3 &&
+            toUpper(tokens[tokens.size() - 2]) == "SNAPSHOT" &&
+            parseUInt(tokens.back(), namedSnapshot)) {
             executionMode_ = ExecutionMode::Snapshot;
-            tokens.pop_back();
+            hasSnapshotId_ = true;
+            snapshotId_ = namedSnapshot;
+            tokens.pop_back();                   // the id
+            tokens.pop_back();                   // SNAPSHOT
         }
-        else if (lastUpper == "LIVE") {
-            executionMode_ = ExecutionMode::Live;
-            tokens.pop_back();
+        else if (tokens.size() >= 2) {
+            std::string lastUpper = toUpper(tokens.back());
+            if (lastUpper == "SNAPSHOT") {
+                executionMode_ = ExecutionMode::Snapshot;
+                tokens.pop_back();
+            }
+            else if (lastUpper == "LIVE") {
+                executionMode_ = ExecutionMode::Live;
+                tokens.pop_back();
+            }
         }
     }
 
@@ -702,6 +722,26 @@ bool Query::whereHasOr() const {
     return false;
 }
 
+// hasNodeIndexAnchor: does the (pure-AND) WHERE contain ID = <n> or LABEL = '<x>'?
+// These are exactly the predicates the live node fast paths serve.
+bool Query::hasNodeIndexAnchor() const {
+    for (const Condition& c : conditions_) {
+        const std::string p = toUpper(c.property);
+        if ((p == "ID" || p == "LABEL") && c.op == "=") return true;
+    }
+    return false;
+}
+
+// hasEdgeIndexAnchor: ID / FROM / LABEL equality -- the keys the live edge fast
+// paths build their field map from.
+bool Query::hasEdgeIndexAnchor() const {
+    for (const Condition& c : conditions_) {
+        const std::string p = toUpper(c.property);
+        if ((p == "ID" || p == "FROM" || p == "LABEL") && c.op == "=") return true;
+    }
+    return false;
+}
+
 // selectMessage: the result message for a SELECT. A COUNT reports the match
 // count ("Count: <n>"); a normal SELECT reports the returned-row count, using
 // the singular "Found 1 row." form when exactly one row came back.
@@ -820,13 +860,17 @@ QueryResult Query::executeSelectNodes(Graph& graph) const {
     //   - the WHERE contains an OR (the single-anchor index fast-paths below
     //     cannot serve it, so it falls back to a scan rather than being rejected
     //     -- the language favours "the command always works");
-    //   - this is a Snapshot-mode read (a point-in-time full scan);
+    //   - this is a Snapshot-mode read that has fallen back to the live graph (no
+    //     snapshot supplied) AND has no ID/LABEL equality to anchor on -- when it
+    //     does have one, the index fast paths below serve it, so a snapshot-tagged
+    //     id lookup is NOT turned into an O(N) scan of every node;
     //   - there is no WHERE at all (conditions_ empty): "SELECT * FROM NODES" now
     //     means "every node", the whole-live-graph read the visualiser needs.
     //     This also covers the WHERE-less COUNT (count the whole graph).
     // nodeMatchesConditions honours AND/OR precedence, and an empty condition
     // list matches every node, so the same loop serves all three cases.
-    if (whereHasOr() || executionMode_ == ExecutionMode::Snapshot ||
+    if (whereHasOr() ||
+        (executionMode_ == ExecutionMode::Snapshot && !hasNodeIndexAnchor()) ||
         conditions_.empty()) {
         std::vector<NodeId> ids;
         graph.GetNodeIdOrder(ids);                // deterministic insertion order
@@ -923,11 +967,14 @@ QueryResult Query::executeSelectEdges(Graph& graph) const {
 
     // Full-scan path. Taken when the WHERE contains an OR (the index fast-paths
     // below build an AND-ed-equality field map that OR breaks), on a Snapshot-mode
-    // read, or when there is no WHERE at all (conditions_ empty): "SELECT * FROM
-    // EDGES" now means "every edge", which also serves "SELECT COUNT * FROM EDGES".
+    // read that fell back to the live graph and has no ID/FROM/LABEL equality to
+    // anchor on, or when there is no WHERE at all (conditions_ empty): "SELECT *
+    // FROM EDGES" now means "every edge", which also serves "SELECT COUNT * FROM
+    // EDGES".
     // edgeMatchesConditions matches every edge on an empty condition list, so one
     // loop serves all three cases.
-    if (whereHasOr() || executionMode_ == ExecutionMode::Snapshot ||
+    if (whereHasOr() ||
+        (executionMode_ == ExecutionMode::Snapshot && !hasEdgeIndexAnchor()) ||
         conditions_.empty()) {
         std::vector<EdgeId> ids;
         graph.GetAllEdgeIds(ids);
@@ -1218,7 +1265,18 @@ QueryResult Query::executeSelectNodesSnapshot(Graph& graph, const CSR_Representa
         // No id predicate: membership is the CSR snapshot's captured id set. Fetch
         // each id's payload at-version and filter it in the same pass -- nothing is
         // materialised except the rows that pass, and we stop early once TOP is hit.
-        for (const NodeId id : snapshot.GetCSRNodeMapping()) {
+        //
+        // With a LABEL = '...' predicate the snapshot's label index narrows the walk
+        // to just the members carrying that label (in CSR order), instead of fetching
+        // and copying every member only to discard the non-matches. A snapshot with no
+        // index (e.g. restored from disk) returns nullptr and scans all members. The
+        // per-id GetNodeAtVersion + considerNode below still enforce visibility and
+        // every predicate, so the index only ever changes how many ids we look at.
+        const std::vector<NodeId>* labelCandidates =
+            haveLabelFilter ? snapshot.NodesWithLabel(labelFilter) : nullptr;
+        const std::vector<NodeId>& walkIds =
+            labelCandidates ? *labelCandidates : snapshot.GetCSRNodeMapping();
+        for (const NodeId id : walkIds) {
             Node node;
             if (!graph.GetNodeAtVersion(id, snapshotVersion, node))
                 continue;                                    // not visible at version
@@ -1251,16 +1309,12 @@ QueryResult Query::executeSelectEdgesSnapshot(Graph& graph, const CSR_Representa
 
     const uint64_t snapshotVersion = snapshot.GetSnapshotVersion();
 
-    // Materialize edges visible at the snapshot version.
-    std::vector<Edge> visible;
-    graph.GetEdgesAtVersion(visible, snapshotVersion);
-
     // OR full-scan path: evaluate the AND/OR condition tree over the visible set.
+    // The predicate runs on the retained history records in place, so only edges
+    // that match are copied (the old path copied EVERY visible edge first).
     if (whereHasOr()) {
-        for (const Edge& e : visible) {
-            if (!edgeMatchesConditions(e, conditions_)) continue;
-            result.edges.push_back(e);
-        }
+        graph.GetEdgesAtVersionIf(result.edges, snapshotVersion,
+            [&](const Edge& e) { return edgeMatchesConditions(e, conditions_); });
         result.success = true;
         applyScanCap(result.edges, result);       // cap at TOP <n> or DEFAULT_SCAN_CAP
         size_t n = result.edges.size();
@@ -1306,9 +1360,10 @@ QueryResult Query::executeSelectEdgesSnapshot(Graph& graph, const CSR_Representa
         else { result.success = false; result.message = "Invalid DIRECTION (expected OUTGOING, INCOMING, or BOTH)."; return result; }
     }
 
-    for (const Edge& e : visible) {
-        if (haveId && e.id.value() != idVal) continue;
-        if (haveLabel && e.label != labelVal) continue;
+    // One predicate for every equality filter the WHERE supplied.
+    auto edgePasses = [&](const Edge& e) -> bool {
+        if (haveId && e.id.value() != idVal) return false;
+        if (haveLabel && e.label != labelVal) return false;
         // FROM with a direction: match the requested endpoint role.
         if (haveFrom) {
             NodeId anchor(fromVal);
@@ -1316,13 +1371,25 @@ QueryResult Query::executeSelectEdgesSnapshot(Graph& graph, const CSR_Representa
             if (dir == OUTGOING)      ok = (e.from == anchor);
             else if (dir == INCOMING) ok = (e.to == anchor);
             else                      ok = (e.from == anchor || e.to == anchor);
-            if (!ok) continue;
+            if (!ok) return false;
         }
         if (haveTo) {
             NodeId target(toVal);
-            if (!(e.to == target || e.from == target)) continue;
+            if (!(e.to == target || e.from == target)) return false;
         }
-        result.edges.push_back(e);
+        return true;
+        };
+
+    if (haveId) {
+        // WHERE ID = <n>: a single O(1) history lookup, then the remaining filters.
+        // (The id is the membership key, so there is nothing to scan.)
+        Edge edge;
+        if (graph.GetEdgeAtVersion(EdgeId(idVal), snapshotVersion, edge) && edgePasses(edge))
+            result.edges.push_back(std::move(edge));
+    }
+    else {
+        // No id: walk the retained history once, copying only the edges that pass.
+        graph.GetEdgesAtVersionIf(result.edges, snapshotVersion, edgePasses);
     }
 
     result.success = true;
@@ -1788,13 +1855,56 @@ QueryResult Query::executeUpdateNodes(Graph& graph) const {
         result.message = "UPDATE NODES requires a WHERE clause.";
         return result;
     }
-    std::vector<NodeId> ids;
-    graph.GetNodeIdOrder(ids);
+
+    // Choose the candidate ids. UPDATE runs under the engine's EXCLUSIVE lock, so
+    // every microsecond spent here blocks every reader and writer. Scanning and
+    // copying every node to find one by id (the old behaviour) made UPDATE ... WHERE
+    // ID = n cost O(N) with an allocation-heavy copy per node.
+    //
+    // For a pure-AND WHERE every condition must hold, so any ID = / LABEL = equality
+    // is a valid anchor: an ID equality names at most one candidate (O(1)); a LABEL
+    // equality names that label's bucket (O(matches)). All conditions -- including
+    // the anchor itself -- are still evaluated against each candidate below, so the
+    // result is identical to a full scan. OR (or no usable anchor) scans all ids.
+    std::vector<NodeId> candidates;
+    bool anchored = false;
+    if (!whereHasOr()) {
+        for (const Condition& c : conditions_) {
+            if (updateUpper(c.property) == "ID" && c.op == "=") {
+                anchored = true;
+                uint64_t idVal = 0;
+                if (updateParseUInt(c.value, idVal))
+                    candidates.push_back(NodeId(idVal));
+                // an unparsable id can match nothing: candidates stays empty
+                break;
+            }
+        }
+        if (!anchored) {
+            for (const Condition& c : conditions_) {
+                if (updateUpper(c.property) == "LABEL" && c.op == "=") {
+                    anchored = true;
+                    if (const std::vector<NodeId>* bucket = graph.NodeIdsForLabel(c.value))
+                        candidates = *bucket;       // copy: updates must not alias the index
+                    break;
+                }
+            }
+        }
+    }
+    if (!anchored)
+        graph.GetNodeIdOrder(candidates);
+
+    // Evaluate the WHERE against the live nodes IN PLACE (no per-node copy), and
+    // collect the matches before mutating anything.
+    std::vector<NodeId> matched;
+    for (NodeId id : candidates) {
+        const Node* node = graph.PeekNode(id);
+        if (node == nullptr) continue;
+        if (!nodeMatchesConditions(*node, conditions_)) continue;
+        matched.push_back(id);
+    }
+
     size_t updated = 0;
-    for (NodeId id : ids) {
-        Node node;
-        if (!graph.GetNode(id, node)) continue;
-        if (!nodeMatchesConditions(node, conditions_)) continue;
+    for (NodeId id : matched) {
         int warning = operationSuccessful;
         graph.UpdateNodeProperties(id, values_, warning);
         if (warning == operationSuccessful) ++updated;
@@ -1826,13 +1936,49 @@ QueryResult Query::executeUpdateEdges(Graph& graph) const {
         result.message = "UPDATE EDGES: SET label = <value> is required.";
         return result;
     }
-    std::vector<EdgeId> ids;
-    graph.GetAllEdgeIds(ids);
+
+    // Same candidate strategy as executeUpdateNodes: anchor on an ID / LABEL
+    // equality when the WHERE is pure-AND (every condition is still evaluated per
+    // candidate, so results match a full scan), otherwise scan every edge id. Edges
+    // are evaluated in place (no copy), and matches are collected BEFORE any
+    // UpdateEdgeLabel call, because that call edits the label index we may be
+    // reading from.
+    std::vector<EdgeId> candidates;
+    bool anchored = false;
+    if (!whereHasOr()) {
+        for (const Condition& c : conditions_) {
+            if (updateUpper(c.property) == "ID" && c.op == "=") {
+                anchored = true;
+                uint64_t idVal = 0;
+                if (updateParseUInt(c.value, idVal))
+                    candidates.push_back(EdgeId(idVal));
+                break;
+            }
+        }
+        if (!anchored) {
+            for (const Condition& c : conditions_) {
+                if (updateUpper(c.property) == "LABEL" && c.op == "=") {
+                    anchored = true;
+                    if (const std::vector<EdgeId>* bucket = graph.EdgeIdsForLabel(c.value))
+                        candidates = *bucket;       // copy: UpdateEdgeLabel edits the bucket
+                    break;
+                }
+            }
+        }
+    }
+    if (!anchored)
+        graph.GetAllEdgeIds(candidates);
+
+    std::vector<EdgeId> matched;
+    for (EdgeId id : candidates) {
+        const Edge* edge = graph.PeekEdge(id);
+        if (edge == nullptr) continue;
+        if (!edgeMatchesConditions(*edge, conditions_)) continue;
+        matched.push_back(id);
+    }
+
     size_t updated = 0;
-    for (EdgeId id : ids) {
-        Edge edge;
-        if (!graph.GetEdge(id, edge)) continue;
-        if (!edgeMatchesConditions(edge, conditions_)) continue;
+    for (EdgeId id : matched) {
         int warning = operationSuccessful;
         graph.UpdateEdgeLabel(id, labelIt->second, warning);
         if (warning == operationSuccessful) ++updated;

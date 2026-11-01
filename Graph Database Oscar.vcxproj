@@ -139,9 +139,13 @@
     <ClInclude Include="User Interaction\InteractiveApp.h" />
   </ItemGroup>
   <ItemGroup>
+    <None Include=".dockerignore" />
+    <None Include=".env" />
+    <None Include=".gitignore" />
     <None Include="QUERY_REFERENCE.md" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="DockerFile" />
     <ClCompile Include="Graph and Searchers\BFS_Searcher.cpp" />
     <ClCompile Include="Graph and Searchers\CSR_Representation.cpp" />
     <ClCompile Include="Graph and Searchers\CSR_Searcher.cpp" />

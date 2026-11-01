@@ -1,0 +1,18 @@
+FROM ubuntu : 24.04 AS build
+RUN apt - get update && apt - get install - y --no - install - recommends g++ && rm - rf / var / lib / apt / lists/*
+WORKDIR /src
+COPY . .
+RUN g++ -std=c++17 -O2 -pthread -I SuedeServer -o /suede \
+      "Graph and Searchers/BFS_Searcher.cpp" "Graph and Searchers/CSR_Representation.cpp" \
+      "Graph and Searchers/CSR_Searcher.cpp" "Graph and Searchers/Graph.cpp" \
+      "Queries and Graph Handlers/GraphHandler.cpp" "Queries and Graph Handlers/Query.cpp" \
+      Storage/StorageEngine.cpp SuedeServer/Server_Core/UseServer.cpp SuedeServer/SuedeServer.cpp
+
+FROM ubuntu:24.04
+RUN useradd -r -u 10001 suede && mkdir /data && chown suede /data
+COPY --from=build /suede /usr/local/bin/suede
+COPY SuedeServer/SuedeVisualiser.htm /data/
+WORKDIR /data
+USER suede
+EXPOSE 4001
+ENTRYPOINT ["suede", "4001", "--public"]

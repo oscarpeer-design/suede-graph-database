@@ -2,7 +2,9 @@
 //
 // Two modes, chosen by the command line:
 //
-//   SuedeServer.exe                         -> start the HTTP server (default).
+//   SuedeServer.exe [port] [--public]       -> start the HTTP server (default).
+//                                              Listens on localhost only unless
+//                                              --public is given (see below).
 //   SuedeServer.exe --mint <ip> [ttl_secs]  -> OPERATOR ACTION: mint one bearer
 //                                              token for <ip>, print it to
 //                                              stdout, and exit. Does NOT start
@@ -123,7 +125,9 @@ static void printHelp() {
         "Suede Graph Database server\n"
         "\n"
         "USAGE\n"
-        "  SuedeServer [port]              Start the HTTP server (default port 8080).\n"
+        "  SuedeServer [port] [--public]   Start the HTTP server (default port 8080).\n"
+        "                                  Listens on localhost only; --public listens on\n"
+        "                                  ALL network interfaces (needed in a container).\n"
         "  SuedeServer --mint <ip> [ttl]   Mint a bearer token for <ip>, print it, exit.\n"
         "  SuedeServer --help | -h         Show this help.\n"
         "\n"
@@ -192,24 +196,43 @@ int main(int argc, char** argv)
     }
 
     // ---- server mode ----
-    // Usage: SuedeServer.exe [port]
-    //   no args      -> default port 8080
-    //   one port arg -> use it (must be a valid 1-65535 integer)
+    // Usage: SuedeServer.exe [port] [--public]
+    //   no args      -> default port 8080, localhost only
+    //   port arg     -> use it (must be a valid 1-65535 integer)
+    //   --public     -> listen on ALL interfaces instead of localhost only
+    //                   (e.g. inside a Docker container). Opt-in, never the default.
+    // The flag and the port may come in either order.
     uint64_t port = 8080;
     std::string err;
+    bool use_public = false;
+    bool sawPort = false;
 
-    // A port argument exists ONLY when argc >= 2. Otherwise default port 8080 is used.
-    if (argc >= 2) {
-        if (!parsePortNumber(argv[1], port, err)) {
-            std::cerr << err << std::endl;
-            std::cerr << "usage: SuedeServer [port]" << std::endl;
-            return 2;   // hard exit on a bad port -- do NOT silently fall back to 8080
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--public") {
+            use_public = true;
+        }
+        else if (!sawPort) {
+            // First non-flag argument is the port. A bad value is a hard exit --
+            // do NOT silently fall back to 8080.
+            if (!parsePortNumber(arg, port, err)) {
+                std::cerr << err << std::endl;
+                std::cerr << "usage: SuedeServer [port] [--public]" << std::endl;
+                return 2;
+            }
+            sawPort = true;
+        }
+        else {
+            std::cerr << "unexpected argument: " << arg << std::endl;
+            std::cerr << "usage: SuedeServer [port] [--public]" << std::endl;
+            return 2;
         }
     }
 
     // ---- start the HTTP server ----
-    bool use_public = false;
-    std::cout << "Starting Suede Server on port " << port << std::endl;
+    std::cout << "Starting Suede Server on port " << port
+        << (use_public ? " (all network interfaces)" : " (localhost only)")
+        << std::endl;
     int rc = runSuedeServer(port, err, use_public);
     if (!err.empty())
         std::cerr << "server error: " << err << std::endl;

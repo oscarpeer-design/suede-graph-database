@@ -142,6 +142,7 @@
     <None Include=".dockerignore" />
     <None Include=".env" />
     <None Include=".gitignore" />
+    <None Include="docker-compose.yml" />
     <None Include="QUERY_REFERENCE.md" />
   </ItemGroup>
   <ItemGroup>

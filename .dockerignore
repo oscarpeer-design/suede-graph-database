@@ -1,0 +1,9 @@
+.git
+.vs
+**/.vs
+x64
+**/x64
+**/*.obj
+**/*.pdb
+**/__pycache__
+**/*.csv
